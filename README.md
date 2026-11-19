@@ -48,3 +48,6 @@ Endpoint paths come from the client binary. Response *shapes* are guesses (`{"ve
 4. **Matchmaking.** Work out the WebSocket protocol (`player-join`, `session-started`, `connection`, `group-event`, ...) and send players to a hosted match.
 5. **Verify Steam tickets** at login so player ids can't be faked. Then host on a VPS.
 6. **Server browser UI** in the launcher. A menu inside the game comes later, if at all.
+
+## License
+[MIT](LICENSE) for the code in this repository. SOS itself, its name and its content belong to their owners and are not covered by this license.
