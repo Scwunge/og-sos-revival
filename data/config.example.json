@@ -1,0 +1,25 @@
+{
+  "_docs": {
+    "REGION_NAME": "Name of the single region offered to clients in the get-regions reply. Default: local",
+    "BEACON_URL": "Host the client pings to measure region latency. Default: the value of GAME_SERVER_HOST",
+    "GAME_SERVER_HOST": "IPv4 literal sent in session-started (the client does no DNS; hostnames are rejected and fall back to 127.0.0.1). Default: 127.0.0.1",
+    "GAME_SERVER_PORT": "Game server UDP port sent in session-started. Default: 7777",
+    "MIN_PLAYERS": "Queued players needed to start a match right away. Default: 1 (so a solo player can test)",
+    "MAX_PLAYERS": "Maximum players per session. Default: 16",
+    "QUEUE_TIMEOUT": "Seconds after which a match starts with whoever is queued (at least 1 player). Default: 20",
+    "MATCH_BATCH_MS": "Milliseconds to wait once a match is possible so near-simultaneous players share a session. Default: 300",
+    "LATE_JOIN_SECONDS": "How long a matchmade session keeps accepting newly queued players. Default: 60",
+    "GROUP_MAX_SIZE": "Maximum players per group. Default: 8",
+    "env": "Every key can also be set with an environment variable named OGSOS_<KEY>, e.g. OGSOS_GAME_SERVER_HOST. Env wins over this file. Keys starting with _ are ignored."
+  },
+  "REGION_NAME": "local",
+  "BEACON_URL": "",
+  "GAME_SERVER_HOST": "127.0.0.1",
+  "GAME_SERVER_PORT": 7777,
+  "MIN_PLAYERS": 1,
+  "MAX_PLAYERS": 16,
+  "QUEUE_TIMEOUT": 20,
+  "MATCH_BATCH_MS": 300,
+  "LATE_JOIN_SECONDS": 60,
+  "GROUP_MAX_SIZE": 8
+}

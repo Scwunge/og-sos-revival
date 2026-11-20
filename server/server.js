@@ -10,6 +10,7 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { loadConfig, createMatchmaker } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
 const LOG_DIR = path.join(ROOT, 'logs');
@@ -220,27 +221,67 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// ---------- WebSocket (matchmaking at /ws, stream client too) ----------
-// Minimal RFC 6455: handshake, text/binary frames, ping/pong, close. We only log for now:
-// the matchmaking message format gets worked out from what the client sends.
+// ---------- WebSocket (matchmaking at /ws) ----------
+// Minimal RFC 6455: handshake, text/binary frames, ping/pong, close. The matchmaking protocol
+// itself lives in server/matchmaking.js (see docs/MATCHMAKING.md); every frame is logged.
+const CONFIG = loadConfig(DATA_DIR);
+const mm = createMatchmaker({
+  config: CONFIG,
+  getUname: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
+  log: (m) => { log('ws.jsonl', { event: 'mm', text: m }); console.log(`mm ${m}`); },
+});
+
+function wsAccount(req) {
+  const tok = String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim();
+  const claims = tok && readJwt(tok);
+  if (!claims || (claims.exp && claims.exp < Date.now() / 1000)) return null;
+  return String(claims['account-id'] || claims.id || '') || null;
+}
+
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
   if (!key) return socket.destroy();
+  socket.on('error', () => {});
+  const isMm = new URL(req.url, 'http://x').pathname === '/ws';
+  const accountId = isMm ? wsAccount(req) : null;
+  if (isMm && !accountId) {
+    log('ws.jsonl', { event: 'rejected', path: req.url, reason: 'missing or invalid token', headers: req.headers });
+    console.log(`ws rejected ${req.url} (401)`);
+    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
   const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   const proto = req.headers['sec-websocket-protocol'];
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
     `Sec-WebSocket-Accept: ${accept}\r\n` + (proto ? `Sec-WebSocket-Protocol: ${proto.split(',')[0].trim()}\r\n` : '') + '\r\n');
   const id = crypto.randomBytes(4).toString('hex');
-  log('ws.jsonl', { id, event: 'open', path: req.url, headers: req.headers });
-  console.log(`ws ${id} open ${req.url}`);
+  log('ws.jsonl', { id, event: 'open', path: req.url, account: accountId, headers: req.headers });
+  console.log(`ws ${id} open ${req.url}${accountId ? ` account ${accountId}` : ''}`);
 
   const sendFrame = (opcode, payload) => {
+    if (socket.destroyed || !socket.writable) return;
     const len = payload.length;
     const head = len < 126 ? Buffer.from([0x80 | opcode, len])
       : len < 65536 ? Buffer.from([0x80 | opcode, 126, len >> 8, len & 255])
       : Buffer.concat([Buffer.from([0x80 | opcode, 127]), (() => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(len)); return b; })()]);
     socket.write(Buffer.concat([head, payload]));
   };
+
+  // Matchmaking client for this connection. Non-/ws paths (e.g. stream client) are log-only.
+  let client = null;
+  if (isMm) {
+    client = {
+      id: accountId, connId: id,
+      sendMsg(type, data) {
+        const text = JSON.stringify(data === undefined ? { type } : { type, data });
+        sendFrame(0x1, Buffer.from(text));
+        log('ws.jsonl', { id, event: 'sent', text });
+        console.log(`ws ${id} -> ${text.slice(0, 200)}`);
+      },
+      close() { sendFrame(0x8, Buffer.alloc(0)); socket.end(); },
+    };
+    mm.onConnect(client);
+  }
 
   let buf = Buffer.alloc(0);
   socket.on('data', (d) => {
@@ -266,17 +307,14 @@ server.on('upgrade', (req, socket) => {
       const text = payload.toString('utf8');
       log('ws.jsonl', { id, event: 'msg', opcode, text });
       console.log(`ws ${id} <- ${text.slice(0, 200)}`);
-      // Application-level keepalive: the client counts missed pongs and reconnects.
-      // Guess: echo a "pong" for any message that mentions ping. Refine from logs.
-      if (/ping/i.test(text)) {
-        const reply = text.replace(/ping/g, 'pong').replace(/Ping/g, 'Pong');
-        sendFrame(0x1, Buffer.from(reply));
-        log('ws.jsonl', { id, event: 'sent', text: reply });
-      }
+      if (client) mm.onMessage(client, text);
     }
   });
-  socket.on('close', () => { log('ws.jsonl', { id, event: 'close' }); console.log(`ws ${id} closed`); });
-  socket.on('error', () => {});
+  socket.on('close', () => {
+    if (client) mm.onClose(client);
+    log('ws.jsonl', { id, event: 'close' });
+    console.log(`ws ${id} closed`);
+  });
 });
 
 server.listen(PORT, () => {
