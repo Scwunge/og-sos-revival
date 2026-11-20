@@ -1,5 +1,14 @@
 // Classic-specific checks (docs/CLASSIC.md) against a running server: node tools/classic_test.js <port>
 // Run tools/mm_test.js too; this covers login roles, per-app KV, separate queues and custom matches.
+//
+// Environment:
+//  * Without OGSOS_CLASSIC_HOSTS in the TEST env the hosted checks print SKIP; the server needs no special env.
+//  * With it, start the server with the SAME OGSOS_CLASSIC_HOSTS plus short timers, and give the test the same values:
+//      OGSOS_CLASSIC_HOSTS='[{"host":"127.0.0.1","port":7777,"sessionId":"22222222-3333-4444-5555-666666666666","sessionToken":"test-token-2","hostIds":["76561190000000000"]}]'
+//      OGSOS_CLASSIC_START_MIN_PLAYERS=1 OGSOS_CLASSIC_START_COUNTDOWN_SECONDS=1 OGSOS_CLASSIC_TRAVEL_GRACE_SECONDS=1
+//      (and optionally OGSOS_CLASSIC_PUBLIC_HOST=203.0.113.7, also exported to the test so it expects that host in session-started)
+//    Classic inherits the main START_MIN_PLAYERS (e.g. OGSOS_START_MIN_PLAYERS=3 set for mm_test), so set the CLASSIC one to 1 here.
+//    The test reads the three timer values and waits accordingly (countdown + grace).
 'use strict';
 const http = require('http');
 const net = require('net');
@@ -50,6 +59,9 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 // Hosted-session checks need the server started with the same OGSOS_CLASSIC_HOSTS value.
 let HOST = null;
 try { HOST = JSON.parse(process.env.OGSOS_CLASSIC_HOSTS || 'null')?.[0] || null; } catch { /* unset */ }
+const CLASSIC_PUB = process.env.OGSOS_CLASSIC_PUBLIC_HOST || '';          // optional: address clients must be handed
+const CD = Number(process.env.OGSOS_CLASSIC_START_COUNTDOWN_SECONDS ?? 10) * 1000;
+const GRACE = Number(process.env.OGSOS_CLASSIC_TRAVEL_GRACE_SECONDS ?? 300) * 1000;
 const hostGet = (id, token) => req('GET', `/api/session/${id}`, null, token === null ? {} : { Authorization: `Token ${token}` });
 function verifyHs512(jwt, key) {
   const [h, c, sg] = jwt.split('.');
@@ -119,20 +131,25 @@ function verifyHs512(jwt, key) {
   a.close(); b.close();
   if (HOST) {
     const sid = HOST.sessionId, tok = HOST.sessionToken;
+    // The earlier queue checks already seated players in the hosted session; start from a clean one.
+    assert((await req('POST', `/api/session/${sid}/reset`, '{}', { Authorization: `Token ${tok}` })).status === 200, 'reset');
     const d = await login('76561190000000103', 'sostest');
     const dw = await ws(d['access-token']);
     await wait(200);
     dw.send({ type: 'find-session', data: { opts: { 'game-mode': '', map: '' } } });
-    await wait(1500);
+    await wait(500);
+    assert(dw.msgs.some((x) => x.type === 'session'), 'no session at once');
+    if (CD > 600) assert(!dw.msgs.some((x) => x.type === 'session-started'), 'session-started before the countdown ended');
+    await wait(CD + 1000);
     const ds = dw.msgs.find((x) => x.type === 'session');
     assert(ds && dw.msgs.some((x) => x.type === 'session-started'), 'hosted: no session/session-started ' + JSON.stringify(dw.msgs));
     const so = ds.data.session;
-    assert(so.id === sid && so.host === HOST.host && so.port === HOST.port, 'hosted session fields ' + JSON.stringify(so));
+    assert(so.id === sid && so.host === (CLASSIC_PUB || HOST.host) && so.port === HOST.port, 'hosted session fields ' + JSON.stringify(so));
     assert(so.opts.map === '' && so.opts['game-mode'] === '' && so.owner === 'system', 'hosted opts/owner ' + JSON.stringify(so.opts));
     const jc = verifyHs512(ds.data['access-token'], tok);
     assert(jc.sub === sid && jc.roles.includes('user+session') && jc.id === d['user-id'], 'jwt claims ' + JSON.stringify(jc));
     const started = dw.msgs.find((x) => x.type === 'session-started');
-    assert(started.data.id === sid && started.data.host === HOST.host && started.data.port === HOST.port, 'session-started');
+    assert(started.data.id === sid && started.data.host === (CLASSIC_PUB || HOST.host) && started.data.port === HOST.port, 'session-started');
     console.log('PASS  hosted match: fixed session id, host/port from config, HS512 access-token verifies');
 
     const g1 = JSON.parse((await hostGet(sid, tok)).body);
@@ -146,11 +163,27 @@ function verifyHs512(jwt, key) {
     console.log('PASS  host POST events -> {"result":true}');
 
     dw.close();
-    await wait(500);
+    await wait(Math.min(300, GRACE / 3));
     const g2 = JSON.parse((await hostGet(sid, tok)).body);
-    assert(!g2['player-map'][d['user-id']], 'player still listed after ws close');
-    for (const hid of HOST.hostIds || []) assert(g2['player-map'][hid], 'hostId dropped after close');
-    console.log('PASS  player removed from host view after WS close');
+    if (GRACE > 600) assert(g2['player-map'][d['user-id']], 'player removed before the travel grace expired');
+    await wait(GRACE + 1200);
+    const g3 = JSON.parse((await hostGet(sid, tok)).body);
+    assert(!g3['player-map'][d['user-id']], 'player still listed after the travel grace');
+    for (const hid of HOST.hostIds || []) assert(g3['player-map'][hid], 'hostId dropped after close');
+    console.log('PASS  player kept during the travel grace after WS close, removed once it expires');
+
+    // Explicit leave-session removes at once (no grace), and the session start flag survives for late joiners.
+    const e = await login('76561190000000104', 'sostest');
+    const ew = await ws(e['access-token']);
+    await wait(200);
+    ew.send({ type: 'find-session', data: { opts: { 'game-mode': '', map: '' } } });
+    await wait(500);
+    assert(ew.msgs.some((x) => x.type === 'session') && ew.msgs.some((x) => x.type === 'session-started'), 'late join: ' + JSON.stringify(ew.msgs));
+    ew.send({ type: 'leave-session', data: { 'session-id': sid } });
+    await wait(300);
+    assert(!JSON.parse((await hostGet(sid, tok)).body)['player-map'][e['user-id']], 'still listed after leave-session');
+    ew.close();
+    console.log('PASS  join in progress gets session-started at once; leave-session removes immediately');
   }
   console.log('\nall classic checks passed');
   process.exit(0);

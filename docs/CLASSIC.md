@@ -236,7 +236,24 @@ A listen server is started with `-SESSION_ID=<hyphenated guid> -SESSION_TOKEN=<s
 
 Unknown id gives 404, a wrong or missing token gives 401. Both matchmakers are searched (Classic first).
 
-With `HOSTS` configured, matchmade solo/duo players are **added to the host's fixed session** (id = `sessionId`, owner `system`, host/port from the entry) instead of a new session, and removed again when they leave or their WebSocket closes. They get `session` then `session-started` as before. Custom matches (`create-session`) are unchanged. Only the first host is used for now.
+With `HOSTS` configured, matchmade solo/duo players are **added to the host's fixed session** (id = `sessionId`, owner `system`, host/port from the entry) instead of a new session. Everyone who calls `find-session` at any time lands in that one session, and `GET /api/session/<id>` lists all of them plus `hostIds`. Custom matches (`create-session`) are unchanged. Only the first host is used for now.
+
+**Start gate (hosted sessions only).** A hosted session starts un-started (`session-started` is not sent yet):
+
+- A player seated before the start gets `session` (host/port, own `access-token`) at once but not `session-started`. The seated players also get the existing `summary` message (`players.waiting` = seated count) when the count changes.
+- When the seated count reaches `START_MIN_PLAYERS`, a countdown of `START_COUNTDOWN_SECONDS` begins (0 = start at once). When it ends, every seated player gets `session-started` and the session is marked started. If the count falls below the minimum during the countdown (leave, cancel, grace expiry) the countdown is cancelled.
+- Players seated after the start (while under `MAX_PLAYERS`) get `session` and `session-started` immediately (join in progress).
+- `opts.min-players` in the session object is `START_MIN_PLAYERS`.
+- **Force start:** `POST /api/session/<id>/start` starts at once whatever the count and returns `{"result":true,"players":n}`. Typing `start` + Enter in the server console force-starts all hosted sessions (ignored when stdin is closed or not a terminal).
+- **Reset** (the host restarted, new match): `POST /api/session/<id>/reset` clears the player-map and the started flag and sends `session-closed` to the players still connected. Returns `{"result":true,"cleared":n}`.
+- `start` and `reset` require `Authorization: Token <sessionToken>`. There is no loopback bypass, because behind a tunnel (playit and similar) remote callers arrive as loopback. The host can also type `start` in the server console.
+- `POST .../events` with `{"type":"match-start"}` is logged ("host reported match-start") and answered `{"result":true}`; it does not change the session state.
+
+**Travel grace.** A player whose WebSocket closes while seated in a hosted session keeps the seat (stays in `player-map`) for `TRAVEL_GRACE_SECONDS` (default 300), because the client drops the matchmaking socket while it travels to the host. If the same account reconnects within the grace, it is reattached silently (no `session`, no `session-started`; `get-session` returns its session with host/port and token). After the grace the player is removed (others get `player-leave`). `leave-session`, a new `find-session` and `cancel-find-session` remove immediately. Non-hosted sessions keep the old behaviour (removed as soon as the socket closes).
+
+**Public address.** The game client does no DNS, so for friends on the internet set `PUBLIC_HOST` to the IPv4 literal they should connect to (your public IP, with the game's UDP port forwarded). It replaces the host sent in `session`, `session-started` and the region `beacon-url` (unless `BEACON_URL` is set explicitly) for hosted and normal sessions. The host's own `GET /api/session/<id>` still shows the entry's `host`. Precedence: `--public-host <ipv4>` on `server.js` (applies to both builds) > env `OGSOS_PUBLIC_HOST` (main) / `OGSOS_CLASSIC_PUBLIC_HOST` (Classic) > `PUBLIC_HOST` / `classic.PUBLIC_HOST` in `data/config.json`; Classic inherits the main value if it has none. A value that is not an IPv4 literal is warned about and ignored. The effective address is printed at startup. The server already listens on `0.0.0.0`; forward the HTTP/WS port (default 7780) and the game's UDP port.
+
+Settings (each also as env `OGSOS_<KEY>`, `OGSOS_CLASSIC_<KEY>` for Classic, or in `data/config.json` / its `classic` object): `PUBLIC_HOST` (default none), `START_MIN_PLAYERS` (1), `START_COUNTDOWN_SECONDS` (10), `TRAVEL_GRACE_SECONDS` (300). Note Classic starts from the main values, so `OGSOS_START_MIN_PLAYERS=3` also applies to Classic unless `OGSOS_CLASSIC_START_MIN_PLAYERS` is set.
 
 The `access-token` in each player's `session` packet is a per-player JWT: header `{"typ":"JWT","alg":"HS512"}`, signed with HMAC-SHA512 using the `sessionToken` as key, claims `sub` = session id, `roles` = `["user+session"]`, the player's `id`, `iat`, `exp`. Sessions without a host keep the old random token.
 
@@ -247,7 +264,7 @@ Config (`classic.HOSTS` in `data/config.json`, or env `OGSOS_CLASSIC_HOSTS` as a
             "sessionToken": "CHANGE-ME-placeholder", "hostIds": ["76561190000000000"] }]
 ```
 
-`host` must be an IPv4 literal, `sessionId` must contain `-`, `sessionToken` longer than 1 character; bad entries are warned about and skipped. Start the game host with the same values: `-SESSION_ID=<sessionId> -SESSION_TOKEN=<sessionToken>`. Test: start the server with `OGSOS_CLASSIC_HOSTS` set and run `node tools/classic_test.js <port>`.
+`host` must be an IPv4 literal, `sessionId` must contain `-`, `sessionToken` longer than 1 character; bad entries are warned about and skipped. Start the game host with the same values: `-SESSION_ID=<sessionId> -SESSION_TOKEN=<sessionToken>`. Tests: the env each run needs is in the header comment of `tools/classic_test.js` (hosted checks, short countdown/grace) and `tools/mm_test.js` (the 3-client hosted scenario needs `OGSOS_HOSTS`, `OGSOS_START_MIN_PLAYERS=3`, a 1 s countdown; run it against a separate server from the non-hosted checks).
 
 ## Live test, 2026-11-20 (branch server on 7781, hosting session's listen host on 7777)
 

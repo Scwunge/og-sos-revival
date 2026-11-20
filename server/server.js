@@ -10,7 +10,7 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, createMatchmaker, parseHosts, DEFAULTS } = require('./matchmaking');
+const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, DEFAULTS } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
 const LOG_DIR = path.join(ROOT, 'logs');
@@ -20,6 +20,9 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const argPort = process.argv.indexOf('--port');
 const PORT = argPort > 0 ? Number(process.argv[argPort + 1]) : 7780;
+// --public-host <ipv4>: address handed to clients in session/session-started (wins over env and config file, both builds).
+const argPublic = process.argv.indexOf('--public-host');
+const FLAG_PUBLIC_HOST = argPublic > 0 ? process.argv[argPublic + 1] : undefined;
 
 // ---------- logging ----------
 function log(file, entry) {
@@ -176,16 +179,31 @@ function handleApi(req, url, body, res) {
   let r;
 
   // Routes the game host (a listen server) calls on its MMS, authorised by `Token <SESSION_TOKEN>`.
-  if ((r = m(/^\/api\/session\/([^/]+?)(\/events)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
+  // POST .../start and .../reset are for whoever runs the server (same token; or type `start` in the console).
+  if ((r = m(/^\/api\/session\/([^/]+?)(\/events|\/start|\/reset)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
     const id = decodeURIComponent(r[1]);
-    const found = mmClassic.getHostedSession(id) || mm.getHostedSession(id);
+    const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
+    const found = owner.getHostedSession(id);
     if (!found) return send(res, 404, { error: 'not-found' });
     const given = Buffer.from(String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim());
     const want = Buffer.from(found.token);
-    if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return send(res, 401, { error: 'unauthorized' });
+    const tokenOk = given.length === want.length && crypto.timingSafeEqual(given, want);
+    // Token only, no loopback bypass: behind a tunnel (playit etc.) remote callers arrive as loopback.
+    if (!tokenOk) return send(res, 401, { error: 'unauthorized' });
+    if (r[2] === '/start') {
+      const players = owner.forceStartHosted(id);
+      console.log(`forced start of hosted session ${id} via HTTP (${players} player(s))`);
+      return send(res, 200, { result: true, players });
+    }
+    if (r[2] === '/reset') {
+      const cleared = owner.resetHosted(id);
+      console.log(`reset hosted session ${id} via HTTP (${cleared} player(s) cleared)`);
+      return send(res, 200, { result: true, cleared });
+    }
     if (r[2]) {
       let j = {}; try { j = JSON.parse(body || '{}'); } catch {}
       console.log(`host event for session ${id}: ${j.type}`);
+      if (j.type === 'match-start') console.log(`host reported match-start for session ${id}`);
       log('ws.jsonl', { event: 'host-event', session: id, type: j.type, body });
       return send(res, 200, { result: true });
     }
@@ -295,7 +313,7 @@ const server = http.createServer((req, res) => {
 // ---------- WebSocket (matchmaking at /ws) ----------
 // Minimal RFC 6455: handshake, text/binary frames, ping/pong, close. The matchmaking protocol
 // itself lives in server/matchmaking.js (see docs/MATCHMAKING.md); every frame is logged.
-const CONFIG = loadConfig(DATA_DIR);
+const CONFIG = loadConfig(DATA_DIR, process.env, console.warn, { PUBLIC_HOST: FLAG_PUBLIC_HOST });
 const mm = createMatchmaker({
   config: CONFIG,
   getUname: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
@@ -310,16 +328,23 @@ function classicMmConfig() {
   // HOSTS is never inherited from the main config (it would put both builds in one host's session).
   cfg.HOSTS = parseHosts(process.env.OGSOS_CLASSIC_HOSTS ?? CLASSIC.mm.HOSTS, console.warn, cfg.GAME_SERVER_PORT);
   for (const key of Object.keys(DEFAULTS)) {
-    if (key === 'HOSTS') continue;
+    if (key === 'HOSTS' || key === 'PUBLIC_HOST') continue;
     let v = process.env[`OGSOS_CLASSIC_${key}`] ?? CLASSIC.mm[key];
     if (v === undefined || v === null || v === '') continue;
     if (typeof DEFAULTS[key] === 'number') { v = Number(v); if (!Number.isFinite(v)) continue; } else v = String(v);
     cfg[key] = v;
   }
+  // PUBLIC_HOST: flag > OGSOS_CLASSIC_PUBLIC_HOST > classic.PUBLIC_HOST > the main value (inherited via the copy above).
+  cfg.PUBLIC_HOST = pickPublicHost([
+    { src: '--public-host', v: FLAG_PUBLIC_HOST },
+    { src: 'env OGSOS_CLASSIC_PUBLIC_HOST', v: process.env.OGSOS_CLASSIC_PUBLIC_HOST },
+    { src: 'data/config.json classic.PUBLIC_HOST', v: CLASSIC.mm.PUBLIC_HOST },
+  ], console.warn) || CONFIG.PUBLIC_HOST;
   return cfg;
 }
+const CLASSIC_CONFIG = classicMmConfig();
 const mmClassic = createMatchmaker({
-  config: classicMmConfig(),
+  config: CLASSIC_CONFIG,
   getUname: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
   log: (m) => { log('ws.jsonl', { event: 'mm-classic', text: m }); console.log(`mm[classic] ${m}`); },
 });
@@ -416,7 +441,21 @@ server.on('upgrade', (req, socket) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`OG SOS Revival backend listening on http://0.0.0.0:${PORT}`);
   console.log(`Logs: ${LOG_DIR}   ("??" lines = calls we don't handle yet)`);
+  const shown = (cfg) => (cfg.PUBLIC_HOST ? `${cfg.PUBLIC_HOST} (PUBLIC_HOST)` : `not set, clients get ${cfg.GAME_SERVER_HOST} (GAME_SERVER_HOST) or the host entry's host`);
+  console.log(`Public address handed to clients: main ${shown(CONFIG)}; classic ${shown(CLASSIC_CONFIG)}`);
 });
+
+// Typing `start` + Enter force-starts every hosted session. Harmless when stdin is closed or not a terminal.
+try {
+  const rl = require('readline').createInterface({ input: process.stdin });
+  rl.on('line', (line) => {
+    if (line.trim().toLowerCase() !== 'start') return;
+    const all = [...mmClassic.forceStartAll(), ...mm.forceStartAll()];
+    console.log(all.length ? `forced start: ${all.map((x) => `${x.id} (${x.players} player(s))`).join(', ')}` : 'no hosted sessions configured');
+  });
+  rl.on('error', () => {});
+  process.stdin.on('error', () => {});
+} catch { /* no usable stdin */ }
