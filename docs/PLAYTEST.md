@@ -209,7 +209,7 @@ Run it with `--dry-run` first. In remote mode, the dry run checks the backend, t
 Friends use the same command as before, `--server <server IPv4>:7781`.
 
 The container:
-- runs as a non-root user with a read-only filesystem and a 512 MB memory limit;
+- runs as a non-root user with a read-only filesystem and a 2 GB memory limit;
 - publishes only port 7781;
 - keeps its accounts and logs on Docker volumes;
 - restarts on its own unless you stop it (`docker compose down`).
