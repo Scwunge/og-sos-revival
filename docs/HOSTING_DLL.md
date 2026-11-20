@@ -182,7 +182,7 @@ How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
 - **Ported:** sos_host runs on SOS: Classic (802240). Listen, the join hooks, `MaxClientRate`, and the MMS session route all work (`-SESSION_ID`/`-SESSION_TOKEN`, and the host needs its own `?AuthToken=` JWT).
 - **Missing server code:** the shipping client is built without server code. `UNetDriver::TickFlush` (FUN_1411f5460) never calls ServerReplicateActors. A joiner only got actors that an RPC targeted (`ProcessRemoteFunction` opens their channel), so its pawn never arrived and the camera sat under the map.
 - **Replication pass (e97685a):** `ReplicateActors=1` adds sos_host's own pass before TickFlush:
-  - Open a channel with CreateChannel FUN_1411dba20 + SetChannelActor FUN_1411080c10 (the open sequence ProcessRemoteFunction uses); send updates with ReplicateActor FUN_14107dbe0, throttled by IsNetReady (vt+0x240).
+  - Open a channel with CreateChannel FUN_1411dba20 + SetChannelActor FUN_141080c10 (the open sequence ProcessRemoteFunction uses); send updates with ReplicateActor FUN_14107dbe0, throttled by IsNetReady (vt+0x240).
   - Actor flags: +0x7C (bHidden 1, bNetStartup 4, bOnlyRelevantToOwner 8, bAlwaysRelevant 0x10), bReplicates at +0x7E bit 4, Owner +0x90.
   - Test: 2726 channels opened within ~20 s of the join. The joiner reached Playing with a pawn and no Inactive loop.
 - **Open:**
