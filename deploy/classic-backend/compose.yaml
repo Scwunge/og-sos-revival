@@ -1,0 +1,38 @@
+# OG SOS Revival backend as its own compose project. It touches no other container or network.
+#   cp .env.example .env && chmod 600 .env   (then fill it in; never commit .env)
+#   docker compose up -d --build
+#   docker compose logs -f backend
+name: ogsos
+
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: deploy/classic-backend/Dockerfile
+    image: ogsos-backend:local
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${BIND_IP:-0.0.0.0}:7781:7781"
+    volumes:
+      - state:/state
+      - logs:/logs
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  state:
+  logs:

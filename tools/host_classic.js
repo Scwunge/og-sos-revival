@@ -5,6 +5,14 @@
 //        [--game "<Classic install folder>"] [--no-game-log] [--dry-run]
 //   node tools/host_classic.js --cleanup     remove installed files / restore Engine.ini after a crash
 //
+// Remote backend (server already running elsewhere, e.g. Docker, with a FIXED hosted session in its
+// OGSOS_CLASSIC_HOSTS whose hostIds contains this PC's SteamID64): nothing is spawned locally.
+//   node tools/host_classic.js --backend <IPv4:port> --session-id <uuid> --session-token <secret>
+//        [--session-file <json>] [--public-host <IPv4>] [--steam-id <id64>] [--game ...] [--dry-run]
+//   --session-file: JSON {sessionId, sessionToken} or a HOSTS array (first entry). The token may also come from
+//   env OGSOS_SESSION_TOKEN (keeps it out of the process list). Id and token are required with --backend and
+//   ignored (with a warning) without it. Typing 'start' POSTs /api/session/<id>/start to the backend.
+//
 // Test overrides: --win64 <dir>  --engine-ini <path>  --exe <path>  --exe-arg <arg> (repeatable)
 //
 // What it does: starts server/server.js with a fresh hosted session, points Classic's Engine.ini at it
@@ -15,6 +23,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const net = require('net');
 const crypto = require('crypto');
 const readline = require('readline');
 const { spawn } = require('child_process');
@@ -115,7 +124,8 @@ function parseArgs(argv) {
   const o = { exeArgs: [] };
   const valued = { '--public-host': 'publicHost', '--port': 'port', '--game-port': 'gamePort', '--min-players': 'minPlayers',
     '--countdown': 'countdown', '--steam-id': 'steamId', '--sos-host-dir': 'sosHostDir', '--game': 'game',
-    '--win64': 'win64', '--engine-ini': 'engineIni', '--exe': 'exe' };
+    '--win64': 'win64', '--engine-ini': 'engineIni', '--exe': 'exe',
+    '--backend': 'backend', '--session-id': 'sessionId', '--session-token': 'sessionToken', '--session-file': 'sessionFile' };
   const bool = { '--no-game-log': 'noGameLog', '--dry-run': 'dryRun', '--cleanup': 'cleanup', '--help': 'help' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -127,9 +137,32 @@ function parseArgs(argv) {
   const num = (k, lo, hi) => { if (o[k] !== undefined && !(Number.isInteger(+o[k]) && +o[k] >= lo && +o[k] <= hi)) throw new Error(`bad --${k}`); };
   num('port', 1, 65535); num('gamePort', 1, 65535); num('minPlayers', 1, 1000);
   if (o.countdown !== undefined && !(Number.isFinite(+o.countdown) && +o.countdown >= 0)) throw new Error('bad --countdown');
-  if (o.publicHost && !require('net').isIPv4(o.publicHost)) throw new Error('--public-host must be an IPv4 literal (the client does no DNS)');
+  if (o.backend) {
+    const m = o.backend.match(/^([^:]+):(\d+)$/);
+    if (!m || !net.isIPv4(m[1]) || +m[2] < 1 || +m[2] > 65535) throw new Error('--backend must be <IPv4>:<port> (the client does no DNS)');
+  }
+  if (o.publicHost && !net.isIPv4(o.publicHost)) throw new Error('--public-host must be an IPv4 literal (the client does no DNS)');
   if (o.steamId && !/^\d{17}$/.test(o.steamId)) throw new Error('--steam-id must be a 17-digit SteamID64');
   return o;
+}
+
+// {sessionId, sessionToken} from a --session-file value: that shape, or a HOSTS array (first entry).
+function sessionFromJson(j) {
+  const e = Array.isArray(j) ? j[0] : j;
+  if (!e || typeof e !== 'object') throw new Error('expected {sessionId, sessionToken} or a HOSTS array');
+  return { sessionId: e.sessionId, sessionToken: e.sessionToken };
+}
+
+// Remote mode session: flags > --session-file; token also from env OGSOS_SESSION_TOKEN. Throws if incomplete.
+function resolveRemoteSession(o, env = process.env) {
+  let f = {};
+  if (o.sessionFile) {
+    try { f = sessionFromJson(JSON.parse(fs.readFileSync(o.sessionFile, 'utf8'))); } catch (e) { throw new Error(`cannot use --session-file ${o.sessionFile}: ${e.message}`); }
+  }
+  const sessionId = o.sessionId || f.sessionId;
+  const sessionToken = o.sessionToken || env.OGSOS_SESSION_TOKEN || f.sessionToken;
+  if (!sessionId || !sessionToken) throw new Error('--backend needs a session id and token: --session-id/--session-token, --session-file, or env OGSOS_SESSION_TOKEN');
+  return { sessionId: String(sessionId), sessionToken: String(sessionToken) };
 }
 
 // ---------- filesystem / process helpers ----------
@@ -149,6 +182,7 @@ function resolveConfig(o) {
     dllSrc: path.join(sosHostDir, 'build', 'version.dll'), iniSrc: path.join(sosHostDir, 'sos_host.ini'),
     engineIni: o.engineIni || path.join(process.env.LOCALAPPDATA || '', 'SOS', 'Saved', 'Config', 'WindowsClient', 'Engine.ini'),
     steamId: o.steamId || null,
+    backend: o.backend || `127.0.0.1:${Number(o.port || 7781)}`, remote: !!o.backend,
   };
 }
 
@@ -176,14 +210,14 @@ function buildServerSpawn(cfg, o, session) {
 }
 
 function launcherArgs(cfg, o) {
-  const a = [path.join(REPO, 'launcher', 'launcher.js'), '--classic', '--server', `127.0.0.1:${cfg.port}`, '--no-launch'];
+  const a = [path.join(REPO, 'launcher', 'launcher.js'), '--classic', '--server', cfg.backend, '--no-launch'];
   if (o.engineIni) a.push('--ini', cfg.engineIni);
   return a;
 }
 
-function probe(port, timeoutMs = 1500) {
+function probe(port, timeoutMs = 1500, host = '127.0.0.1') {
   return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port, path: '/kv/live-rev.txt', timeout: timeoutMs }, (res) => { res.resume(); resolve(res.statusCode === 200); });
+    const req = http.get({ host, port, path: '/kv/live-rev.txt', timeout: timeoutMs }, (res) => { res.resume(); resolve(res.statusCode === 200); });
     req.on('timeout', () => { req.destroy(); resolve(false); });
     req.on('error', () => resolve(false));
   });
@@ -197,6 +231,33 @@ async function waitForServer(port, child, timeoutMs = 20000) {
     await sleep(250);
   }
   throw new Error(`server did not answer on port ${port} within ${timeoutMs / 1000}s`);
+}
+
+// Request to the backend's session API; the host auth is 'Token <SESSION_TOKEN>'. Resolves {status, json}.
+function sessionApi(backend, method, session, suffix = '', timeoutMs = 5000) {
+  const [host, port] = backend.split(':');
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host, port: Number(port), method, path: `/api/session/${encodeURIComponent(session.sessionId)}${suffix}`,
+      headers: { Authorization: `Token ${session.sessionToken}`, 'Content-Length': 0 }, timeout: timeoutMs }, (res) => {
+      let b = ''; res.on('data', (d) => { b += d; });
+      res.on('end', () => { let json = null; try { json = JSON.parse(b); } catch { /* not json */ } resolve({ status: res.statusCode, json }); });
+    });
+    req.on('timeout', () => req.destroy(new Error('timed out')));
+    req.on('error', (e) => reject(new Error(`${method} ${backend} session API: ${e.message}`)));
+    req.end();
+  });
+}
+
+// Read-only checks of a remote backend: reachable, token accepted, host SteamID seated in the session.
+async function checkRemote(cfg, session) {
+  const [host, port] = cfg.backend.split(':');
+  if (!(await probe(Number(port), 3000, host))) throw new Error(`backend ${cfg.backend} did not answer GET /kv/live-rev.txt with 200`);
+  const r = await sessionApi(cfg.backend, 'GET', session);
+  if (r.status === 401) throw new Error(`session token does not match the backend (401 from ${cfg.backend}); check the token in its OGSOS_CLASSIC_HOSTS`);
+  if (r.status === 404) throw new Error(`backend ${cfg.backend} has no hosted session ${session.sessionId}; check sessionId in its OGSOS_CLASSIC_HOSTS`);
+  if (r.status !== 200 || !r.json) throw new Error(`GET /api/session/<id> on ${cfg.backend} returned ${r.status}`);
+  if (!(cfg.steamId in (r.json['player-map'] || {}))) throw new Error(`host SteamID ${cfg.steamId} is not in the session's player-map; add "${cfg.steamId}" to hostIds of the session in the server's OGSOS_CLASSIC_HOSTS`);
+  return r.json;
 }
 
 function prefixPipe(stream, prefix) {
@@ -296,7 +357,7 @@ async function doCleanup(cfg, appIdCreated, log) {
 
 function printPlan(cfg, o, session, jwt) {
   const L = (s) => console.log(s);
-  const srv = buildServerSpawn(cfg, o, session);
+  const srv = cfg.remote ? null : buildServerSpawn(cfg, o, session);
   const secrets = [session.sessionToken, jwt];
   L('DRY RUN: nothing will be started, copied or written.');
   L(`Classic install : ${cfg.installDir}`);
@@ -308,10 +369,15 @@ function printPlan(cfg, o, session, jwt) {
   L(`  sos_host.ini  : ${cfg.iniSrc}  (${fs.existsSync(cfg.iniSrc) ? 'exists' : 'MISSING'})`);
   L(`Engine.ini      : ${cfg.engineIni}  (${fs.existsSync(cfg.engineIni) ? 'exists' : 'MISSING'}); backup -> ${cfg.engineIni}${BACKUP_TAG}<timestamp>`);
   L(`Session         : id ${session.sessionId}, token <redacted>`);
-  L(`1. server: ${srv.cmd} ${srv.args.join(' ')}  (cwd ${srv.cwd})`);
-  L(`   env OGSOS_CLASSIC_HOSTS=${redactArgs([srv.env.OGSOS_CLASSIC_HOSTS], secrets)[0]}`);
-  for (const k of ['OGSOS_CLASSIC_START_MIN_PLAYERS', 'OGSOS_CLASSIC_START_COUNTDOWN_SECONDS']) if (srv.env[k]) L(`   env ${k}=${srv.env[k]}`);
-  L(`2. wait for GET http://127.0.0.1:${cfg.port}/kv/live-rev.txt`);
+  if (srv) {
+    L(`1. server: ${srv.cmd} ${srv.args.join(' ')}  (cwd ${srv.cwd})`);
+    L(`   env OGSOS_CLASSIC_HOSTS=${redactArgs([srv.env.OGSOS_CLASSIC_HOSTS], secrets)[0]}`);
+    for (const k of ['OGSOS_CLASSIC_START_MIN_PLAYERS', 'OGSOS_CLASSIC_START_COUNTDOWN_SECONDS']) if (srv.env[k]) L(`   env ${k}=${srv.env[k]}`);
+    L(`2. wait for GET http://127.0.0.1:${cfg.port}/kv/live-rev.txt`);
+  } else {
+    L(`1. REMOTE backend ${cfg.backend}: no local server is started`);
+    L(`2. check GET http://${cfg.backend}/kv/live-rev.txt, then GET /api/session/<id> (Authorization: Token <redacted>); 'start' -> POST /api/session/<id>/start`);
+  }
   L(`3. launcher: ${process.execPath} ${launcherArgs(cfg, o).join(' ')}`);
   L(`4. install into Win64: version.dll, sos_host.ini [Host] ${Object.entries({ ...HOST_INI_KEYS, ...(o.noGameLog ? { GameLog: '0' } : {}) }).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   L(`   steam_appid.txt (${APP_ID}) ${fs.existsSync(path.join(cfg.win64, 'steam_appid.txt')) ? 'already present, left alone' : 'will be created'}`);
@@ -321,12 +387,14 @@ function printPlan(cfg, o, session, jwt) {
 }
 
 function printBanner(cfg, o) {
-  const pub = o.publicHost || '<YOUR-PUBLIC-IPv4>';
+  const bport = cfg.backend.split(':')[1];
+  const pub = cfg.remote ? (o.publicHost ? `${o.publicHost}:${bport}` : cfg.backend) : `${o.publicHost || '<YOUR-PUBLIC-IPv4>'}:${cfg.port}`;
   const bar = '='.repeat(72);
   console.log(['', bar, ' SOS: Classic playtest host is up', bar,
-    ` Friends run:   node launcher/launcher.js --classic --server ${pub}:${cfg.port}`,
-    ` Open on your router/firewall:  TCP ${cfg.port}  (backend)   UDP ${cfg.gamePort}  (game)`,
-    o.publicHost ? '' : ' (pass --public-host <your IPv4> so clients are told the right game address)',
+    ` Friends run:   node launcher/launcher.js --classic --server ${pub}`,
+    cfg.remote ? ` Open on your router/firewall:  UDP ${cfg.gamePort}  (game) must reach this PC; the backend is remote`
+      : ` Open on your router/firewall:  TCP ${cfg.port}  (backend)   UDP ${cfg.gamePort}  (game)`,
+    o.publicHost || cfg.remote ? '' : ' (pass --public-host <your IPv4> so clients are told the right game address)',
     ' Force-start the match:  type  start  and press Enter in this window',
     ' Stop everything:        Ctrl+C (files are removed and Engine.ini restored)',
     bar, ''].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n'));
@@ -347,16 +415,27 @@ async function main() {
   }
 
   cfg.steamId = cfg.steamId || readSteamId();
-  const session = newSession();
+  let session;
+  if (cfg.remote) session = resolveRemoteSession(o);
+  else {
+    if (o.sessionId || o.sessionToken || o.sessionFile) console.warn('[host_classic] WARNING: --session-id/--session-token/--session-file are ignored without --backend (a fresh session is generated)');
+    session = newSession();
+  }
+  if (cfg.remote && (o.minPlayers !== undefined || o.countdown !== undefined)) console.warn('[host_classic] WARNING: --min-players/--countdown are ignored with --backend (set them on the server)');
   const jwt = makeSessionJwt(session, cfg.steamId);
-  if (o.dryRun) { printPlan(cfg, o, session, jwt); return 0; }
+  if (o.dryRun) {
+    printPlan(cfg, o, session, jwt);
+    if (cfg.remote) { await checkRemote(cfg, session); console.log(`REMOTE CHECK OK: ${cfg.backend} answers, session token accepted, host SteamID ${cfg.steamId} is in the session`); }
+    return 0;
+  }
 
   const need = [[cfg.win64, 'Win64 folder'], [cfg.exe, 'game exe'], [cfg.engineIni, 'Engine.ini (start Classic once through Steam so it exists)']];
   if (!fs.existsSync(cfg.dllSrc) || !fs.existsSync(cfg.iniSrc)) {
     throw new Error(`sos_host files not found (${cfg.dllSrc}, ${cfg.iniSrc}). Pass --sos-host-dir <mod/sos_host folder> or merge the host-dll branch.`);
   }
   for (const [p, what] of need) if (!fs.existsSync(p)) throw new Error(`${what} not found: ${p}`);
-  if (await probe(cfg.port)) throw new Error(`something already answers on port ${cfg.port}; pick another --port`);
+  if (cfg.remote) { await checkRemote(cfg, session); console.log(`[host_classic] remote backend ${cfg.backend} OK (token accepted, host SteamID seated)`); }
+  else if (await probe(cfg.port)) throw new Error(`something already answers on port ${cfg.port}; pick another --port`);
 
   let server = null, host = null, shuttingDown = false, installed = false, appIdCreated = false, backedUp = false;
   let resolveDone; const done = new Promise((r) => { resolveDone = r; });
@@ -381,16 +460,24 @@ async function main() {
     if (listBackups(cfg.engineIni).length) restoreEngineIni(cfg.engineIni, log);
     fs.copyFileSync(cfg.engineIni, `${cfg.engineIni}${BACKUP_TAG}${stamp()}`); backedUp = true;
 
-    const srv = buildServerSpawn(cfg, o, session);
-    server = spawn(srv.cmd, srv.args, { cwd: srv.cwd, env: srv.env, stdio: ['pipe', 'pipe', 'pipe'] });
-    prefixPipe(server.stdout, '[server]'); prefixPipe(server.stderr, '[server]');
-    server.stdin.on('error', () => {});
-    server.on('exit', (c) => { if (!shuttingDown) shutdown(`server exited (code ${c})`, 1); });
-    await waitForServer(cfg.port, server);
-    log(`backend answering on port ${cfg.port}`);
-    // Forward typed lines (e.g. "start") to the backend.
-    const rl = readline.createInterface({ input: process.stdin });
-    rl.on('line', (l) => { if (server.exitCode === null) server.stdin.write(l + '\n'); });
+    if (cfg.remote) {
+      // 'start' -> POST /api/session/<id>/start on the remote backend.
+      readline.createInterface({ input: process.stdin }).on('line', (l) => {
+        if (l.trim().toLowerCase() !== 'start') return;
+        sessionApi(cfg.backend, 'POST', session, '/start').then((r) => log(`start: HTTP ${r.status} ${JSON.stringify(r.json)}`), (e) => log(`start failed: ${e.message}`));
+      });
+    } else {
+      const srv = buildServerSpawn(cfg, o, session);
+      server = spawn(srv.cmd, srv.args, { cwd: srv.cwd, env: srv.env, stdio: ['pipe', 'pipe', 'pipe'] });
+      prefixPipe(server.stdout, '[server]'); prefixPipe(server.stderr, '[server]');
+      server.stdin.on('error', () => {});
+      server.on('exit', (c) => { if (!shuttingDown) shutdown(`server exited (code ${c})`, 1); });
+      await waitForServer(cfg.port, server);
+      log(`backend answering on port ${cfg.port}`);
+      // Forward typed lines (e.g. "start") to the backend.
+      const rl = readline.createInterface({ input: process.stdin });
+      rl.on('line', (l) => { if (server.exitCode === null) server.stdin.write(l + '\n'); });
+    }
 
     await runLauncher(cfg, o);
     writeState({ win64: cfg.win64, appIdCreated: false });
@@ -411,7 +498,7 @@ async function main() {
   return exitCode;
 }
 
-module.exports = { parseVdf, mostRecentSteamId, setIniKeys, buildGameArgs, redactArgs, isOurFile, parseArgs, HOST_INI_KEYS, cleanupWin64, installFile };
+module.exports = { parseVdf, mostRecentSteamId, setIniKeys, buildGameArgs, redactArgs, isOurFile, parseArgs, resolveRemoteSession, sessionFromJson, HOST_INI_KEYS, cleanupWin64, installFile };
 
 if (require.main === module) {
   main().then((c) => process.exit(c), (e) => { console.error(`ERROR: ${e.message}`); process.exit(1); });

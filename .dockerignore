@@ -1,0 +1,7 @@
+# Whitelist: only what the backend image needs. Keeps db.json, secret.key, logs, mod/ and tools/ out.
+*
+!server/
+!data/kv/
+!data/kv-classic/
+!data/cosmetics.json
+!deploy/classic-backend/Dockerfile

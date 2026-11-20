@@ -177,7 +177,42 @@ node tools/host_classic.js --public-host <VPS public IPv4> --min-players 2
 
 `sudo bash vps_relay.sh --status` shows the rules. `sudo bash vps_relay.sh 100.x.y.z --remove` removes them. The rules do not survive a VPS reboot, so run the script again after one.
 
-Running the game host itself on a VPS is not supported. It is the full Classic client: it needs Windows, Steam signed in, and a GPU.
+Running the game host itself on a VPS is not supported yet. It is the full Classic client: it needs Windows, Steam signed in, and a GPU.
+
+### Backend on the Linux server (Docker)
+
+The backend (login, MOTD, matchmaking) can live on the server, so it stays up when your PC is off. The game host still runs on your PC.
+
+On the server, from a copy of this repo:
+
+```bash
+cd deploy/classic-backend
+cp .env.example .env && chmod 600 .env    # fill in the public IP, a session id + token, your SteamID64
+docker compose up -d --build
+```
+
+Then relay only the game port to your PC, because the container now answers TCP 7781 itself:
+
+```bash
+sudo BACKEND_PORT=none bash vps_relay.sh 100.x.y.z
+```
+
+On your PC, host against it. Keep the session id and token from the server's `.env`:
+
+```powershell
+$env:OGSOS_SESSION_TOKEN = "<token>"
+node tools/host_classic.js --backend <server IPv4>:7781 --session-id <id> --public-host <server IPv4>
+```
+
+Run it with `--dry-run` first. In remote mode, the dry run checks the backend, the token and your SteamID against the server.
+
+Friends use the same command as before, `--server <server IPv4>:7781`.
+
+The container:
+- runs as a non-root user with a read-only filesystem and a 512 MB memory limit;
+- publishes only port 7781;
+- keeps its accounts and logs on Docker volumes;
+- restarts on its own unless you stop it (`docker compose down`).
 
 ### Other options
 

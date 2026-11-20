@@ -9,8 +9,9 @@
 #   sudo bash vps_relay.sh <host-tailscale-ip> --remove   take them out again
 #   sudo bash vps_relay.sh --status                       show the rules this script added
 #
-# Env (optional): BACKEND_PORT (7781), GAME_PORT (7777), WAN_IF (default: the interface of the
-# default route), TS_IF (tailscale0).
+# Env (optional): BACKEND_PORT (7781; "none" = relay only the game port, for when the backend runs
+# on the VPS itself, see deploy/classic-backend), GAME_PORT (7777), WAN_IF (default: the interface
+# of the default route), TS_IF (tailscale0). Use the same env for --remove as for adding.
 #
 # Needs: root, iptables, Tailscale installed and logged in on the VPS and on the host PC, both in
 # the same tailnet. The rules are not saved across a reboot: run the script again after one.
@@ -53,7 +54,9 @@ rule() {
   fi
 }
 
-for p in "tcp $BACKEND_PORT" "udp $GAME_PORT"; do
+PORTS=("udp $GAME_PORT")
+[ "$BACKEND_PORT" = none ] || PORTS=("tcp $BACKEND_PORT" "${PORTS[@]}")
+for p in "${PORTS[@]}"; do
   set -- $p
   # Public port on the VPS -> same port on the host PC, over Tailscale.
   rule nat PREROUTING -i "$WAN_IF" -p "$1" --dport "$2" -j DNAT --to-destination "$HOST:$2"
@@ -67,7 +70,7 @@ if [ "$MODE" = add ]; then
   sysctl -q -w net.ipv4.ip_forward=1
   PUB="$(ip -4 addr show "$WAN_IF" | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')"
   cat <<EOF
-Relay on: $WAN_IF TCP $BACKEND_PORT + UDP $GAME_PORT -> $HOST (via $TS_IF).
+Relay on: $WAN_IF ${PORTS[*]} -> $HOST (via $TS_IF).
 Also allow TCP $BACKEND_PORT and UDP $GAME_PORT in the VPS provider's firewall / security group.
 The VPS's address on $WAN_IF is ${PUB:-unknown}. If your provider uses 1:1 NAT that is a private
 address: use the public IPv4 from the provider's dashboard instead.

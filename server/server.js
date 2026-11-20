@@ -13,10 +13,13 @@ const path = require('path');
 const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, DEFAULTS } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
-const LOG_DIR = path.join(ROOT, 'logs');
+// OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
+// repo, e.g. onto a Docker volume. data/ itself (kv, cosmetics, config.json) stays read-only.
+const LOG_DIR = process.env.OGSOS_LOG_DIR || path.join(ROOT, 'logs');
 const DATA_DIR = path.join(ROOT, 'data');
+const STATE_DIR = process.env.OGSOS_STATE_DIR || DATA_DIR;
 fs.mkdirSync(LOG_DIR, { recursive: true });
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(STATE_DIR, { recursive: true });
 
 const argPort = process.argv.indexOf('--port');
 const PORT = argPort > 0 ? Number(process.argv[argPort + 1]) : 7780;
@@ -31,7 +34,7 @@ function log(file, entry) {
 }
 
 // ---------- tiny JSON "database" ----------
-const DB_FILE = path.join(DATA_DIR, 'db.json');
+const DB_FILE = path.join(STATE_DIR, 'db.json');
 let db = { accounts: {}, appData: {}, tokens: {} };
 try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { /* first run */ }
 function saveDb() { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
@@ -43,7 +46,7 @@ function newToken(accountId) {
   return token;
 }
 // JWT-shaped token: base64url(header).base64url(claims).base64url(HMAC-SHA256).
-const SECRET_FILE = path.join(DATA_DIR, 'secret.key');
+const SECRET_FILE = path.join(STATE_DIR, 'secret.key');
 if (!fs.existsSync(SECRET_FILE)) fs.writeFileSync(SECRET_FILE, crypto.randomBytes(32).toString('hex'));
 const SECRET = fs.readFileSync(SECRET_FILE, 'utf8');
 const b64u = (s) => Buffer.from(s).toString('base64url');
