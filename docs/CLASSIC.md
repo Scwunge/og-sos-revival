@@ -227,6 +227,28 @@ Launcher (`launcher/launcher.js`):
    - Pointing one client at a server points both, and `--restore` restores both.
 9. **Hosting** is still blocked on `UWorld::Listen`. Later, a host mode would pass `LaCuna?game=SUR?listen` and run a patched private copy of the exe.
 
+### MMS session routes for a hosted server
+
+A listen server is started with `-SESSION_ID=<hyphenated guid> -SESSION_TOKEN=<secret>` and uses the client's MatchmakingApi (`http://<ip>:<port>/api`). It sends `Authorization: Token <SESSION_TOKEN>` on:
+
+- `GET /api/session/<id>`: once at startup and then every 5 s. The server answers 200 with the **bare** session object (same as `sessionObj(s, true)`, no `{version,data}` wrapper). Every GET kicks any connected player missing from `player-map`, so `player-map` always also lists the configured `hostIds` (the host's own player, possibly the same Steam id as a joiner).
+- `POST /api/session/<id>/events` with `{"type":"match-start"}`: 200 `{"result":true}` (the type is logged).
+
+Unknown id gives 404, a wrong or missing token gives 401. Both matchmakers are searched (Classic first).
+
+With `HOSTS` configured, matchmade solo/duo players are **added to the host's fixed session** (id = `sessionId`, owner `system`, host/port from the entry) instead of a new session, and removed again when they leave or their WebSocket closes. They get `session` then `session-started` as before. Custom matches (`create-session`) are unchanged. Only the first host is used for now.
+
+The `access-token` in each player's `session` packet is a per-player JWT: header `{"typ":"JWT","alg":"HS512"}`, signed with HMAC-SHA512 using the `sessionToken` as key, claims `sub` = session id, `roles` = `["user+session"]`, the player's `id`, `iat`, `exp`. Sessions without a host keep the old random token.
+
+Config (`classic.HOSTS` in `data/config.json`, or env `OGSOS_CLASSIC_HOSTS` as a JSON string; the main matchmaker reads `HOSTS` / `OGSOS_HOSTS`; the main list is not inherited by Classic):
+
+```json
+"HOSTS": [{ "host": "127.0.0.1", "port": 7777, "sessionId": "00000000-0000-0000-0000-000000000000",
+            "sessionToken": "CHANGE-ME-placeholder", "hostIds": ["76561190000000000"] }]
+```
+
+`host` must be an IPv4 literal, `sessionId` must contain `-`, `sessionToken` longer than 1 character; bad entries are warned about and skipped. Start the game host with the same values: `-SESSION_ID=<sessionId> -SESSION_TOKEN=<sessionToken>`. Test: start the server with `OGSOS_CLASSIC_HOSTS` set and run `node tools/classic_test.js <port>`.
+
 ## Live test, 2026-11-20 (branch server on 7781, hosting session's listen host on 7777)
 
 - **Steam auth.** It fails (`LoadingSteamClientAuth` Success=false) when the exe is launched directly, because the Classic install ships no `steam_appid.txt`. The launcher now sets `SteamAppId`/`SteamGameId` = 802240 in the child environment. With that set: `LoadingSteamClientAuth` true, then `POST /api/access-token/steam` 200, then `LoadingOutpostLoginEnd` Success=true, user 7656119xxxxxxxxxx.

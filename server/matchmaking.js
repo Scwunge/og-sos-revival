@@ -21,7 +21,46 @@ const DEFAULTS = {
   MATCH_BATCH_MS: 300,         // wait this long after the queue becomes matchable so near-simultaneous players share a session
   LATE_JOIN_SECONDS: 60,       // a matchmade session accepts newly queued players for this long
   GROUP_MAX_SIZE: 8,           // players per group
+  HOSTS: [],                   // fixed game hosts: [{host, port, sessionId, sessionToken, hostIds}], see docs/CLASSIC.md
 };
+
+// Validate a HOSTS value (array or JSON string). Bad entries are warned about and skipped.
+function parseHosts(raw, warn = console.warn, defaultPort = 7777) {
+  if (raw === undefined || raw === null || raw === '') return [];
+  if (typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch (e) { warn(`HOSTS ignored: not valid JSON (${e.message})`); return []; }
+  }
+  if (!Array.isArray(raw)) { warn('HOSTS ignored: not an array'); return []; }
+  const out = [];
+  raw.forEach((h, i) => {
+    const o = h && typeof h === 'object' ? h : {};
+    const port = o.port === undefined || o.port === '' ? defaultPort : Number(o.port);
+    const problem = !net.isIPv4(String(o.host)) ? 'host must be an IPv4 literal'
+      : !Number.isInteger(port) || port < 1 || port > 65535 ? 'bad port'
+      : typeof o.sessionId !== 'string' || !o.sessionId.includes('-') ? 'sessionId must be a string containing "-"'
+      : typeof o.sessionToken !== 'string' || o.sessionToken.length <= 1 ? 'sessionToken must be a string longer than 1 character'
+      : null;
+    if (problem) { warn(`HOSTS[${i}] skipped: ${problem}`); return; }
+    out.push({
+      host: o.host, port, sessionId: o.sessionId, sessionToken: o.sessionToken,
+      hostIds: Array.isArray(o.hostIds) ? o.hostIds.map(String).filter(Boolean) : [],
+    });
+  });
+  return out;
+}
+
+const b64u = (v) => Buffer.from(v).toString('base64url');
+// Access token a listen server accepts: HS512 keyed with its SESSION_TOKEN, sub = session id.
+function makeSessionJwt(entry, playerId) {
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64u(JSON.stringify({ typ: 'JWT', alg: 'HS512' }));
+  const claims = b64u(JSON.stringify({
+    sub: entry.sessionId, id: String(playerId), 'user-id': String(playerId), 'account-id': String(playerId),
+    roles: ['user+session'], iat: now, exp: now + 24 * 3600,
+  }));
+  const sig = crypto.createHmac('sha512', entry.sessionToken).update(`${head}.${claims}`).digest('base64url');
+  return `${head}.${claims}.${sig}`;
+}
 
 function loadConfig(dataDir, env = process.env, warn = console.warn) {
   const cfg = { ...DEFAULTS };
@@ -29,6 +68,7 @@ function loadConfig(dataDir, env = process.env, warn = console.warn) {
   try { file = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8')); }
   catch (e) { if (e.code !== 'ENOENT') warn(`data/config.json ignored: ${e.message}`); }
   for (const key of Object.keys(DEFAULTS)) {
+    if (key === 'HOSTS') continue;
     let v = env[`OGSOS_${key}`] !== undefined ? env[`OGSOS_${key}`] : file[key];
     if (v === undefined || v === null || v === '') continue;
     if (typeof DEFAULTS[key] === 'number') {
@@ -37,6 +77,7 @@ function loadConfig(dataDir, env = process.env, warn = console.warn) {
     } else v = String(v);
     cfg[key] = v;
   }
+  cfg.HOSTS = parseHosts(env.OGSOS_HOSTS !== undefined ? env.OGSOS_HOSTS : file.HOSTS, warn, cfg.GAME_SERVER_PORT);
   if (!net.isIPv4(cfg.GAME_SERVER_HOST)) {
     warn(`config GAME_SERVER_HOST "${cfg.GAME_SERVER_HOST}" is not an IPv4 literal (the client does no DNS); using 127.0.0.1`);
     cfg.GAME_SERVER_HOST = '127.0.0.1';
@@ -56,6 +97,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   const sessions = new Map();  // sessionId -> session
   let queue = [];              // { kind: 'solo'|'group', client?, groupId?, opts, since }
   let batchTimer = null;
+  const hostEntries = Array.isArray(config.HOSTS) ? config.HOSTS : [];
+  const hostedById = new Map(); // sessionId -> { s, entry }; one persistent live session per host
 
   const uname = (id) => getUname(id) || id;
   const newId = () => crypto.randomUUID(); // the client's JoinSession rejects ids without a hyphen
@@ -92,7 +135,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     };
   }
 
-  const sendSession = (c, s, withHost = false) => c.sendMsg('session', { session: sessionObj(s, withHost), 'access-token': s.token });
+  const tokenFor = (s, c) => (s.hosted ? makeSessionJwt(s.hosted, c.id) : s.token);
+  const sendSession = (c, s, withHost = false) => c.sendMsg('session', { session: sessionObj(s, withHost), 'access-token': tokenFor(s, c) });
   const sendStarted = (c, s) => c.sendMsg('session-started', { id: s.id, host: s.host, port: s.port });
 
   // ---------- groups ----------
@@ -145,6 +189,25 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     return s;
   }
 
+  for (const entry of hostEntries) {
+    const s = newSession({
+      id: entry.sessionId, name: 'Match', host: entry.host, port: entry.port, owner: 'system',
+      matchmade: true, started: true, hosted: entry, token: entry.sessionToken,
+    });
+    hostedById.set(entry.sessionId, { s, entry });
+  }
+  const hostedSession = () => (hostEntries.length ? hostedById.get(hostEntries[0].sessionId).s : null);
+
+  // For the host's own GET /api/session/<id>: the live session plus the host's configured player ids
+  // (every GET kicks players missing from player-map, including the host's own).
+  function getHostedSession(id) {
+    const h = hostedById.get(String(id));
+    if (!h) return null;
+    const session = sessionObj(h.s, true);
+    for (const hid of h.entry.hostIds) session['player-map'][hid] ??= { uname: uname(hid), 'auto-group': false };
+    return { session, token: h.entry.sessionToken };
+  }
+
   function addPlayerToSession(s, c, groupId, notifyIds = s.players.keys()) {
     // Tell the players already inside (notifyIds) before adding the newcomer.
     for (const pid of [...notifyIds]) {
@@ -163,6 +226,10 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const [gid, list] of Object.entries(s.groups)) {
       s.groups[gid] = list.filter((p) => p !== c.id);
       if (!s.groups[gid].length) delete s.groups[gid];
+    }
+    if (s.hosted) {
+      for (const pid of s.players.keys()) clients.get(pid)?.sendMsg('player-leave', { id: s.id, 'player-id': c.id });
+      return;   // the fixed session outlives its players
     }
     if (!s.players.size) { sessions.delete(s.id); return; }
     if (s.owner === c.id) s.owner = s.players.keys().next().value;
@@ -200,6 +267,13 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function createMatch(batch) {
     const first = obj(batch[0].opts);
+    const live = hostedSession();
+    if (live) {
+      if (!live.players.size) live.opts = { gameMode: str(first['game-mode']), gameModeParams: '', map: str(first.map), language: str(first.language) };
+      seat(live, batch);
+      console.log(`mm hosted session ${live.id} now has ${live.players.size} player(s) -> ${live.host}:${live.port}`);
+      return live;
+    }
     const s = newSession({
       name: 'Match', matchmade: true, started: true,
       opts: { gameMode: str(first['game-mode']), gameModeParams: '', map: str(first.map), language: str(first.language) },
@@ -211,6 +285,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   // A matchmade session that is still young and has room takes newly queued players straight away.
   function findOpenSession(count) {
+    const live = hostedSession();
+    if (live) return live.players.size + count <= config.MAX_PLAYERS ? live : null;
     const now = Date.now();
     for (const s of sessions.values()) {
       if (s.matchmade && now - s.createdAt < config.LATE_JOIN_SECONDS * 1000 && s.players.size + count <= config.MAX_PLAYERS) return s;
@@ -246,7 +322,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function enqueue(entry, count) {
     const open = findOpenSession(count);
-    if (open) { seat(open, [entry]); return; }
+    if (open) { if (open.hosted && !open.players.size) createMatch([entry]); else seat(open, [entry]); return; }
     queue.push(entry);
     sendSummary();
     if (queuePlayers() >= config.MIN_PLAYERS) scheduleMatch();
@@ -449,7 +525,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function shutdown() { clearInterval(tick); clearTimeout(batchTimer); }
 
-  return { onConnect, onMessage, onClose, shutdown, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
-module.exports = { loadConfig, createMatchmaker, DEFAULTS };
+module.exports = { parseHosts, makeSessionJwt, loadConfig, createMatchmaker, DEFAULTS };

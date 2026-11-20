@@ -11,7 +11,7 @@
     "LATE_JOIN_SECONDS": "How long a matchmade session keeps accepting newly queued players. Default: 60",
     "GROUP_MAX_SIZE": "Maximum players per group. Default: 8",
     "env": "Every key can also be set with an environment variable named OGSOS_<KEY>, e.g. OGSOS_GAME_SERVER_HOST. Env wins over this file. Keys starting with _ are ignored.",
-    "classic": "SOS: Classic (app-id sostest) options. EXTRA_ROLES: roles added for every Classic login (everyone already gets app-user, user, testserver). DEV_ACCOUNTS: account ids or Steam ids that also get the dev role (Director button, server browser). Any matchmaking key above may be repeated here to override it for Classic only (e.g. GAME_SERVER_PORT for a Classic host); env OGSOS_CLASSIC_<KEY> also works. Classic live config is served from data/kv-classic/."
+    "classic": "SOS: Classic (app-id sostest) options. EXTRA_ROLES: roles added for every Classic login (everyone already gets app-user, user, testserver). DEV_ACCOUNTS: account ids or Steam ids that also get the dev role (Director button, server browser). Any matchmaking key above may be repeated here to override it for Classic only (e.g. GAME_SERVER_PORT for a Classic host); env OGSOS_CLASSIC_<KEY> also works. Classic live config is served from data/kv-classic/. HOSTS (Classic only here, or env OGSOS_CLASSIC_HOSTS as a JSON string): fixed game hosts, see docs/CLASSIC.md \"MMS session routes for a hosted server\"; with it set, matchmade players join the host's fixed session instead of a new one."
   },
   "REGION_NAME": "local",
   "BEACON_URL": "",
@@ -26,6 +26,15 @@
   "classic": {
     "EXTRA_ROLES": [],
     "DEV_ACCOUNTS": [],
-    "GAME_SERVER_PORT": 7777
+    "GAME_SERVER_PORT": 7777,
+    "HOSTS": [
+      {
+        "host": "127.0.0.1",
+        "port": 7777,
+        "sessionId": "00000000-0000-0000-0000-000000000000",
+        "sessionToken": "CHANGE-ME-placeholder",
+        "hostIds": ["76561190000000000"]
+      }
+    ]
   }
 }

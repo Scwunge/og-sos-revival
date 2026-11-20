@@ -10,7 +10,7 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, createMatchmaker, DEFAULTS } = require('./matchmaking');
+const { loadConfig, createMatchmaker, parseHosts, DEFAULTS } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
 const LOG_DIR = path.join(ROOT, 'logs');
@@ -175,6 +175,23 @@ function handleApi(req, url, body, res) {
   const m = (re) => p.match(re);
   let r;
 
+  // Routes the game host (a listen server) calls on its MMS, authorised by `Token <SESSION_TOKEN>`.
+  if ((r = m(/^\/api\/session\/([^/]+?)(\/events)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
+    const id = decodeURIComponent(r[1]);
+    const found = mmClassic.getHostedSession(id) || mm.getHostedSession(id);
+    if (!found) return send(res, 404, { error: 'not-found' });
+    const given = Buffer.from(String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim());
+    const want = Buffer.from(found.token);
+    if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return send(res, 401, { error: 'unauthorized' });
+    if (r[2]) {
+      let j = {}; try { j = JSON.parse(body || '{}'); } catch {}
+      console.log(`host event for session ${id}: ${j.type}`);
+      log('ws.jsonl', { event: 'host-event', session: id, type: j.type, body });
+      return send(res, 200, { result: true });
+    }
+    return send(res, 200, found.session);
+  }
+
   // Login. The client posts {"steam-app-id","steam-id","session-auth-token","roles","app-id"}
   // to /api/access-token/steam and expects a JWT-shaped token (it rejects anything not
   // "xxx.yyy.zzz" and reads "claims" from it). Field names are still guesses, so the
@@ -290,7 +307,10 @@ const mm = createMatchmaker({
 // object in data/config.json, or env OGSOS_CLASSIC_<KEY>.
 function classicMmConfig() {
   const cfg = { ...CONFIG };
+  // HOSTS is never inherited from the main config (it would put both builds in one host's session).
+  cfg.HOSTS = parseHosts(process.env.OGSOS_CLASSIC_HOSTS ?? CLASSIC.mm.HOSTS, console.warn, cfg.GAME_SERVER_PORT);
   for (const key of Object.keys(DEFAULTS)) {
+    if (key === 'HOSTS') continue;
     let v = process.env[`OGSOS_CLASSIC_${key}`] ?? CLASSIC.mm[key];
     if (v === undefined || v === null || v === '') continue;
     if (typeof DEFAULTS[key] === 'number') { v = Number(v); if (!Number.isFinite(v)) continue; } else v = String(v);
@@ -386,6 +406,9 @@ server.on('upgrade', (req, socket) => {
       if (client) mmFor.onMessage(client, text);
     }
   });
+  // The http server leaves upgraded sockets half-open, so a client that just drops the TCP connection
+  // (no close frame) would otherwise never reach 'close' and keep its seat in a session.
+  socket.on('end', () => socket.end());
   socket.on('close', () => {
     if (client) mmFor.onClose(client);
     log('ws.jsonl', { id, event: 'close' });
