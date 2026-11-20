@@ -195,38 +195,78 @@ Join options `SpectatorOnly=1` and `DirectorOnly=1` (and `bDirectorOnly`, `MaxSp
 
 Matchmaking joiners connect to whatever `session-started` names, so the same `server/` MMS flow would work once a host can listen (route 0).
 
-## Code changes Classic needs (not made here)
+## Classic support in `server/` and `launcher/` (implemented)
+
+Tested with `node tools/mm_test.js <port>` (main client, unchanged behaviour) and `node tools/classic_test.js <port>` against a temporary server. It was **not** tested with the real Classic client.
 
 Server (`server/server.js`):
 
-1. **app-id `sostest`.** Login: keep `j['app-id']` (Classic sends `sostest`). AppPersistence `/api/account/:id/app/sostest` is already keyed by app, so no change is needed.
-   - Optionally drop `/api/app/sostest/...` inventory, store and season routes: Classic never calls them.
-2. **Roles.** Login should return roles that include `user` and `testserver` for Classic (for example `["app-user","user","testserver"]`), plus `dev` for chosen accounts (Director and server browser).
-   - The roles come out of `AppRoles`, a **space-separated** list. Check what form our login reply uses: Main reads the same attribute.
-3. **KV.** Classic reads a different key set. It can share one `runtime-<rev>.json` with Main, because the keys do not overlap except `UE_CLIENT_CUSTOM_MATCHES_MAPS`, `UE_CLIENT_INACTIVE_SERVER_TEXT` and `UE_CLIENT_TEST_SERVER_ENABLED`. Main and Classic disagree on the map-list value (`LaCuna/LaCuna_BR` vs `LaCuna`). Either serve per-app KV or list both values. Minimum keys:
-   ```json
-   {
-     "UE_CLIENT_TEST_SERVER_ENABLED": true,
-     "UE_CLIENT_CUSTOM_MATCHES_ENABLED": true,
-     "UE_CLIENT_CUSTOM_MATCHES_ROLES": ["user"],
-     "UE_CLIENT_CUSTOM_MATCHES_MAPS": ["LaCuna"],
-     "UE_CLIENT_DUOS_ENABLED": true,
-     "UE_CLIENT_DUOS_ROLES": ["user"],
-     "UE_CLIENT_DIRECTOR_USERS": []
-   }
-   ```
-   Leave `UE_CLIENT_MINIMUM_REQUIRED_BUILD` unset, or set it to `5.57767.0` or lower.
-4. **Matchmaking.** Accept `find-session` with empty game-mode and map (solo on LaCuna). Accept `group-find-session` with game-mode `duo`. Accept `create-session` with game-mode `solo` and map `LaCuna`. Hand out Classic hosts only to Classic clients: key the queues on app-id from the JWT, because Main uses map `LaCuna_BR` and the two builds cannot play together.
+1. **App id.** Login keeps the `app-id` the client sends (Classic: `sostest`) in the JWT. AppPersistence is keyed by app already. Classic never calls the inventory, store or season routes, so they stay as they are for the main client.
+2. **Roles.** A `sostest` login gets `app-user user testserver`, plus any `classic.EXTRA_ROLES`, plus `dev` for accounts or Steam ids in `classic.DEV_ACCOUNTS` (`data/config.json`).
+   - The roles are in the JWT `roles` claim and also in the top-level `roles` of the login reply. Main-client logins are unchanged.
+3. **Live config.** Both clients share one Engine.ini, so they share one KV endpoint. The server picks the folder by the request's `app-id` header:
+   - `sostest` gets `data/kv-classic/`;
+   - everything else gets `data/kv/`.
+
+   `data/kv-classic/runtime-1.json` sets:
+   - `UE_CLIENT_TEST_SERVER_ENABLED` and its MOTD;
+   - the custom-match keys (map `LaCuna`) and the duo keys, all open to role `user`;
+   - an empty `UE_CLIENT_DIRECTOR_USERS`.
+4. **Matchmaking.** Classic connections (JWT `app-id` `sostest`) go to a **second matchmaker instance**. `server/matchmaking.js` is unchanged. The two builds never share a queue or session.
+   - Its settings default to the main ones. Any key can be overridden in the `classic` object of `data/config.json`, or with env `OGSOS_CLASSIC_<KEY>`; for example `GAME_SERVER_PORT` for a Classic host.
+   - Empty game-mode or map (solo), `duo` groups and custom `create-session`/`start-session` work as-is.
+5. **WebSocket subprotocol.** The 101 reply echoes the whole `Sec-WebSocket-Protocol` value (`wss,ws`), for both clients.
+6. **Cosmetics.** No `data/cosmetics-classic.json`: Classic has no inventory service. Its locks are Steam DLC checks (see Cosmetics above), which the server cannot answer.
 
 Launcher (`launcher/launcher.js`):
 
-5. **Classic install path.** `--game "C:\Program Files (x86)\Steam\steamapps\common\SOS Test Server"` already points the exe there, because the folder layout is identical. A `--classic` shortcut would be convenient.
-6. **Config.** Classic uses the **same** `%LOCALAPPDATA%\SOS\Saved\Config\WindowsClient\Engine.ini` as Main and reads the same Outpost sections. The extra `[OutpostIAP]` and `[OutpostStorefront]` sections are harmless, so the same patch serves both clients and nothing needs to change. Just be aware that patching for one patches the other, and `--restore` restores both.
-7. **Hosting.** Blocked until a `UWorld::Listen` replacement exists (route 0). After that, a host mode would pass `LaCuna?game=SUR?listen` as the first argument and run a patched private copy of the exe (Listen cave; filter at 0x414D8F; DLC at 0x166390 and 0x1662D0) next to the original, never touching the original.
-8. **Matchmaking WebSocket.** Echo `Sec-WebSocket-Protocol: wss,ws` in full; Classic has the same literal as Main.
+7. `--classic` (or a `--game` path containing `SOS Test Server`) finds the install from Steam's `libraryfolders.vdf` and `appmanifest_802240.acf`. On this machine that is `C:\Program Files (x86)\Steam\steamapps\common\SOS Test Server`.
+8. **Saved path.** It is `%LOCALAPPDATA%\SOS\Saved\Config\WindowsClient\Engine.ini`, **the same file as the main client**, because both builds are project `SOS`. This is Inferred from the shared engine code; Classic has never been run on this PC, so there is no Classic log to confirm it.
+   - `--ini <path>` overrides it.
+   - The launcher writes the same sections for both clients. The extra IAP and Storefront sections are harmless to Classic.
+   - Pointing one client at a server points both, and `--restore` restores both.
+9. **Hosting** is still blocked on `UWorld::Listen`. Later, a host mode would pass `LaCuna?game=SUR?listen` and run a patched private copy of the exe.
+
+## Addresses for a `UWorld::Listen` replacement (Classic exe, image base 0x140000000)
+
+| What | Address / offset | Evidence |
+|---|---|---|
+| `UEngine::LoadMap` | FUN_141416250 | "LoadMap: failed to Listen(%s)" (UnrealEngine.cpp:0x2639) |
+| Listen call site in LoadMap | **0x141417674**: `mov rcx,[r14+0x298]; mov rdx,r13; call 0x140B6EDF0; test al,al` | rcx = `WorldContext.ThisCurrentWorld`, rdx = `FURL&` |
+| `UWorld::Listen` (stub) | **0x140B6EDF0** = `32 C0 C3`, a shared return-false stub: patch the **call site**, not the stub | |
+| `GIsClient` | DAT_142A035B8 (constant 1) | LoadMap tests `GIsClient==0 \|\| URL.HasOption("Listen")` |
+| `GWorld` | DAT_142B79370 | set in LoadMap |
+| **`GEngine`** | **DAT_142B766A0** (UEngine*) | loaded before both `CreateNamedNetDriver` wrapper calls |
+| `UEngine::WorldList` | engine **+0xB78** (FWorldContext** data), count +0xB80 | wrapper loops |
+| `FWorldContext.ThisCurrentWorld` | **+0x298** | |
+| `FWorldContext.PendingNetGame` | +0x1C8 | |
+| `FWorldContext.ActiveNetDrivers` | +0x248 (data), +0x250 (count); 16-byte `FNamedNetDriver {UNetDriver*, def*}` | `CreateNamedNetDriver_Local` |
+| **`UEngine::CreateNamedNetDriver(UWorld*, FName name, FName def)`** | **FUN_1414048E0** (bool) | walks WorldList for ThisCurrentWorld==world |
+| `UEngine::CreateNamedNetDriver(UPendingNetGame*, ...)` | FUN_141404870 | |
+| `CreateNamedNetDriver_Local(UEngine*, FWorldContext&, FName, FName)` | FUN_141404950 | "CreateNamedNetDriver %s already exists as %s" |
+| `UNetDriver.NetDriverName` | driver **+0xE0** (FName) | |
+| `FName::FName(const TCHAR*, EFindName)` | FUN_140472C50 (`(FName* out, L"GameNetDriver", 1)`) | used everywhere for names |
+| **`UWorld::NetDriver`** | world **+0x38** (DemoNetDriver +0xB8; PersistentLevel +0x30) | UWorld reflection (UObjectProperty offsets) |
+| `FNetworkNotify*` for the world | world **+0x28** (second base after UObject's 0x28 bytes): **Inferred** from the layout | |
+| `UNetDriver` vtable | 0x142410EB0: `InitBase` +0x1E8, `InitConnect` +0x1F0, **`InitListen` +0x1F8**, `InitConnectionlessHandler` +0x200 | pure-virtual stub FUN_1411E5990 "UNetDriver::InitListen" sits in slot +0x1F8 |
+| **`UIpNetDriver::InitListen(this, FNetworkNotify*, FURL&, bool bReuseAddressAndPort, FString& Error)`** | **FUN_140E542B0** (vtable 0x1422F0830, slot +0x1F8) | "Failed to init net driver ListenURL" / "IpNetDriver listening on port %i" (IpNetDriver.cpp); stores the bound port to URL+0x20 |
+
+The UE 4.12 body to recreate:
+
+```
+if (World->NetDriver) return false;
+if (CreateNamedNetDriver(GEngine, World, NAME_GameNetDriver, NAME_GameNetDriver))
+    World->NetDriver = <ActiveNetDrivers entry whose driver+0xE0 == NAME_GameNetDriver>;
+// then driver->SetWorld(World): its vtable slot was not identified here
+if (!World->NetDriver) return false;
+return World->NetDriver->InitListen((FNetworkNotify*)((char*)World + 0x28), URL, false, Error);
+```
+
+The config names the Steam net driver with an IpNetDriver fallback, so the driver created from `GameNetDriver` may be `SteamNetDriver`, which also overrides `InitListen`. Still to find: `SetWorld` and `DestroyNamedNetDriver`.
 
 ## Helper scripts added
 
 - `tools/exe_strings.py`: dump, diff or grep the UTF-16 and ASCII strings of one or two exes. `diff` writes `only_a/only_b/common.txt`.
 - `tools/kismet_dis.py`: a minimal UE 4.12 Blueprint bytecode disassembler for cooked `.uasset` files (`list`, `dis [Func]`, `strings`). It prints in-memory offsets, so jump targets line up.
 - `tools/ghidra/run-classic.ps1`: like `run.ps1`, but for the `SOS-Classic` Ghidra project (setup steps are in the header).
+- `tools/classic_test.js`: Classic checks against a running server (login roles, per-app KV, separate queues, custom match).

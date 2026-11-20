@@ -4,9 +4,15 @@
 //   node launcher/launcher.js --server 127.0.0.1:7780     point at a server and launch
 //   node launcher/launcher.js --server host:port --no-launch
 //   node launcher/launcher.js --restore                   put the original settings back
+//   node launcher/launcher.js --classic --server ...      same, for SOS: Classic (Steam app 802240)
+//
+// Other options: --game "<install folder>" (default: found from Steam's library manifests),
+// --ini "<Engine.ini path>" (default below).
 //
 // It only edits your own config file (%LOCALAPPDATA%\SOS\Saved\Config\WindowsClient\Engine.ini).
-// The game files themselves are never touched. A backup is kept next to the file.
+// SOS: Classic uses the SAME file (both builds are project "SOS"), so pointing one client at a
+// server points both, and --restore restores both. The game files themselves are never touched.
+// A backup is kept next to the file.
 
 'use strict';
 const fs = require('fs');
@@ -17,14 +23,40 @@ const args = process.argv.slice(2);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const flag = (name) => args.includes(name);
 
-const INI = path.join(process.env.LOCALAPPDATA || '', 'SOS', 'Saved', 'Config', 'WindowsClient', 'Engine.ini');
+const STEAM_DIR = 'C:\\Program Files (x86)\\Steam';
+const APPS = {
+  main: { id: '619080', name: 'SOS', dir: 'SOS' },
+  classic: { id: '802240', name: 'SOS: Classic', dir: 'SOS Test Server' },
+};
+
+// Find a Steam app's install folder from libraryfolders.vdf and appmanifest_<id>.acf.
+function findSteamApp(app) {
+  const libs = [STEAM_DIR];
+  try {
+    const vdf = fs.readFileSync(path.join(STEAM_DIR, 'steamapps', 'libraryfolders.vdf'), 'utf8');
+    for (const m of vdf.matchAll(/"path"\s+"([^"]+)"/g)) libs.push(m[1].replace(/\\\\/g, '\\'));
+  } catch { /* no Steam here */ }
+  for (const lib of libs) {
+    try {
+      const acf = fs.readFileSync(path.join(lib, 'steamapps', `appmanifest_${app.id}.acf`), 'utf8');
+      const dir = acf.match(/"installdir"\s+"([^"]+)"/);
+      if (dir) return path.join(lib, 'steamapps', 'common', dir[1]);
+    } catch { /* not in this library */ }
+  }
+  return path.join(STEAM_DIR, 'steamapps', 'common', app.dir);
+}
+
+// Classic if asked for, or if --game points at the Classic install folder.
+const CLASSIC = flag('--classic') || /SOS Test Server/i.test(opt('--game') || '');
+const APP = CLASSIC ? APPS.classic : APPS.main;
+const INI = opt('--ini') || path.join(process.env.LOCALAPPDATA || '', 'SOS', 'Saved', 'Config', 'WindowsClient', 'Engine.ini');
 const BACKUP = INI + '.ogsos-backup';
-const GAME_DIR = opt('--game') || 'C:\\Program Files (x86)\\Steam\\steamapps\\common\\SOS';
+const GAME_DIR = opt('--game') || findSteamApp(APP);
 const EXE = path.join(GAME_DIR, 'SOS', 'Binaries', 'Win64', 'SOS-Win64-Shipping.exe');
 
 function die(msg) { console.error('ERROR: ' + msg); process.exit(1); }
 
-if (!fs.existsSync(INI)) die(`Config not found at ${INI}. Start SOS once through Steam so it creates it.`);
+if (!fs.existsSync(INI)) die(`Config not found at ${INI}. Start ${APP.name} once through Steam so it creates it.`);
 
 if (flag('--restore')) {
   if (!fs.existsSync(BACKUP)) die('No backup found; nothing to restore.');
@@ -38,7 +70,9 @@ if (!server) die('Pass --server host:port (for example --server 127.0.0.1:7780),
 const [host, port = '7780'] = server.split(':');
 const base = `http://${host}:${port}`;
 
-// Section -> key -> value. Matches the sections the client reads.
+// Section -> key -> value. Matches the sections the client reads. Classic reads the same
+// sections minus IAP/Storefront; they stay because the file is shared with the main client.
+// The server tells the two clients apart by their app-id (sos / sostest).
 const WANT = {
   OutpostKeyValueStore: {
     EndpointClient: `"${base}/kv/"`,
@@ -104,11 +138,11 @@ for (const sec of Object.keys(WANT)) {
   }
 }
 fs.writeFileSync(INI, out.join('\r\n'));
-console.log(`SOS now points at ${base}`);
+console.log(`${APP.name} now points at ${base}${CLASSIC ? ' (shared config: the main client does too)' : ''}`);
 
 if (flag('--no-launch')) process.exit(0);
-if (!fs.existsSync(EXE)) die(`Game not found at ${EXE}. Pass --game "<SOS install folder>".`);
+if (!fs.existsSync(EXE)) die(`Game not found at ${EXE}. Pass --game "<${APP.name} install folder>".`);
 // Launch the game exe directly (no BattlEye launcher). Steam must be running.
 const child = spawn(EXE, ['-log'], { cwd: path.dirname(EXE), detached: true, stdio: 'ignore' });
 child.unref();
-console.log('SOS started. Steam must be running and signed in.');
+console.log(`${APP.name} started from ${GAME_DIR}. Steam must be running and signed in.`);

@@ -10,7 +10,8 @@
     "MATCH_BATCH_MS": "Milliseconds to wait once a match is possible so near-simultaneous players share a session. Default: 300",
     "LATE_JOIN_SECONDS": "How long a matchmade session keeps accepting newly queued players. Default: 60",
     "GROUP_MAX_SIZE": "Maximum players per group. Default: 8",
-    "env": "Every key can also be set with an environment variable named OGSOS_<KEY>, e.g. OGSOS_GAME_SERVER_HOST. Env wins over this file. Keys starting with _ are ignored."
+    "env": "Every key can also be set with an environment variable named OGSOS_<KEY>, e.g. OGSOS_GAME_SERVER_HOST. Env wins over this file. Keys starting with _ are ignored.",
+    "classic": "SOS: Classic (app-id sostest) options. EXTRA_ROLES: roles added for every Classic login (everyone already gets app-user, user, testserver). DEV_ACCOUNTS: account ids or Steam ids that also get the dev role (Director button, server browser). Any matchmaking key above may be repeated here to override it for Classic only (e.g. GAME_SERVER_PORT for a Classic host); env OGSOS_CLASSIC_<KEY> also works. Classic live config is served from data/kv-classic/."
   },
   "REGION_NAME": "local",
   "BEACON_URL": "",
@@ -21,5 +22,10 @@
   "QUEUE_TIMEOUT": 20,
   "MATCH_BATCH_MS": 300,
   "LATE_JOIN_SECONDS": 60,
-  "GROUP_MAX_SIZE": 8
+  "GROUP_MAX_SIZE": 8,
+  "classic": {
+    "EXTRA_ROLES": [],
+    "DEV_ACCOUNTS": [],
+    "GAME_SERVER_PORT": 7777
+  }
 }

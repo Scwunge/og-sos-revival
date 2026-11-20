@@ -10,7 +10,7 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, createMatchmaker } = require('./matchmaking');
+const { loadConfig, createMatchmaker, DEFAULTS } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
 const LOG_DIR = path.join(ROOT, 'logs');
@@ -61,6 +61,32 @@ function readJwt(tok) {
   if (want !== s) return null;
   try { return JSON.parse(Buffer.from(c, 'base64url').toString()); } catch { return null; }
 }
+// ---------- SOS: Classic (Steam app 802240, see docs/CLASSIC.md) ----------
+// Classic logs in with app-id "sostest" and sends an `app-id` header on every HTTP request.
+// It has no inventory/store, reads its own live-config keys, and gates matchmaking on the
+// `testserver` role (or KV UE_CLIENT_TEST_SERVER_ENABLED). Options live under "classic" in
+// data/config.json (see data/config.example.json).
+const CLASSIC_APP = 'sostest';
+const isClassic = (appId) => appId === CLASSIC_APP;
+function readClassicOptions() {
+  let file = {};
+  try { file = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'config.json'), 'utf8')).classic || {}; } catch { /* none */ }
+  const list = (v) => (Array.isArray(v) ? v.map(String) : []);
+  return {
+    extraRoles: list(file.EXTRA_ROLES),
+    devAccounts: list(file.DEV_ACCOUNTS),   // account ids or Steam ids that also get the `dev` role
+    mm: file,                               // matchmaking overrides (GAME_SERVER_PORT etc.), merged below
+  };
+}
+const CLASSIC = readClassicOptions();
+// AppRoles is matched as a space-separated list; `user` keeps the GrantApp step a no-op,
+// `testserver` opens matchmaking even if the KV switch is off.
+function classicRoles(accountId, steamId, asked) {
+  const roles = new Set([...(Array.isArray(asked) ? asked.map(String) : []), 'app-user', 'user', 'testserver', ...CLASSIC.extraRoles]);
+  if (CLASSIC.devAccounts.includes(accountId) || (steamId && CLASSIC.devAccounts.includes(steamId))) roles.add('dev');
+  return [...roles];
+}
+
 function accountFromAuth(req) {
   const h = req.headers['authorization'] || '';
   const tok = h.replace(/^Token\s+/i, '').trim();
@@ -82,15 +108,19 @@ function send(res, status, body, type = 'application/json; charset=utf-8') {
 // ---------- key/value store (live game config) ----------
 // The client asks for <EndpointClient>/live-rev.txt, then per-key files under
 // that revision. Put files in data/kv/ to serve them; anything missing is logged.
+// Both clients share one Engine.ini (so one KV endpoint); Classic is told apart by its
+// `app-id: sostest` request header and gets data/kv-classic/ instead (its keys differ).
 const KV_DIR = path.join(DATA_DIR, 'kv');
+const KV_DIR_CLASSIC = path.join(DATA_DIR, 'kv-classic');
 fs.mkdirSync(KV_DIR, { recursive: true });
-function handleKv(rel, res) {
+function handleKv(rel, res, req) {
+  const dir = isClassic(req.headers['app-id']) ? KV_DIR_CLASSIC : KV_DIR;
   if (rel === 'live-rev.txt') {
-    const f = path.join(KV_DIR, 'live-rev.txt');
+    const f = path.join(dir, 'live-rev.txt');
     return send(res, 200, fs.existsSync(f) ? fs.readFileSync(f) : '1', 'text/plain');
   }
-  const f = path.normalize(path.join(KV_DIR, rel));
-  if (f.startsWith(KV_DIR) && fs.existsSync(f) && fs.statSync(f).isFile()) {
+  const f = path.normalize(path.join(dir, rel));
+  if (f.startsWith(dir + path.sep) && fs.existsSync(f) && fs.statSync(f).isFile()) {
     return send(res, 200, fs.readFileSync(f), f.endsWith('.json') ? 'application/json' : 'application/octet-stream');
   }
   return send(res, 404, 'not found', 'text/plain');
@@ -143,10 +173,13 @@ function handleApi(req, url, body, res) {
       identities: steamId ? [{ provider: 'steam', 'provider-data': steamId }] : [],
     };
     db.accounts[accountId]['last-access'] = new Date().toISOString();
-    const jwt = makeJwt(accountId, steamId, j.roles || ['app-user'], j['app-id'] || 'sos');
+    const appId = String(j['app-id'] || req.headers['app-id'] || 'sos');
+    const roles = isClassic(appId) ? classicRoles(accountId, steamId, j.roles) : (j.roles || ['app-user']);
+    const jwt = makeJwt(accountId, steamId, roles, appId);
     db.tokens[jwt] = accountId;
     saveDb();
     const payload = { ...db.accounts[accountId], 'user-id': accountId, 'access-token': jwt, token: jwt };
+    if (isClassic(appId)) payload.roles = roles;
     // Give the fields both at top level and under "data" until we know which the client reads.
     return send(res, 200, { ...payload, version: 1, data: payload });
   }
@@ -206,7 +239,7 @@ const server = http.createServer((req, res) => {
     let result;
     let handled = true;
     try {
-      if (url.pathname.startsWith('/kv/')) result = handleKv(url.pathname.slice(4), res);
+      if (url.pathname.startsWith('/kv/')) result = handleKv(url.pathname.slice(4), res, req);
       else result = handleApi(req, url, body, res);
       if (!result) {
         handled = false;
@@ -231,11 +264,31 @@ const mm = createMatchmaker({
   log: (m) => { log('ws.jsonl', { event: 'mm', text: m }); console.log(`mm ${m}`); },
 });
 
+// Classic gets its own matchmaker: the two builds cannot share a match (different maps and
+// game versions), and Classic hosts may run on another port. Overrides come from the "classic"
+// object in data/config.json, or env OGSOS_CLASSIC_<KEY>.
+function classicMmConfig() {
+  const cfg = { ...CONFIG };
+  for (const key of Object.keys(DEFAULTS)) {
+    let v = process.env[`OGSOS_CLASSIC_${key}`] ?? CLASSIC.mm[key];
+    if (v === undefined || v === null || v === '') continue;
+    if (typeof DEFAULTS[key] === 'number') { v = Number(v); if (!Number.isFinite(v)) continue; } else v = String(v);
+    cfg[key] = v;
+  }
+  return cfg;
+}
+const mmClassic = createMatchmaker({
+  config: classicMmConfig(),
+  getUname: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
+  log: (m) => { log('ws.jsonl', { event: 'mm-classic', text: m }); console.log(`mm[classic] ${m}`); },
+});
+
 function wsAccount(req) {
   const tok = String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim();
   const claims = tok && readJwt(tok);
   if (!claims || (claims.exp && claims.exp < Date.now() / 1000)) return null;
-  return String(claims['account-id'] || claims.id || '') || null;
+  const id = String(claims['account-id'] || claims.id || '');
+  return id ? { id, appId: String(claims['app-id'] || req.headers['app-id'] || 'sos') } : null;
 }
 
 server.on('upgrade', (req, socket) => {
@@ -243,7 +296,9 @@ server.on('upgrade', (req, socket) => {
   if (!key) return socket.destroy();
   socket.on('error', () => {});
   const isMm = new URL(req.url, 'http://x').pathname === '/ws';
-  const accountId = isMm ? wsAccount(req) : null;
+  const who = isMm ? wsAccount(req) : null;
+  const accountId = who ? who.id : null;
+  const mmFor = who && isClassic(who.appId) ? mmClassic : mm;
   if (isMm && !accountId) {
     log('ws.jsonl', { event: 'rejected', path: req.url, reason: 'missing or invalid token', headers: req.headers });
     console.log(`ws rejected ${req.url} (401)`);
@@ -253,10 +308,10 @@ server.on('upgrade', (req, socket) => {
   const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   const proto = req.headers['sec-websocket-protocol'];
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${accept}\r\n` + (proto ? `Sec-WebSocket-Protocol: ${proto.split(',')[0].trim()}\r\n` : '') + '\r\n');
+    `Sec-WebSocket-Accept: ${accept}\r\n` + (proto ? `Sec-WebSocket-Protocol: ${proto.trim()}\r\n` : '') + '\r\n');
   const id = crypto.randomBytes(4).toString('hex');
   log('ws.jsonl', { id, event: 'open', path: req.url, account: accountId, headers: req.headers });
-  console.log(`ws ${id} open ${req.url}${accountId ? ` account ${accountId}` : ''}`);
+  console.log(`ws ${id} open ${req.url}${accountId ? ` account ${accountId}${mmFor === mmClassic ? ' (classic)' : ''}` : ''}`);
 
   const sendFrame = (opcode, payload) => {
     if (socket.destroyed || !socket.writable) return;
@@ -280,7 +335,7 @@ server.on('upgrade', (req, socket) => {
       },
       close() { sendFrame(0x8, Buffer.alloc(0)); socket.end(); },
     };
-    mm.onConnect(client);
+    mmFor.onConnect(client);
   }
 
   let buf = Buffer.alloc(0);
@@ -307,11 +362,11 @@ server.on('upgrade', (req, socket) => {
       const text = payload.toString('utf8');
       log('ws.jsonl', { id, event: 'msg', opcode, text });
       console.log(`ws ${id} <- ${text.slice(0, 200)}`);
-      if (client) mm.onMessage(client, text);
+      if (client) mmFor.onMessage(client, text);
     }
   });
   socket.on('close', () => {
-    if (client) mm.onClose(client);
+    if (client) mmFor.onClose(client);
     log('ws.jsonl', { id, event: 'close' });
     console.log(`ws ${id} closed`);
   });

@@ -112,7 +112,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await check('valid token upgrades, subprotocol echoed', async () => {
     const r = await Ws.connect(tokA); a = r.ws;
     assert(r.status === 101, `status ${r.status}`);
-    assert(r.headers['sec-websocket-protocol'] === 'wss', 'subprotocol ' + r.headers['sec-websocket-protocol']);
+    assert(r.headers['sec-websocket-protocol'] === 'wss,ws', 'subprotocol ' + r.headers['sec-websocket-protocol']);
   });
 
   await check('ready arrives first', async () => {
