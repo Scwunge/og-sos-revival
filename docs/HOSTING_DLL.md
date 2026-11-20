@@ -176,3 +176,18 @@ How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
 - With no `-SESSION_ID`, `ApproveLogin` skips the `AuthToken` check (Inferred, see `docs/HOSTING.md`). The join above confirms a connection without a session check is accepted.
 - The host player could get a real login with the `-AUTH_LOGIN=` / `-AUTH_PASSWORD=` / `-AUTH_TYPE=` switches (types `OutpostUser`, `OutpostOnceCodeUser`, `Steam`, `Auto`); the host logs `Outpost: AutoLogin missing AUTH_LOGIN`. Not tried.
 - The Classic table is derived the same way but has not been run.
+
+## Status, 20 Nov 2026 (SOS: Classic): paused
+
+- **Ported:** sos_host runs on SOS: Classic (802240). Listen, the join hooks, `MaxClientRate`, and the MMS session route all work (`-SESSION_ID`/`-SESSION_TOKEN`, and the host needs its own `?AuthToken=` JWT).
+- **Missing server code:** the shipping client is built without server code. `UNetDriver::TickFlush` (FUN_1411f5460) never calls ServerReplicateActors. A joiner only got actors that an RPC targeted (`ProcessRemoteFunction` opens their channel), so its pawn never arrived and the camera sat under the map.
+- **Replication pass (e97685a):** `ReplicateActors=1` adds sos_host's own pass before TickFlush:
+  - Open a channel with CreateChannel FUN_1411dba20 + SetChannelActor FUN_1411080c10 (the open sequence ProcessRemoteFunction uses); send updates with ReplicateActor FUN_14107dbe0, throttled by IsNetReady (vt+0x240).
+  - Actor flags: +0x7C (bHidden 1, bNetStartup 4, bOnlyRelevantToOwner 8, bAlwaysRelevant 0x10), bReplicates at +0x7E bit 4, Owner +0x90.
+  - Test: 2726 channels opened within ~20 s of the join. The joiner reached Playing with a pawn and no Inactive loop.
+- **Open:**
+  - The joiner stayed on the loading screen. It hears the pregame music but sees no intro visuals, probably because the map-placed (startup) sequence actors are skipped with `ReplicateStartupActors=0`.
+  - Its log fills with "CreateSavedMove: Hit limit of 96 saved moves", so the host never acks moves. Character movement correction (SendClientAdjustment) is probably also stripped and needs the same treatment.
+  - Host 35104 exited about 80 s into the test with no crash report; the cause is unknown. The pass sent ~15k updates/s (no distance culling, frequency up to 30 Hz), which should be cut.
+  - The main build has the same gap; its RVAs are not mapped.
+- **Game folders:** all sos_host files have been removed from the Classic Win64 folder.
