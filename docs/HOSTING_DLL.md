@@ -131,7 +131,10 @@ How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
 ## Status and open items
 
 - Built and smoke-tested outside the game: export forwarding works, and an unknown exe is left unpatched.
-- **Not yet run in game.** The first test should show `IpNetDriver listening on port 7777` and UDP 7777 open (`Get-NetUDPEndpoint -LocalPort 7777`).
+- **In-game test, 20 Nov 2026, main client:** `SOS-Win64-Shipping.exe LaCuna_BR?game=SUR?listen -log -windowed` with `LoginPendingTimeout=86400`. `sos_host.log` showed both patches, then `Listen(/Game/Maps/LaCuna/LaCuna_BR) requested, port 7777`, `blackbird.LoginPendingTimeout 120.0 -> 86400` and `Listening with IpNetDriver on port 7777`. The game picked `IpNetDriver` directly, not the Steam driver. The process owned UDP `0.0.0.0:7777` and was still up 150 s after Listen, past the stock 120 s LoginPending kick. The host window stays on the loading screen, as expected for a player waiting in LoginPending with no pawn.
+- The same process also holds about 26 UDP sockets on consecutive high ports (61609 to 61634). The count stayed flat over a minute, and the DLL logs a single Listen, so it is not the listen path re-creating sockets. They are opened at startup by something else in the client.
+- No `SOS.log` was written during the run (only the backup of the previous log), even with `-log`. The DLL log is the reliable signal for now.
+- Not yet tested: a second client joining.
 - Untested: whether a remote client gets past `LoginPending` on the host. This needs the server-side `IsLoggedIn`: the client's UniqueNetId from `NMT_Login`, and app data loaded by `LoadAppData` (FUN_1401ba330). That loads synchronously when the app-data key list is empty, otherwise over HTTP.
 - With no `-SESSION_ID`, `ApproveLogin` skips the `AuthToken` check (Inferred, see `docs/HOSTING.md`).
 - The Classic table is derived the same way but has not been run.
