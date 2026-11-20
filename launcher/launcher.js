@@ -143,6 +143,9 @@ console.log(`${APP.name} now points at ${base}${CLASSIC ? ' (shared config: the 
 if (flag('--no-launch')) process.exit(0);
 if (!fs.existsSync(EXE)) die(`Game not found at ${EXE}. Pass --game "<${APP.name} install folder>".`);
 // Launch the game exe directly (no BattlEye launcher). Steam must be running.
-const child = spawn(EXE, ['-log'], { cwd: path.dirname(EXE), detached: true, stdio: 'ignore' });
+// SteamAppId/SteamGameId tell SteamAPI_Init which app this is. The Classic install ships no
+// steam_appid.txt, so without them Steam auth fails ("LoadingSteamClientAuth" Success=false).
+const env = { ...process.env, SteamAppId: APP.id, SteamGameId: APP.id };
+const child = spawn(EXE, ['-log'], { cwd: path.dirname(EXE), env, detached: true, stdio: 'ignore' });
 child.unref();
 console.log(`${APP.name} started from ${GAME_DIR}. Steam must be running and signed in.`);

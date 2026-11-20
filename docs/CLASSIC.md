@@ -227,6 +227,21 @@ Launcher (`launcher/launcher.js`):
    - Pointing one client at a server points both, and `--restore` restores both.
 9. **Hosting** is still blocked on `UWorld::Listen`. Later, a host mode would pass `LaCuna?game=SUR?listen` and run a patched private copy of the exe.
 
+## Live test, 2026-11-20 (branch server on 7781, hosting session's listen host on 7777)
+
+- **Steam auth.** It fails (`LoadingSteamClientAuth` Success=false) when the exe is launched directly, because the Classic install ships no `steam_appid.txt`. The launcher now sets `SteamAppId`/`SteamGameId` = 802240 in the child environment. With that set: `LoadingSteamClientAuth` true, then `POST /api/access-token/steam` 200, then `LoadingOutpostLoginEnd` Success=true, user 7656119xxxxxxxxxx.
+- **After login.** `GET /api/account`, `GET /api/account/<id>/app/sostest` and `PUT .../app-meta/sostest/language` all return 200.
+- **Matchmaking WS.** It stays open on `wss,ws`, with this sequence:
+  - `ready`;
+  - `leave-all-groups`, answered with `ack`;
+  - `get-regions`;
+  - `get-session`, answered with `nak not-found` (normal before a match);
+  - ping/pong every 30 s.
+- **PLAY (solo).** The client sends `find-session` with `game-mode ""` and `map ""`. The server answers `ack`, then `summary`, then `session` (UUID id, host 127.0.0.1, port 7777), then `session-started`.
+- **Travel.** The client logs "Join session: traveling to 127.0.0.1:7777" and "Welcomed by server (Level: /Game/Maps/LaCuna/LaCuna, Game: Gamemode_Survival_C)". The host logs "Join succeeded: player-xxxx". The joiner then sits in `LoginPending`, which is the known join-state issue and still open.
+- **Leaderboards.** `GET /api/leaderboard/sostest/...` returning `[]` logs "Response failed to deserialize as a valid json array". This is harmless, because the frontend leaderboards are just empty.
+- **Cosmetics and coins.** Classic has no inventory or wallet backend (see Cosmetics), so there are no coins. DLC-gated outfits and gestures need the private-copy DLC patch.
+
 ## Addresses for a `UWorld::Listen` replacement (Classic exe, image base 0x140000000)
 
 | What | Address / offset | Evidence |
