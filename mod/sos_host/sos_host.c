@@ -62,7 +62,8 @@ static struct {
     int unfilter_cmdline;     /* 1: NOP the shipping command-line allow-list */
     int steam_sockets;        /* 0: force plain IP sockets on SteamNetDriver */
     int login_timeout;        /* >0: set blackbird.LoginPendingTimeout (main only) */
-} cfg = { 1, 0, 1, 0, 0 };
+    int game_log;             /* 1: mirror every UE_LOG line to sos_game_<pid>.log */
+} cfg = { 1, 0, 1, 0, 0, 1 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_log_path[MAX_PATH];
@@ -73,8 +74,8 @@ static void hlog(const char *fmt, ...)
     char buf[1024];
     SYSTEMTIME t;
     GetLocalTime(&t);
-    int n = snprintf(buf, sizeof buf, "[%02d:%02d:%02d.%03d] ",
-                     t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    int n = snprintf(buf, sizeof buf, "[%02d:%02d:%02d.%03d][%lu] ",
+                     t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentProcessId());
     va_list ap;
     va_start(ap, fmt);
     n += vsnprintf(buf + n, sizeof buf - n - 2, fmt, ap);
@@ -110,6 +111,7 @@ static void load_config(HMODULE self)
     cfg.unfilter_cmdline = GetPrivateProfileIntW(L"Host", L"UnfilterCommandLine", cfg.unfilter_cmdline, ini);
     cfg.steam_sockets    = GetPrivateProfileIntW(L"Host", L"SteamSockets", cfg.steam_sockets, ini);
     cfg.login_timeout    = GetPrivateProfileIntW(L"Host", L"LoginPendingTimeout", cfg.login_timeout, ini);
+    cfg.game_log         = GetPrivateProfileIntW(L"Host", L"GameLog", cfg.game_log, ini);
 
     wchar_t log_name[MAX_PATH];
     GetPrivateProfileStringW(L"Host", L"LogFile", L"sos_host.log", log_name, MAX_PATH, ini);
@@ -142,6 +144,8 @@ typedef struct {
     uint32_t ip_listen;         /* UIpNetDriver::InitListen */
     uint32_t mem_free;          /* FMemory::Free */
     uint32_t login_timeout_cvar;/* float* behind blackbird.LoginPendingTimeout, 0 if absent */
+    uint32_t log_fn;            /* FMsg::Logf_Internal(File, Line, Category, Verbosity, Fmt, ...) */
+    uint32_t fname_tostring;    /* FString* FName::ToString(const FName*, FString*) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -150,12 +154,14 @@ static const GameBuild k_builds[] = {
         0x147cef4, 0x0188b70, 0x047504f,
         0x2bf5818, 0x04d3280, 0x146a1c0, 0x1471a30, 0x146c3b0, 0x1258c90,
         0x1aeafc0, 0x0eb75b0, 0x040d1b0, 0x2a4b0b0,
+        0x04a9f30, 0x04de7a0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
         0x1417674, 0x0b6edf0, 0x041578f,
         0x2b766a0, 0x0472c50, 0x14048e0, 0x140c1d0, 0x1406ad0, 0x11f3aa0,
         0x1a7ec40, 0x0e542b0, 0x03acc40, 0,
+        0x044a500, 0x047e090,
     },
 };
 
@@ -278,6 +284,84 @@ static uint8_t HostListen(uint8_t *world, uint8_t *url)
 }
 
 /* ------------------------------------------------------------------------ */
+/* UE_LOG mirror                                                             */
+/* ------------------------------------------------------------------------ */
+/* The shipping client writes no SOS.log in these runs, so the DLL copies every
+   line that reaches FMsg::Logf_Internal into sos_game_<pid>.log. The function
+   entry (push rbx/rbp/rsi/rdi, 5 bytes) jumps to log_hook, which records the
+   line and continues in a trampoline holding the displaced bytes. */
+
+typedef FString *(*FNameToStringFn)(const FName *, FString *);
+
+static HANDLE g_game_log = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION g_game_lock;
+void *g_log_tramp;   /* referenced from log_hook */
+
+void log_capture(uint64_t *frame)
+{
+    /* frame[0] = return address, frame[1..4] = homed rcx rdx r8 r9,
+       frame[5] = format, frame[6..] = variadic arguments. */
+    static const char *const verb_names[] = {
+        "", "Fatal", "Error", "Warning", "Display", "Log", "Verbose", "VeryVerbose" };
+    const FName *category = (const FName *)frame[3];
+    unsigned verbosity = (unsigned)frame[4] & 0xF;
+    const wchar_t *fmt = (const wchar_t *)frame[5];
+    if (!fmt || g_game_log == INVALID_HANDLE_VALUE) return;
+
+    DWORD saved_error = GetLastError();
+    wchar_t msg[2048];
+    int n = _vsnwprintf(msg, 2047, fmt, (va_list)(frame + 6));
+    if (n < 0) n = 2047;
+    msg[n] = 0;
+
+    wchar_t cat[64] = L"?";
+    if (category) {
+        FString fs = { 0 };
+        ((FNameToStringFn)AT(g_build->fname_tostring))(category, &fs);
+        if (fs.data) {
+            wcsncpy(cat, fs.data, 63);
+            cat[63] = 0;
+            ((FreeFn)AT(g_build->mem_free))(fs.data);
+        }
+    }
+
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char line[4096];
+    const char *verb = (verbosity < 8 && verbosity != 5) ? verb_names[verbosity] : "";
+    int len = snprintf(line, sizeof line - 2, "[%02d:%02d:%02d.%03d] %ls: %s%s%ls",
+                       t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, cat,
+                       verb, verb[0] ? ": " : "", msg);
+    if (len < 0 || len > (int)sizeof line - 2) len = sizeof line - 2;
+    line[len++] = 13;
+    line[len++] = 10;
+    EnterCriticalSection(&g_game_lock);
+    DWORD w;
+    WriteFile(g_game_log, line, (DWORD)len, &w, NULL);
+    LeaveCriticalSection(&g_game_lock);
+    SetLastError(saved_error);
+}
+
+void log_hook(void);
+__asm__(
+    ".text\n"
+    ".globl log_hook\n"
+    "log_hook:\n"
+    "  movq %rcx, 8(%rsp)\n"
+    "  movq %rdx, 16(%rsp)\n"
+    "  movq %r8, 24(%rsp)\n"
+    "  movq %r9, 32(%rsp)\n"
+    "  subq $40, %rsp\n"
+    "  leaq 40(%rsp), %rcx\n"
+    "  call log_capture\n"
+    "  addq $40, %rsp\n"
+    "  movq 8(%rsp), %rcx\n"
+    "  movq 16(%rsp), %rdx\n"
+    "  movq 24(%rsp), %r8\n"
+    "  movq 32(%rsp), %r9\n"
+    "  jmp *g_log_tramp(%rip)\n");
+
+/* ------------------------------------------------------------------------ */
 /* Patching                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -349,8 +433,41 @@ static void install(void)
          "SteamSockets=%d LoginPendingTimeout=%d)", g_build->name, g_base, cfg.enable_listen,
          cfg.port, cfg.unfilter_cmdline, cfg.steam_sockets, cfg.login_timeout);
 
+    uint8_t *near_page = alloc_near(g_base, 4096);
+
+    if (cfg.game_log && near_page) {
+        static const uint8_t prologue[5] = { 0x40, 0x53, 0x55, 0x56, 0x57 };
+        uint8_t *fn = g_base + g_build->log_fn;
+        wchar_t path[MAX_PATH];
+        _snwprintf(path, MAX_PATH - 1, L"%lssos_game_%lu.log", g_dir, GetCurrentProcessId());
+        path[MAX_PATH - 1] = 0;
+        if (!bytes_equal(fn, prologue, 5)) {
+            hlog("Log function prologue mismatch; game log mirror off");
+        } else if ((g_game_log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                                             FILE_ATTRIBUTE_NORMAL, NULL)) == INVALID_HANDLE_VALUE) {
+            hlog("Cannot create the game log file");
+        } else {
+            InitializeCriticalSection(&g_game_lock);
+            /* near_page+16: trampoline = displaced prologue; mov rax, fn+5; jmp rax */
+            uint8_t *tramp = near_page + 16;
+            uint64_t back = (uint64_t)(uintptr_t)(fn + 5);
+            memcpy(tramp, prologue, 5);
+            tramp[5] = 0x48; tramp[6] = 0xB8; memcpy(tramp + 7, &back, 8); tramp[15] = 0xFF; tramp[16] = 0xE0;
+            g_log_tramp = tramp;
+            /* near_page+48: mov rax, log_hook; jmp rax */
+            uint8_t *entry = near_page + 48;
+            uint64_t hook = (uint64_t)(uintptr_t)&log_hook;
+            entry[0] = 0x48; entry[1] = 0xB8; memcpy(entry + 2, &hook, 8); entry[10] = 0xFF; entry[11] = 0xE0;
+            FlushInstructionCache(GetCurrentProcess(), near_page, 4096);
+            uint8_t jmp[5] = { 0xE9 };
+            int32_t rel = (int32_t)(entry - (fn + 5));
+            memcpy(jmp + 1, &rel, 4);
+            if (write_code(fn, jmp, 5)) hlog("Game log mirror -> %ls", path);
+        }
+    }
+
     if (cfg.enable_listen) {
-        uint8_t *thunk = alloc_near(g_base, 64);
+        uint8_t *thunk = near_page;
         if (!thunk) {
             hlog("No memory near the exe for the Listen thunk; hosting disabled");
         } else {
