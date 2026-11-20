@@ -1,0 +1,1212 @@
+{
+ "source": "SOS-WindowsClient.pak /Game/Blueprints/Storefront/StoreItemDefinitions (DataTable, row struct StoreItemDefinition); ids are DataTable row names",
+ "keyField": "row name of StoreItemDefinitions == StoreItemIds/ItemId (e.g. o_ninja_a_m)",
+ "grantableCategories": [
+  "outfit",
+  "gesture",
+  "icon",
+  "license"
+ ],
+ "items": [
+  {
+   "id": "o_plain_a_m",
+   "category": "outfit",
+   "name": "Black T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_a_f",
+   "category": "outfit",
+   "name": "Black T-Shirt (Female)"
+  },
+  {
+   "id": "o_plain_b_m",
+   "category": "outfit",
+   "name": "Green T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_b_f",
+   "category": "outfit",
+   "name": "Green T-Shirt (Female)"
+  },
+  {
+   "id": "o_plain_c_m",
+   "category": "outfit",
+   "name": "Grey T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_c_f",
+   "category": "outfit",
+   "name": "Grey T-Shirt (Female)"
+  },
+  {
+   "id": "o_plain_d_m",
+   "category": "outfit",
+   "name": "Blue T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_d_f",
+   "category": "outfit",
+   "name": "Blue T-Shirt (Female)"
+  },
+  {
+   "id": "o_plain_e_m",
+   "category": "outfit",
+   "name": "Pink T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_e_f",
+   "category": "outfit",
+   "name": "Pink T-Shirt (Female)"
+  },
+  {
+   "id": "o_plain_f_m",
+   "category": "outfit",
+   "name": "Purple T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_f_f",
+   "category": "outfit",
+   "name": "Purple T-Shirt (Female)"
+  },
+  {
+   "id": "o_plain_g_m",
+   "category": "outfit",
+   "name": "Red T-Shirt (Male)"
+  },
+  {
+   "id": "o_plain_g_f",
+   "category": "outfit",
+   "name": "Red T-Shirt (Female)"
+  },
+  {
+   "id": "o_rocker_a_m",
+   "category": "outfit",
+   "name": "Jolly Rocker (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_rocker_a_f",
+   "category": "outfit",
+   "name": "Funky Feline (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_rocker_b_m",
+   "category": "outfit",
+   "name": "Wily (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_rocker_b_f",
+   "category": "outfit",
+   "name": "Doggie Drummer (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_rocker_c_m",
+   "category": "outfit",
+   "name": "Greatfully Undead (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_rocker_c_f",
+   "category": "outfit",
+   "name": "Road Rocker (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_ninja_a_m",
+   "category": "outfit",
+   "name": "Shadow Ninja (Male)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_a_f",
+   "category": "outfit",
+   "name": "Dark Ninja (Female)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_b_m",
+   "category": "outfit",
+   "name": "Light Warrior (Male)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_b_f",
+   "category": "outfit",
+   "name": "Cloud Warrior (Female)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_c_m",
+   "category": "outfit",
+   "name": "Red Assassin (Male)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_c_f",
+   "category": "outfit",
+   "name": "Ruby Assassin (Female)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_d_m",
+   "category": "outfit",
+   "name": "Shinobi Blue (Male)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_d_f",
+   "category": "outfit",
+   "name": "Kunoichi Blue (Female)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_e_m",
+   "category": "outfit",
+   "name": "Royal Spy (Male)",
+   "cost": 300
+  },
+  {
+   "id": "o_ninja_e_f",
+   "category": "outfit",
+   "name": "Regal Spy (Female)",
+   "cost": 300
+  },
+  {
+   "id": "o_bear_a_m",
+   "category": "outfit",
+   "name": "Panda (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_bear_a_f",
+   "category": "outfit",
+   "name": "Panda (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_bear_b_m",
+   "category": "outfit",
+   "name": "Kind Bear (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_bear_b_f",
+   "category": "outfit",
+   "name": "Happy Bear (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_bear_c_m",
+   "category": "outfit",
+   "name": "Grizzly (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_bear_c_f",
+   "category": "outfit",
+   "name": "Kodiak (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_dino_a_m",
+   "category": "outfit",
+   "name": "Dino Might (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_dino_a_f",
+   "category": "outfit",
+   "name": "Dino Dispatch (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_dino_b_m",
+   "category": "outfit",
+   "name": "Prehistoric Pink (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_dino_b_f",
+   "category": "outfit",
+   "name": "Primordial Pink (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_dino_c_m",
+   "category": "outfit",
+   "name": "T-Wrecked (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_dino_c_f",
+   "category": "outfit",
+   "name": "Roaring Rex (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_biker_a_m",
+   "category": "outfit",
+   "name": "Wheelie (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_biker_a_f",
+   "category": "outfit",
+   "name": "Torque (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_biker_b_m",
+   "category": "outfit",
+   "name": "Cruiser (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_biker_b_f",
+   "category": "outfit",
+   "name": "Turbo (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_biker_c_m",
+   "category": "outfit",
+   "name": "Battle Biker (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_biker_c_f",
+   "category": "outfit",
+   "name": "Major Moto (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_pilot_a_m",
+   "category": "outfit",
+   "name": "Aviator (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_pilot_a_f",
+   "category": "outfit",
+   "name": "Flying Ace (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_pilot_b_m",
+   "category": "outfit",
+   "name": "Dogfighter (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_pilot_b_f",
+   "category": "outfit",
+   "name": "Bomber (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_pilot_c_m",
+   "category": "outfit",
+   "name": "Helmsman (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_pilot_c_f",
+   "category": "outfit",
+   "name": "Navigator (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_aloha_a_m",
+   "category": "outfit",
+   "name": "Bahama Boy (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_aloha_a_f",
+   "category": "outfit",
+   "name": "Carribbean Queen (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_aloha_b_m",
+   "category": "outfit",
+   "name": "Cabo Cadet (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_aloha_b_f",
+   "category": "outfit",
+   "name": "La Jolla (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_aloha_c_m",
+   "category": "outfit",
+   "name": "Antigua (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_aloha_c_f",
+   "category": "outfit",
+   "name": "Nassau (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_bowler_a_m",
+   "category": "outfit",
+   "name": "A Dude (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_bowler_a_f",
+   "category": "outfit",
+   "name": "A Dudette (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_bowler_b_m",
+   "category": "outfit",
+   "name": "Gutter Ball (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_bowler_b_f",
+   "category": "outfit",
+   "name": "Curve Ball (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_bowler_c_m",
+   "category": "outfit",
+   "name": "Lane King (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_bowler_c_f",
+   "category": "outfit",
+   "name": "Lane Queen (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_lumberjack_a_m",
+   "category": "outfit",
+   "name": "Lumberjack (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_lumberjack_a_f",
+   "category": "outfit",
+   "name": "Lumberjill (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_lumberjack_b_m",
+   "category": "outfit",
+   "name": "Big Logger (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_lumberjack_b_f",
+   "category": "outfit",
+   "name": "Lumber Lass (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_lumberjack_c_m",
+   "category": "outfit",
+   "name": "Woodsman (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_lumberjack_c_f",
+   "category": "outfit",
+   "name": "Woodcutter (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_trucker_a_m",
+   "category": "outfit",
+   "name": "Route 66 (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_trucker_a_f",
+   "category": "outfit",
+   "name": "Highwaywoman (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_trucker_b_m",
+   "category": "outfit",
+   "name": "Big Rig (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_trucker_b_f",
+   "category": "outfit",
+   "name": "Big Hauler (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_trucker_c_m",
+   "category": "outfit",
+   "name": "18 Wheelin' (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_trucker_c_f",
+   "category": "outfit",
+   "name": "18 Wheels Rollin' (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_surviv_a_m",
+   "category": "outfit",
+   "name": "Tracker (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_surviv_a_f",
+   "category": "outfit",
+   "name": "Explorer (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_surviv_b_m",
+   "category": "outfit",
+   "name": "Scout (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_surviv_b_f",
+   "category": "outfit",
+   "name": "Adventurer (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_surviv_c_m",
+   "category": "outfit",
+   "name": "Voyager (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_surviv_c_f",
+   "category": "outfit",
+   "name": "Recon (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_astronaut_a_m",
+   "category": "outfit",
+   "name": "Mercury 1 (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_astronaut_a_f",
+   "category": "outfit",
+   "name": "Gemini 2 (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_astronaut_b_m",
+   "category": "outfit",
+   "name": "Orbital Orange (Male)",
+   "cost": 400
+  },
+  {
+   "id": "o_astronaut_b_f",
+   "category": "outfit",
+   "name": "T-minus Tangerine (Female)",
+   "cost": 400
+  },
+  {
+   "id": "o_70s_a_m",
+   "category": "outfit",
+   "name": "Bandmate (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_70s_a_f",
+   "category": "outfit",
+   "name": "Superfan (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_70s_b_m",
+   "category": "outfit",
+   "name": "La Cuna Local (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_70s_b_f",
+   "category": "outfit",
+   "name": "La Cuna Loyal (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_70s_c_m",
+   "category": "outfit",
+   "name": "Old School (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_70s_c_f",
+   "category": "outfit",
+   "name": "Vintage (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_8bit_a_m",
+   "category": "outfit",
+   "name": "Keymaster (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_8bit_a_f",
+   "category": "outfit",
+   "name": "5 Directions (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_8bit_b_m",
+   "category": "outfit",
+   "name": "Chopper Boy (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_8bit_b_f",
+   "category": "outfit",
+   "name": "Copter Girl (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_8bit_c_m",
+   "category": "outfit",
+   "name": "Temple Treasure (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_8bit_c_f",
+   "category": "outfit",
+   "name": "Temple Relic (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_ranger_a_m",
+   "category": "outfit",
+   "name": "Pathfinder (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_ranger_a_f",
+   "category": "outfit",
+   "name": "Pioneer (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_ranger_b_m",
+   "category": "outfit",
+   "name": "Wanderer (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_ranger_b_f",
+   "category": "outfit",
+   "name": "Gatherer (Female)",
+   "cost": 220
+  },
+  {
+   "id": "o_ranger_c_m",
+   "category": "outfit",
+   "name": "Ranger (Male)",
+   "cost": 220
+  },
+  {
+   "id": "o_ranger_c_f",
+   "category": "outfit",
+   "name": "Hunter (Female)",
+   "cost": 220
+  },
+  {
+   "id": "g_wave",
+   "category": "gesture",
+   "name": "Wave"
+  },
+  {
+   "id": "g_batter_up",
+   "category": "gesture",
+   "name": "Batter Up",
+   "cost": 160
+  },
+  {
+   "id": "g_beckon",
+   "category": "gesture",
+   "name": "Call Over",
+   "cost": 100
+  },
+  {
+   "id": "g_bow",
+   "category": "gesture",
+   "name": "Bow",
+   "cost": 100
+  },
+  {
+   "id": "g_brushit",
+   "category": "gesture",
+   "name": "Brush It Off",
+   "cost": 100
+  },
+  {
+   "id": "g_chicken",
+   "category": "gesture",
+   "name": "Chicken Dance",
+   "cost": 300
+  },
+  {
+   "id": "g_comeon",
+   "category": "gesture",
+   "name": "Come On",
+   "cost": 50
+  },
+  {
+   "id": "g_blowkiss",
+   "category": "gesture",
+   "name": "Kiss",
+   "cost": 100
+  },
+  {
+   "id": "g_cutitout",
+   "category": "gesture",
+   "name": "Cut It Out",
+   "cost": 50
+  },
+  {
+   "id": "g_iseeyou",
+   "category": "gesture",
+   "name": "I see You",
+   "cost": 50
+  },
+  {
+   "id": "g_okay",
+   "category": "gesture",
+   "name": "Okay",
+   "cost": 50
+  },
+  {
+   "id": "g_point",
+   "category": "gesture",
+   "name": "Point",
+   "cost": 50
+  },
+  {
+   "id": "g_shhh",
+   "category": "gesture",
+   "name": "Quiet Down",
+   "cost": 50
+  },
+  {
+   "id": "g_easythere",
+   "category": "gesture",
+   "name": "Easy There",
+   "cost": 50
+  },
+  {
+   "id": "g_facepalm",
+   "category": "gesture",
+   "name": "Facepalm",
+   "cost": 50
+  },
+  {
+   "id": "g_gottadance",
+   "category": "gesture",
+   "name": "Gotta Dance",
+   "cost": 160
+  },
+  {
+   "id": "g_handsup",
+   "category": "gesture",
+   "name": "Don't Shoot",
+   "cost": 50
+  },
+  {
+   "id": "g_listen",
+   "category": "gesture",
+   "name": "Listen",
+   "cost": 50
+  },
+  {
+   "id": "g_mindblown",
+   "category": "gesture",
+   "name": "Mind Blown",
+   "cost": 160
+  },
+  {
+   "id": "g_ohbrother",
+   "category": "gesture",
+   "name": "Oh Brother",
+   "cost": 50
+  },
+  {
+   "id": "g_shadowbox",
+   "category": "gesture",
+   "name": "Shadow Box",
+   "cost": 160
+  },
+  {
+   "id": "g_slitthroat",
+   "category": "gesture",
+   "name": "Cut Throat",
+   "cost": 100
+  },
+  {
+   "id": "g_slowclap",
+   "category": "gesture",
+   "name": "Slow Clap",
+   "cost": 100
+  },
+  {
+   "id": "g_thedeuce",
+   "category": "gesture",
+   "name": "Double Point",
+   "cost": 160
+  },
+  {
+   "id": "i_outpost_logo",
+   "category": "icon",
+   "name": "Outpost Games"
+  },
+  {
+   "id": "i_obelisk",
+   "category": "icon",
+   "name": "Obelisk"
+  },
+  {
+   "id": "i_cookie",
+   "category": "icon",
+   "name": "Cookie"
+  },
+  {
+   "id": "i_motohelmet",
+   "category": "icon",
+   "name": "Motorcycle Helmet"
+  },
+  {
+   "id": "i_campfire",
+   "category": "icon",
+   "name": "Campfire"
+  },
+  {
+   "id": "i_woodaxe",
+   "category": "icon",
+   "name": "Wood Axe"
+  },
+  {
+   "id": "i_chicken",
+   "category": "icon",
+   "name": "Chicken Dinner"
+  },
+  {
+   "id": "i_flaregun",
+   "category": "icon",
+   "name": "Flare Gun"
+  },
+  {
+   "id": "i_pistol",
+   "category": "icon",
+   "name": "Pistol"
+  },
+  {
+   "id": "i_parrot",
+   "category": "icon",
+   "name": "Parrot"
+  },
+  {
+   "id": "i_palmtree",
+   "category": "icon",
+   "name": "Palm Tree"
+  },
+  {
+   "id": "i_grenade",
+   "category": "icon",
+   "name": "Grenade"
+  },
+  {
+   "id": "i_guntarget",
+   "category": "icon",
+   "name": "Reticle"
+  },
+  {
+   "id": "i_mountain",
+   "category": "icon",
+   "name": "Mountain"
+  },
+  {
+   "id": "i_vulture",
+   "category": "icon",
+   "name": "Vulture"
+  },
+  {
+   "id": "i_knife",
+   "category": "icon",
+   "name": "Knife"
+  },
+  {
+   "id": "i_helicopter",
+   "category": "icon",
+   "name": "Chopper"
+  },
+  {
+   "id": "i_papaya",
+   "category": "icon",
+   "name": "Papaya"
+  },
+  {
+   "id": "i_skull",
+   "category": "icon",
+   "name": "Skull"
+  },
+  {
+   "id": "i_sharktooth",
+   "category": "icon",
+   "name": "Shark Tooth"
+  },
+  {
+   "id": "i_trexhead",
+   "category": "icon",
+   "name": "T-Rex"
+  },
+  {
+   "id": "i_dragonhead",
+   "category": "icon",
+   "name": "Dragon"
+  },
+  {
+   "id": "i_pandahead",
+   "category": "icon",
+   "name": "Panda"
+  },
+  {
+   "id": "i_ninjahead",
+   "category": "icon",
+   "name": "Ninja"
+  },
+  {
+   "id": "i_explosion",
+   "category": "icon",
+   "name": "Explosion"
+  },
+  {
+   "id": "i_smileyxx",
+   "category": "icon",
+   "name": "Smiley"
+  },
+  {
+   "id": "i_gorilla",
+   "category": "icon",
+   "name": "Gorilla"
+  },
+  {
+   "id": "i_spearhead",
+   "category": "icon",
+   "name": "Spearhead"
+  },
+  {
+   "id": "i_feather",
+   "category": "icon",
+   "name": "Feather"
+  },
+  {
+   "id": "i_torch",
+   "category": "icon",
+   "name": "Torch"
+  },
+  {
+   "id": "i_machinegun",
+   "category": "icon",
+   "name": "Machine Gun"
+  },
+  {
+   "id": "p_points_50",
+   "category": "sp_boost",
+   "name": "5 Season Tiers",
+   "amount": 50,
+   "cost": 150
+  },
+  {
+   "id": "p_points_100",
+   "category": "sp_boost",
+   "name": "10 Season Tiers",
+   "amount": 100,
+   "cost": 300
+  },
+  {
+   "id": "p_points_150",
+   "category": "sp_boost",
+   "name": "15 Season Tiers",
+   "amount": 150,
+   "cost": 450
+  },
+  {
+   "id": "x_boost_5",
+   "category": "xp_boost",
+   "name": "5% XP Boost",
+   "amount": 5
+  },
+  {
+   "id": "x_boost_10",
+   "category": "xp_boost",
+   "name": "10% XP Boost",
+   "amount": 10
+  },
+  {
+   "id": "x_boost_15",
+   "category": "xp_boost",
+   "name": "15% XP Boost",
+   "amount": 15
+  },
+  {
+   "id": "x_boost_20",
+   "category": "xp_boost",
+   "name": "20% XP Boost",
+   "amount": 20
+  },
+  {
+   "id": "x_boost_25",
+   "category": "xp_boost",
+   "name": "25% XP Boost",
+   "amount": 25
+  },
+  {
+   "id": "c_coins_10",
+   "category": "coin",
+   "name": "10 Coins",
+   "amount": 10
+  },
+  {
+   "id": "c_coins_20",
+   "category": "coin",
+   "name": "20 Coins",
+   "amount": 20
+  },
+  {
+   "id": "s01_pack",
+   "category": "pack",
+   "name": "Season One Bundle",
+   "cost": 560
+  },
+  {
+   "id": "s01_pass",
+   "category": "pass",
+   "name": "Season One",
+   "cost": 190
+  },
+  {
+   "id": "l_starter_1",
+   "category": "license",
+   "name": "Starter Pack"
+  },
+  {
+   "id": "l_early_purchase",
+   "category": "license",
+   "name": "Early Purchase Rewards"
+  },
+  {
+   "id": "o_jock_a_m",
+   "category": "outfit",
+   "name": "Touchdown Trooper (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_jock_a_f",
+   "category": "outfit",
+   "name": "Endzone (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_jock_b_m",
+   "category": "outfit",
+   "name": "Fastball (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_jock_b_f",
+   "category": "outfit",
+   "name": "Base Hit (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_jock_c_m",
+   "category": "outfit",
+   "name": "Big Tackle (Male)",
+   "cost": 160
+  },
+  {
+   "id": "o_jock_c_f",
+   "category": "outfit",
+   "name": "Long Rush (Female)",
+   "cost": 160
+  },
+  {
+   "id": "o_founder_a_m",
+   "category": "outfit",
+   "name": "Orange \"Scout Crew\" Founders' Tee"
+  },
+  {
+   "id": "o_founder_a_f",
+   "category": "outfit",
+   "name": "Orange \"Scout Crew\" Founders' Tee"
+  },
+  {
+   "id": "o_founder_b_m",
+   "category": "outfit",
+   "name": "Ultra-Deluxe Special Edition White Tee"
+  },
+  {
+   "id": "o_founder_b_f",
+   "category": "outfit",
+   "name": "Ultra-Deluxe Special Edition White Tee"
+  },
+  {
+   "id": "o_founder_c_m",
+   "category": "outfit",
+   "name": "Papaya Founders' Tee (Male)"
+  },
+  {
+   "id": "o_founder_c_f",
+   "category": "outfit",
+   "name": "Papaya Founders' Tee (Female)"
+  },
+  {
+   "id": "o_founder_d_m",
+   "category": "outfit",
+   "name": "Party Starter Founders' Tee (Male)"
+  },
+  {
+   "id": "o_founder_d_f",
+   "category": "outfit",
+   "name": "Party Starter Founders' Tee (Female)"
+  },
+  {
+   "id": "o_founder_e_m",
+   "category": "outfit",
+   "name": "SOS Founders' Tee (Male)"
+  },
+  {
+   "id": "o_founder_e_f",
+   "category": "outfit",
+   "name": "SOS Founders' Tee (Female)"
+  },
+  {
+   "id": "o_founder_f_m",
+   "category": "outfit",
+   "name": "Blue Alpha/Beta Tee"
+  },
+  {
+   "id": "o_founder_f_f",
+   "category": "outfit",
+   "name": "Blue Alpha/Beta Tee"
+  },
+  {
+   "id": "o_founder_g_m",
+   "category": "outfit",
+   "name": "Red Alpha/Beta Tee"
+  },
+  {
+   "id": "o_founder_g_f",
+   "category": "outfit",
+   "name": "Red Alpha/Beta Tee"
+  },
+  {
+   "id": "l_alphabeta_1",
+   "category": "license",
+   "name": "Alpha Beta Tester Rewards"
+  },
+  {
+   "id": "l_founder_1",
+   "category": "license",
+   "name": "Ultimate Founder Pack"
+  },
+  {
+   "id": "l_founder_2",
+   "category": "license",
+   "name": "Supremely Ultimate Founder Pack"
+  },
+  {
+   "id": "l_founder_3",
+   "category": "license",
+   "name": "Ultimate Ultimate Founder Pack"
+  },
+  {
+   "id": "r_day_1",
+   "category": "reward",
+   "name": "r_day_1",
+   "contains": [
+    "o_surviv_c_m"
+   ]
+  },
+  {
+   "id": "r_day_2",
+   "category": "reward",
+   "name": "r_day_2",
+   "contains": [
+    "c_coins_20"
+   ]
+  },
+  {
+   "id": "r_day_3",
+   "category": "reward",
+   "name": "r_day_3",
+   "contains": [
+    "o_aloha_c_m"
+   ]
+  },
+  {
+   "id": "r_day_4",
+   "category": "reward",
+   "name": "r_day_4",
+   "contains": [
+    "c_coins_20"
+   ]
+  },
+  {
+   "id": "r_day_5",
+   "category": "reward",
+   "name": "r_day_5",
+   "contains": [
+    "g_brushit"
+   ]
+  },
+  {
+   "id": "r_day_6",
+   "category": "reward",
+   "name": "r_day_6",
+   "contains": [
+    "c_coins_20"
+   ]
+  },
+  {
+   "id": "r_day_7",
+   "category": "reward",
+   "name": "r_day_7",
+   "contains": [
+    "o_ninja_a_m"
+   ]
+  },
+  {
+   "id": "r_day_final",
+   "category": "reward",
+   "name": "r_day_final",
+   "contains": [
+    "c_coins_20"
+   ]
+  },
+  {
+   "id": "l_steam_slowclap",
+   "category": "license",
+   "name": "Founder Slowclap"
+  }
+ ]
+}

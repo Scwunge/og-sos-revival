@@ -2,3 +2,4 @@ logs/
 data/db.json
 node_modules/
 secret.key
+__pycache__/

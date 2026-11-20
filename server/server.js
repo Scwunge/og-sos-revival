@@ -95,6 +95,31 @@ function handleKv(rel, res) {
   return send(res, 404, 'not found', 'text/plain');
 }
 
+// ---------- everything-unlocked app account ----------
+let COSMETICS = { items: [], grantableCategories: [] };
+try { COSMETICS = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'cosmetics.json'), 'utf8')); } catch { console.warn('data/cosmetics.json missing: inventory will be empty'); }
+// Shape confirmed from the client's parser (docs/INVENTORY_FORMAT.md): read from the top level,
+// owned ids are strings in inventory.licenses, wallet is inventory.wallet {coins_paid, coins_free}.
+// Wrong-typed fields are skipped silently by the client, so types matter (season-id is a number).
+function appAccount() {
+  const licenses = COSMETICS.items
+    .filter((i) => ['outfit', 'gesture', 'icon', 'license', 'pass'].includes(i.category))
+    .map((i) => i.id);
+  return {
+    inventory: {
+      wallet: { coins_paid: 0, coins_free: 999999 },
+      licenses,
+    },
+    season: {
+      sp: 0, xp: 0, 'free-tier': 50, 'premium-tier': 50, 'season-id': 1, level: 50,
+      'xp-boost': 0, 'has-premium': true,
+      'start-date': '2018-01-01T00:00:00Z', 'end-date': '2030-01-01T00:00:00Z',
+      'current-level-xp': 0, 'current-free-tier-sp': 0, 'next-level-xp': 1, 'next-free-tier-sp': 1,
+    },
+    gifts: [],
+  };
+}
+
 // ---------- REST API ----------
 // Routes come from the paths baked into SOS-Win64-Shipping.exe.
 function handleApi(req, url, body, res) {
@@ -151,15 +176,17 @@ function handleApi(req, url, body, res) {
   }
   if (p.startsWith('/api/account/')) return send(res, 200, wrap({}));   // tos, language, report, identity, accept-ban
 
-  // Inventory: this is where "everything unlocked" will live once we know the item ids.
-  // Drop the full list into data/inventory_all.json (format learned from logs) and it is served to everyone.
+  // Inventory: everyone owns every cosmetic (ids from data/cosmetics.json, see docs/INVENTORY_FORMAT.md).
   if (m(/^\/api\/app\/[^/]+\/inventory\//) || m(/^\/api\/app\/[^/]+\/reconcile\//)) {
-    const f = path.join(DATA_DIR, 'inventory_all.json');
-    return send(res, 200, wrap(fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {}));
+    return send(res, 200, appAccount());
   }
-  if (m(/^\/api\/app\/[^/]+\/season\//)) return send(res, 200, wrap({}));
-  // Store: everything is free. Purchases always succeed.
-  if (m(/^\/api\/app\/[^/]+\/store\//)) return send(res, 200, wrap({ success: true, items: [] }));
+  // GetAppRewards: {changes:{wallet-delta, new-licenses}, last-level-up}. Nothing new to hand out.
+  if (m(/^\/api\/app\/[^/]+\/season\//)) {
+    return send(res, 200, { changes: { 'wallet-delta': { coins_paid: 0, coins_free: 0 }, 'new-licenses': [] } });
+  }
+  // Store: purchases return the (already complete) account; the shop list is empty since everything is owned.
+  if (m(/^\/api\/app\/[^/]+\/store\/items\/purchase$/)) return send(res, 200, appAccount());
+  if (m(/^\/api\/app\/[^/]+\/store\//)) return send(res, 200, { 'store-view': [] });
 
   if (p === '/api/log') return send(res, 200, wrap({}));
   if (p.startsWith('/api/leaderboard/')) return send(res, 200, []);

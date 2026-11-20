@@ -34,6 +34,8 @@ Steam must be running. The launcher starts `SOS-Win64-Shipping.exe` directly, wi
 
 **Progress, 19 Nov 2026:** Steam login works (`LoadingOutpostLoginEnd Success:true`). After login the client calls `reconcile` (inventory), `season/.../unseen-reward`, saved data, `store/items/view` and `app-meta/.../language`, and opens the matchmaking WebSocket. It then sends nothing and waits for a "ready" message from the server, whose format is still unknown.
 
+**Progress, 20 Nov 2026:** every cosmetic is unlocked for every player. The client reads owned items as strings in `inventory.licenses` and coins from `inventory.wallet.coins_free`, at the top level of the reply. It silently skips any field with the wrong type.
+
 What we've learned:
 - Login is `POST /api/access-token/steam` with `{"steam-app-id","steam-id","session-auth-token","roles","app-id"}`. The reply has to carry a JWT-shaped token, which the client sends back as `Authorization: Token <jwt>`.
 - `GET /api/account` has to return the account fields at the top level of the JSON. A reply with them only under `data` makes login fail.
@@ -42,8 +44,8 @@ What we've learned:
 Endpoint paths come from the client binary. Response *shapes* are guesses (`{"version", "data"}` comes from the client's own error messages) until the logs confirm them.
 
 ## Roadmap
-1. **Get to the main menu.** Launch against a local server, read the logs, fix each response until login and the menu load cleanly.
-2. **Unlock everything.** Learn the inventory format, list every cosmetic id, and serve the full list as `data/inventory_all.json`.
+1. ~~**Get to the main menu.**~~ Done 19 Nov 2026.
+2. ~~**Unlock everything.**~~ Done 20 Nov 2026, confirmed in game: all 181 outfits, gestures and icons, every license, the season-1 pass and 999,999 coins. The item ids are in `data/cosmetics.json` (from the game's `StoreItemDefinitions` table), and the reply format is in [docs/INVENTORY_FORMAT.md](docs/INVENTORY_FORMAT.md).
 3. **Check that matches can be hosted.** The official dedicated server was never given to players. Test whether the client can host (`?listen`), or find another way. *Everything below depends on this.*
 4. **Matchmaking.** Work out the WebSocket protocol (`player-join`, `session-started`, `connection`, `group-event`, ...) and send players to a hosted match.
 5. **Verify Steam tickets** at login so player ids can't be faked. Then host on a VPS.
