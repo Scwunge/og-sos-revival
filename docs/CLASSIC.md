@@ -4,6 +4,21 @@ What our backend and launcher must do so **SOS: Classic** can log in, unlock eve
 Everything here was read from the client: the exe, its pak configs and the cooked Blueprints. No game data is in the repo.
 In this doc, "Main" means the main client (app 619080) that `server/` and `launcher/` already support.
 
+## Verdict: Classic cannot host either (same as Main)
+
+- **`UWorld::Listen` is compiled out in Classic too.** In `UEngine::LoadMap`, the only Listen call (`call 0x140B6EDF0; test al,al` at **0x141417674**, just before the "LoadMap: failed to Listen(%s)" log at 0x1414176CA) goes to a shared **`32 C0 C3`** stub (`xor al,al; ret`). That stub has dozens of callers, so it is a COMDAT-folded "return false".
+  - This is what UE 4.12 gives `UWorld::Listen` when `WITH_SERVER_CODE=0`.
+  - Like Main, Classic has no "Failed to listen: %s" string. Classic, Main and Main's stub at 0x140188B70 all match.
+  - So `?listen` (command-line token, console `open`, `OpenLevel` options) always fails with "LoadMap: failed to Listen".
+- **No dedicated path.** PreInit (FUN_140135d20) writes the client/server globals as constants, and `-server` is never parsed. "SOS Test Server" is **not** a server-code build; it is a client build like Main.
+- **What is still compiled in:**
+  - `UIpNetDriver::InitListen` ("%s IpNetDriver listening on port %i", xref RVA 0xE543F4);
+  - `UNetDriver::InitListen` (RVA 0x11E5996);
+  - the WebSocketNetDriver and LAN beacon listeners.
+
+  So hosting would need a hand-written replacement for `UWorld::Listen` in a code cave. It would create the game net driver, call `InitListen`, and set it on the world. That is a substantial exe patch, not a byte flip.
+- **Matchmaking subprotocol:** Classic has the same `wss,ws` literal as Main, so the same fix applies: the server must echo `Sec-WebSocket-Protocol: wss,ws` in full.
+
 ## Build
 
 | | Classic | Main |
@@ -159,21 +174,26 @@ Join options `SpectatorOnly=1` and `DirectorOnly=1` (and `bDirectorOnly`, `MaxSp
 **None. Same as Main.**
 
 - `FEngineLoop::PreInit` (FUN_140135d20, the caller of `FCommandLine::Set`) writes the client/server globals as constants. On the non-commandlet path it sets `DAT_142a035b8=1` and `DAT_142a035b9=0`, with no `-server` branch. This is the same shape as Main's FUN_140138ca0.
-- A listen server is the only way to host. `?listen` works: the hidden FrontendHUD button `DebugLoadWhitebox` runs `CreateSession(32 players, LAN)` and then `OpenLevel('/Game/Maps/'+DebugLevel, '?listen?bIsLanMatch')`. Its default level `Whiteboxes/Social_Whitebox` is not in the pak, and the button is hidden, so it is not usable without modding.
+- A listen server is not possible either: `UWorld::Listen` is a `return false` stub (see the verdict at the top).
+  - The hidden FrontendHUD button `DebugLoadWhitebox` runs `CreateSession(32 players, LAN)` and then `OpenLevel('/Game/Maps/'+DebugLevel, '?listen?bIsLanMatch')`. This only shows that the Blueprint was written for a server build.
+  - In this build that call would log "LoadMap: failed to Listen". (Its default level `Whiteboxes/Social_Whitebox` is also missing from the pak.)
 - `ApproveLogin` (FUN_140150950, ShooterGameSession.cpp) is **the same as Main**. It checks the `AuthToken=` URL option only when the session has a session id, so joiners of a host started without `SESSION_ID` need no token.
 
 ## Hosting options, ranked
 
+**None of the routes below can host as-is**, because `UWorld::Listen` returns false (see the verdict). They are kept for what they still do.
+
 | # | Route | Status | Notes |
 |---|---|---|---|
-| 1 | **Map token**: `SOS-Win64-Shipping.exe LaCuna?game=SUR?listen` (add `?bIsLanMatch` for LAN search) | best bet; same filter and same code as Main | The first token survives the filter because it does not start with `-`. Classic's map is **`LaCuna`** (there is no `LaCuna_BR`). Port 7777. The host skips the menu and login. |
-| 2 | **Patched private exe** (NOP at file **0x414D8F**) | high | Brings back `-log -nullrhi -nosound -Port= -SESSION_ID= -SESSION_TOKEN=`. Combine with route 1. |
+| 0 | **Code-cave replacement for `UWorld::Listen`** in a private exe copy | the only real route; large effort | Point the call at 0x141417674 to new code that creates the game net driver, calls `UIpNetDriver::InitListen` (still compiled in) and assigns it to the world. Untested; needs the CreateNamedNetDriver/InitListen addresses mapped first. |
+| 1 | **Map token**: `SOS-Win64-Shipping.exe LaCuna?game=SUR?listen` | loads the map; **listen fails** | The first token survives the filter (same as Main), but LoadMap logs "failed to Listen". It is still the way to start a host once route 0 exists. Classic's map is **`LaCuna`**. |
+| 2 | **Patched private exe** (NOP at file **0x414D8F**) | works, but does not host by itself | Brings back `-log -nullrhi -nosound -Port= -SESSION_ID= -SESSION_TOKEN=`. |
 | 3 | **Director server browser** to join a host (Classic only) | joiners' side; untested | Shown to players whose nickname is in KV `UE_CLIENT_DIRECTOR_USERS` (frontend "Show Director Screen"). The in-game Director toggle needs role `BBL_player` or `dev`; the utility-bar Director button needs `dev` or `qa`. ServerListUI offers HOSTED (Internet), LOCAL (LAN), REFRESH, and **Join IP** (`FindSessionByIp(player, hostname)`, then `JoinSession`), with "Join As" Player/Spectator/Director. LAN search finds a host started with `?bIsLanMatch` on the same subnet. How Join IP resolves over the Steam net driver is **Inferred** (not tested). |
 | 4 | **Custom match through MMS** | lobby UI only | KV `UE_CLIENT_CUSTOM_MATCHES_ENABLED=true` and `_ROLES` let players `create-session` (game-mode `solo`, map from `UE_CLIENT_CUSTOM_MATCHES_MAPS`). Our server must still send `session-started {host, port}` pointing at a route 1 or 2 host. |
 | 5 | Console `open LaCuna?game=SUR?listen` | unknown | `ConsoleClassName=OutpostConsole`. Not settled statically, as in Main. |
 | 6 | `MainMenuMap=/Game/Maps/LaCuna/LaCuna` in Game.ini | does not host | Diagnostic only. **Note** that Game.ini is shared with Main (same Saved folder). |
 
-Matchmaking joiners connect to whatever `session-started` names, so the same `server/` MMS flow works once a route 1 or 2 host is running.
+Matchmaking joiners connect to whatever `session-started` names, so the same `server/` MMS flow would work once a host can listen (route 0).
 
 ## Code changes Classic needs (not made here)
 
@@ -202,7 +222,8 @@ Launcher (`launcher/launcher.js`):
 
 5. **Classic install path.** `--game "C:\Program Files (x86)\Steam\steamapps\common\SOS Test Server"` already points the exe there, because the folder layout is identical. A `--classic` shortcut would be convenient.
 6. **Config.** Classic uses the **same** `%LOCALAPPDATA%\SOS\Saved\Config\WindowsClient\Engine.ini` as Main and reads the same Outpost sections. The extra `[OutpostIAP]` and `[OutpostStorefront]` sections are harmless, so the same patch serves both clients and nothing needs to change. Just be aware that patching for one patches the other, and `--restore` restores both.
-7. **Hosting.** Add a host mode that passes `LaCuna?game=SUR?listen` as the first argument (route 1). It could optionally make a patched private copy of the exe (filter at 0x414D8F; DLC at 0x166390 and 0x1662D0) next to the original and never touch the original.
+7. **Hosting.** Blocked until a `UWorld::Listen` replacement exists (route 0). After that, a host mode would pass `LaCuna?game=SUR?listen` as the first argument and run a patched private copy of the exe (Listen cave; filter at 0x414D8F; DLC at 0x166390 and 0x1662D0) next to the original, never touching the original.
+8. **Matchmaking WebSocket.** Echo `Sec-WebSocket-Protocol: wss,ws` in full; Classic has the same literal as Main.
 
 ## Helper scripts added
 
