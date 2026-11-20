@@ -1,0 +1,137 @@
+# Hosting DLL (`mod/sos_host`)
+
+Both shipping exes have `UWorld::Listen` compiled out, so `?listen` always fails with `LoadMap: failed to Listen` (see `docs/HOSTING.md`). `sos_host` is a `version.dll` proxy that puts a working `Listen` back. With it, one copy of the game can host a listen server that other clients join by `IP:port`.
+
+It supports the main client (Steam app 619080) and SOS: Classic (app 802240). It patches nothing in any other exe.
+
+## What it does
+
+The game imports `VERSION.dll` and loads it from its own folder first, so the proxy only has to sit next to the exe. All 17 `version.dll` exports jump to the real `%SystemRoot%\System32\version.dll`.
+
+At load (`DllMain`), before the game's own code runs:
+
+1. **Identifies the exe.** It checks `SizeOfImage`, the PE timestamp, the `32 C0 C3` Listen stub, and that the `LoadMap` call site is `E8 <rel32 to the stub>` followed by `84 C0` (`test al,al`). If any check fails, it logs `Unknown exe` and patches nothing.
+2. **Redirects the one `UWorld::Listen` call.** The `CALL` in `UEngine::LoadMap` is rewritten to call a 12-byte thunk (`mov rax, HostListen; jmp rax`) placed within 2 GB of the exe. The shared stub itself is untouched, because it is a COMDAT-folded `return false` that many unrelated functions call.
+3. **Optionally disables the command-line allow-list** by replacing the single filter call in `FCommandLine::Set` with a 5-byte NOP. `-log`, `-Port=`, `-nullrhi`, `-SESSION_ID=` and so on then reach the engine.
+
+`HostListen(UWorld*, FURL&)` is UE 4.12.5's `UWorld::Listen`, built from functions still in the exe (the same ones `UGameInstance::PlayReplay` uses for the demo driver):
+
+```
+if World->NetDriver: fail                                  (NetDriverAlreadyExists)
+GEngine->CreateNamedNetDriver(World, NAME_GameNetDriver, NAME_GameNetDriver)
+World->NetDriver = GEngine->FindNamedNetDriver(World, NAME_GameNetDriver)
+NetDriver->SetWorld(World)
+NetDriver->InitListen(World as FNetworkNotify, URL, false, Error)   (vtable +0x1F8)
+on failure: GEngine->DestroyNamedNetDriver(...), World->NetDriver = null, fail
+```
+
+The stock version also copies `MaxInternetClientRate` and `ServerTravelPause`; those are tuning values and are skipped.
+
+**Net driver choice.** `GameNetDriver` resolves to `SteamNetDriver` with `IpNetDriver` as fallback. By default, `SteamNetDriver::InitListen` opens Steam P2P sockets, which IP clients cannot reach. When the driver is the Steam one and `SteamSockets=0` (the default), the DLL does what the `?bIsLanMatch` branch of that function does: it sets `bIsPassthrough` (`+0x390`) and calls `UIpNetDriver::InitListen` directly. Joining clients already use IP passthrough when they connect to an IP address.
+
+## Build
+
+Needs MinGW-w64 gcc (the WinLibs build is installed on the dev machine). From `mod\sos_host`:
+
+```powershell
+.\build.ps1
+```
+
+Output: `mod\sos_host\build\version.dll` (about 22 KB, depends only on kernel32 and the UCRT that the game already uses) and a copy of `sos_host.ini`.
+
+## Install and remove
+
+Copy two files into the game's binaries folder:
+
+| File | Destination |
+|---|---|
+| `build\version.dll` | `...\steamapps\common\SOS\SOS\Binaries\Win64\version.dll` |
+| `build\sos_host.ini` | same folder (optional; defaults are built in) |
+
+For Classic, use `...\steamapps\common\SOS Test Server\SOS\Binaries\Win64\`.
+
+To remove, delete `version.dll`, `sos_host.ini` and `sos_host.log` from that folder. The exe and pak are never modified. Launch the exe directly, as `launcher/launcher.js` does, not through BattlEye.
+
+The DLL is inert for players who do not pass `?listen`. Only the command-line filter patch is active in every session, and it only lets more switches through.
+
+## Config (`sos_host.ini`, section `[Host]`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `EnableListen` | 1 | 0 keeps the stock (failing) Listen. |
+| `Port` | 0 | Listen port; 0 keeps the URL port (7777 from `[URL] Port`, or `-Port=`). |
+| `UnfilterCommandLine` | 1 | NOP the shipping command-line allow-list. |
+| `SteamSockets` | 0 | 1 lets `SteamNetDriver` listen on Steam sockets (IP clients cannot join). |
+| `LoginPendingTimeout` | 0 | Main client only. If above 0, sets `blackbird.LoginPendingTimeout` to this many seconds when Listen runs. |
+| `LogFile` | `sos_host.log` | Relative to the DLL folder, or absolute; `-` disables it. |
+
+## Starting a host
+
+From `...\SOS\SOS\Binaries\Win64`, with Steam running:
+
+```powershell
+.\SOS-Win64-Shipping.exe LaCuna_BR?game=SUR?listen -log -windowed
+```
+
+Expected in `sos_host.log`:
+
+```
+sos_host loaded into SOS main (619080) ...
+Patched LoadMap Listen call at +147cef4 -> thunk ...
+Command-line filter disabled at +047504f
+Listen(...) requested, port 7777
+Listening with SteamNetDriver (IP passthrough) on port 7777
+```
+
+Expected in the game log (`%LOCALAPPDATA%\SOS\Saved\Logs\SOS.log`): `IpNetDriver listening on port 7777`, and no `LoadMap: failed to Listen`.
+
+Clients join through matchmaking (`session-started` with `host`/`port` pointing at the host), or with `open <ip>:7777` where a console exists.
+
+## The host player and LoginPending (main client)
+
+Booting straight into a map skips the Frontend, so the host's local player never logs in to the backend. `AShooterGameMode` (FUN_1401cd360, the `RestartPlayer` override) checks `IsLoggedIn` (FUN_1401b8ba0). That needs a PlayerState with a UniqueNetId (`+0x3d8`) and app data (`+0x518`) with `+0x38 >= 1`. Without them the controller is put in the `LoginPending` state. The controller tick (FUN_1401c1a40) returns it to the main menu after `blackbird.LoginPendingTimeout` seconds (cvar float at `*0x142a4b0b0`, default 120). That would take the listen server down with it.
+
+The least invasive fix, implemented here: set `LoginPendingTimeout` in the ini (for example `LoginPendingTimeout=86400`). The host player then just waits in `LoginPending` with no pawn, which makes it a de facto spectator. The listen server keeps running and remote players log in normally. Nothing in game code is patched for this, and joining clients are unaffected because the value only matters on the machine that runs the controller tick, the host.
+
+Other options, not implemented:
+- Make `IsLoggedIn` return true for the local controller. This lets the host spawn, but code that reads the missing app data (loadout and so on) may crash.
+- Host from a logged-in session: start at the Frontend and log in, then make the travel to the match address load the map with `?listen` instead (a `UEngine::Browse` FUN_141466570 hook keyed on the host's own address). The host would then be a normal, logged-in player. This is the best long-term route.
+
+Classic has no `blackbird.LoginPendingTimeout`; its login flow is not analysed yet.
+
+## Address tables
+
+Image base `0x140000000`; the DLL uses RVAs and the runtime base (ASLR is on).
+
+| Item | Main (619080) | Classic (802240) |
+|---|---|---|
+| `SizeOfImage` / PE timestamp | 48713728 / `5bc0f502` | 48156672 / `5b971052` |
+| LoadMap `CALL Listen` site | `14147cef4` | `141417674` |
+| Listen stub (`32 C0 C3`) | `140188b70` | `140b6edf0` |
+| `FCommandLine::Set` filter call (`E8 0C 3A 00 00`) | `14047504f` | `14041578f` |
+| `GEngine` | `142bf5818` | `142b766a0` |
+| `FName::FName(const TCHAR*, EFindName)` | `1404d3280` | `140472c50` |
+| `UEngine::CreateNamedNetDriver(UWorld*, FName, FName)` | `14146a1c0` | `1414048e0` |
+| `UEngine::FindNamedNetDriver(UWorld*, FName)` | `141471a30` | `14140c1d0` |
+| `UEngine::DestroyNamedNetDriver(UWorld*, FName)` | `14146c3b0` | `141406ad0` |
+| `UNetDriver::SetWorld` | `141258c90` | `1411f3aa0` |
+| `USteamNetDriver::InitListen` | `141aeafc0` | `141a7ec40` |
+| `UIpNetDriver::InitListen` | `140eb75b0` | `140e542b0` |
+| `FMemory::Free` | `14040d1b0` | `1403acc40` |
+| `blackbird.LoginPendingTimeout` value pointer | `142a4b0b0` | none |
+
+Shared layout (both builds): `UWorld` FNetworkNotify base `+0x28`, `UWorld::NetDriver` `+0x38`, `UWorld::DemoNetDriver` `+0xb8`. `UNetDriver::World` `+0xa0`, `Notify` `+0xe8`, `NetDriverName` `+0xe0`, `ServerConnection` `+0x70`. Vtable: `InitBase` `+0x1E8`, `InitConnect` `+0x1F0`, `InitListen` `+0x1F8`. `FURL::Port` `+0x20`, `FURL::Map` `+0x28`. `USteamNetDriver::bIsPassthrough` `+0x390`. `FWorldContext::World` `+0x298`, `ActiveNetDrivers` `+0x248`; `UEngine::WorldList` `+0xb78`.
+
+How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
+- `UGameInstance::PlayReplay` (main FUN_141136db0, Classic FUN_1410d1fd0; string `PlayReplay: failed to create demo net driver!`) calls `FName(L"DemoNetDriver",1)`, `CreateNamedNetDriver(GEngine, World, ...)`, `FindNamedNetDriver`, stores to `World+0xb8`, calls `SetWorld`, then `InitConnect` through vtable `+0x1F0` with `World+0x28`.
+- `CreateNamedNetDriver_Local` (FUN_14146a230, strings `CreateNamedNetDriver ...`) and `DestroyNamedNetDriver_Local` (FUN_14146c410, string `DestroyNamedNetDriver %s [%s]`) each have two thin wrappers. The one that matches `FWorldContext::World` (`+0x298`) is the `UWorld*` overload; the other matches `PendingNetGame` (`+0x1c8`).
+- `USteamNetDriver::InitListen` is the function with the string `Unreal server (Steam)`. It checks `bIsLanMatch`, sets `+0x390`, and tail-calls `UIpNetDriver::InitListen` (string `%s IpNetDriver listening on port %i`).
+- `UWorld::NotifyControlMessage` (main FUN_1414ca7f0) is entered with `this = World+0x28` and reads `NetDriver` at `this+0x10`, which confirms the `+0x38` offset.
+
+## Status and open items
+
+- Built and smoke-tested outside the game: export forwarding works, and an unknown exe is left unpatched.
+- **Not yet run in game.** The first test should show `IpNetDriver listening on port 7777` and UDP 7777 open (`Get-NetUDPEndpoint -LocalPort 7777`).
+- Untested: whether a remote client gets past `LoginPending` on the host. This needs the server-side `IsLoggedIn`: the client's UniqueNetId from `NMT_Login`, and app data loaded by `LoadAppData` (FUN_1401ba330). That loads synchronously when the app-data key list is empty, otherwise over HTTP.
+- With no `-SESSION_ID`, `ApproveLogin` skips the `AuthToken` check (Inferred, see `docs/HOSTING.md`).
+- The Classic table is derived the same way but has not been run.
