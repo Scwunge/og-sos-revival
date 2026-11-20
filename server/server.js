@@ -132,6 +132,23 @@ try { COSMETICS = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'cosmetics.json
 // Shape confirmed from the client's parser (docs/INVENTORY_FORMAT.md): read from the top level,
 // owned ids are strings in inventory.licenses, wallet is inventory.wallet {coins_paid, coins_free}.
 // Wrong-typed fields are skipped silently by the client, so types matter (season-id is a number).
+// Account JSON as the client parses it (FUN_141a57160, top level only). "identities" is an OBJECT keyed by
+// provider ({steam:{id,created,updated,display-name}}); the Steam id is read from identities.steam.id. With it
+// missing, OnGetAccountInfoComplete logs "empty Steam ID" and a player joining a match waits minutes in LoginPending.
+// The top-level "id" must be non-empty ("Missing user id"). The db keeps the older array form.
+function accountView(base) {
+  const id = String(base.id ?? base['account-id'] ?? '');
+  const ids = Array.isArray(base.identities) ? base.identities : [];
+  const steamId = /^7656\d{13}$/.test(id) ? id : (ids.find((x) => x.provider === 'steam')?.['provider-data'] ?? id);
+  const name = base['display-name'] ?? base.alias ?? id;
+  return {
+    ...base, id,
+    user: { uname: base.alias ?? id, fname: '', lname: '', email: '' },
+    identities: { steam: { id: steamId, created: '0', updated: '0', 'display-name': name } },
+    roles: base.roles ?? ['app-user'],
+  };
+}
+
 function appAccount() {
   const licenses = COSMETICS.items
     .filter((i) => ['outfit', 'gesture', 'icon', 'license', 'pass'].includes(i.category))
@@ -178,7 +195,7 @@ function handleApi(req, url, body, res) {
     const jwt = makeJwt(accountId, steamId, roles, appId);
     db.tokens[jwt] = accountId;
     saveDb();
-    const payload = { ...db.accounts[accountId], 'user-id': accountId, 'access-token': jwt, token: jwt };
+    const payload = { ...accountView(db.accounts[accountId]), 'user-id': accountId, 'access-token': jwt, token: jwt };
     if (isClassic(appId)) payload.roles = roles;
     // Give the fields both at top level and under "data" until we know which the client reads.
     return send(res, 200, { ...payload, version: 1, data: payload });
@@ -204,8 +221,7 @@ function handleApi(req, url, body, res) {
   }
   if ((r = m(/^\/api\/account\/([^/]+)$/)) || p === '/api/account') {
     const id = r ? r[1] : accountFromAuth(req);
-    const acct = db.accounts[id] ?? { id, 'account-id': id };
-    // Same trick as login: fields at top level and under "data" until we know which is read.
+    const acct = accountView(db.accounts[id] ?? { id, 'account-id': id });
     return send(res, 200, { ...acct, version: 1, data: acct });
   }
   if (p.startsWith('/api/account/')) return send(res, 200, wrap({}));   // tos, language, report, identity, accept-ban
@@ -215,6 +231,11 @@ function handleApi(req, url, body, res) {
     return send(res, 200, appAccount());
   }
   // GetAppRewards: {changes:{wallet-delta, new-licenses}, last-level-up}. Nothing new to hand out.
+  // GET season/<id> (no further path) is the season state, not the rewards call.
+  if (req.method === 'GET' && m(/^\/api\/app\/[^/]+\/season\/[^/]+$/)) {
+    const a = appAccount();
+    return send(res, 200, { ...a.season, season: a.season, data: a.season });
+  }
   if (m(/^\/api\/app\/[^/]+\/season\//)) {
     return send(res, 200, { changes: { 'wallet-delta': { coins_paid: 0, coins_free: 0 }, 'new-licenses': [] } });
   }
@@ -308,7 +329,7 @@ server.on('upgrade', (req, socket) => {
   const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   const proto = req.headers['sec-websocket-protocol'];
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${accept}\r\n` + (proto ? `Sec-WebSocket-Protocol: ${proto.trim()}\r\n` : '') + '\r\n');
+    `Sec-WebSocket-Accept: ${accept}\r\n` + (proto ? `Sec-WebSocket-Protocol: ${proto.trim()}\r\n` : '') /* the client's lws registers one protocol literally named "wss,ws" and rejects a reply naming only "wss" */ + '\r\n');
   const id = crypto.randomBytes(4).toString('hex');
   log('ws.jsonl', { id, event: 'open', path: req.url, account: accountId, headers: req.headers });
   console.log(`ws ${id} open ${req.url}${accountId ? ` account ${accountId}${mmFor === mmClassic ? ' (classic)' : ''}` : ''}`);

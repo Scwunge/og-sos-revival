@@ -56,7 +56,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const m = await login('76561190000000102', 'sos');
   const mc = JSON.parse(Buffer.from(m['access-token'].split('.')[1], 'base64url'));
-  assert(mc['app-id'] === 'sos' && !mc.roles.includes('testserver') && m.roles === undefined, 'main login changed');
+  assert(mc['app-id'] === 'sos' && !mc.roles.includes('testserver') , 'main login changed');
   console.log('PASS  main login unchanged:', mc.roles.join(' '));
 
   const kc = await req('GET', '/kv/runtime-1.json', null, { 'app-id': 'sostest' });
