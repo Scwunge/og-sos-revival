@@ -19,6 +19,21 @@ How to host a SOS: Classic test on your own PC, and how friends join it. Windows
 
 ## Friends: join a host
 
+### The easy way: double-click a file
+
+The host sends you a file called `Join OG SOS Classic.cmd`.
+
+1. Make sure Steam is running and signed in.
+2. Double-click the file. Windows may warn about a downloaded file: choose **More info**, then **Run anyway**.
+3. SOS: Classic opens on the host's server. Press **PLAY**.
+4. Keep the small black window open while you play. When you close the game, it puts your settings back.
+
+You need no Node.js and no commands. The file never changes the game's files.
+
+**Host: make the file** with `node tools/make_join_file.js --server <public IPv4>:7781`. It is written to `dist\Join OG SOS Classic.cmd`.
+
+### The manual way (Node.js)
+
 1. Install **Node.js LTS** from [nodejs.org](https://nodejs.org). Accept the defaults.
 2. Get the OG SOS Revival folder. The host sends you the folder or a link.
 3. Make sure Steam is running.

@@ -4,3 +4,4 @@ node_modules/
 secret.key
 __pycache__/
 deploy/classic-backend/.env
+dist/
