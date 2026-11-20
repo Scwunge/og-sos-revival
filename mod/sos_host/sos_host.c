@@ -65,7 +65,10 @@ static struct {
     int game_log;             /* 1: mirror every UE_LOG line to sos_game_<pid>.log */
     int fix_join_state;       /* 1: send ClientGotoState(Playing) after ClientRetryClientRestart */
     int block_eliminate;      /* 1: skip UTeamManager::EliminatePlayer (test switch) */
-} cfg = { 1, 0, 1, 0, 0, 1, 1, 0 };
+    int max_client_rate;      /* >0: UNetDriver MaxClientRate/MaxInternetClientRate after Listen */
+    int replicate_actors;     /* 1: run our own actor replication pass (client builds lack it) */
+    int replicate_startup;    /* 1: also replicate actors placed in the map (bNetStartup) */
+} cfg = { 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_log_path[MAX_PATH];
@@ -116,6 +119,9 @@ static void load_config(HMODULE self)
     cfg.game_log         = GetPrivateProfileIntW(L"Host", L"GameLog", cfg.game_log, ini);
     cfg.fix_join_state   = GetPrivateProfileIntW(L"Host", L"FixJoinState", cfg.fix_join_state, ini);
     cfg.block_eliminate  = GetPrivateProfileIntW(L"Host", L"BlockEliminate", cfg.block_eliminate, ini);
+    cfg.max_client_rate  = GetPrivateProfileIntW(L"Host", L"MaxClientRate", cfg.max_client_rate, ini);
+    cfg.replicate_actors = GetPrivateProfileIntW(L"Host", L"ReplicateActors", cfg.replicate_actors, ini);
+    cfg.replicate_startup = GetPrivateProfileIntW(L"Host", L"ReplicateStartupActors", cfg.replicate_startup, ini);
 
     wchar_t log_name[MAX_PATH];
     GetPrivateProfileStringW(L"Host", L"LogFile", L"sos_host.log", log_name, MAX_PATH, ini);
@@ -156,6 +162,14 @@ typedef struct {
     uint32_t client_retry;      /* void PC::ClientRetryClientRestart(PC*, APawn*) RPC sender */
     uint32_t client_goto_state; /* void PC::ClientGotoState(PC*, FName) RPC sender */
     uint32_t eliminate;         /* UTeamManager::EliminatePlayer(TM*, APlayerState*) */
+    /* Actor replication (Classic only; 0 = not mapped) */
+    uint32_t tick_flush;        /* void UNetDriver::TickFlush(UNetDriver*, float) */
+    uint32_t find_channel;      /* TMap<FWeakObjectPtr, UActorChannel*>::FindIndex(map, int*, key*) */
+    uint32_t weak_ctor;         /* FWeakObjectPtr::operator=(FWeakObjectPtr*, UObject*) */
+    uint32_t create_channel;    /* UChannel* UNetConnection::CreateChannel(conn, type, bOpenedLocally, index) */
+    uint32_t set_channel_actor; /* void UActorChannel::SetChannelActor(ch, AActor*) */
+    uint32_t replicate_actor;   /* bool UActorChannel::ReplicateActor(ch) */
+    uint32_t is_pending_kill;   /* bool UObjectBaseUtility::IsPendingKill(obj) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -166,6 +180,7 @@ static const GameBuild k_builds[] = {
         0x1aeafc0, 0x0eb75b0, 0x040d1b0, 0x2a4b0b0,
         0x04a9f30, 0x04de7a0,
         0x01cd360, 0x01c7370, 0x14e9160, 0x14e8d20, 0x01f0600,
+        0, 0, 0, 0, 0, 0, 0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -173,7 +188,8 @@ static const GameBuild k_builds[] = {
         0x2b766a0, 0x0472c50, 0x14048e0, 0x140c1d0, 0x1406ad0, 0x11f3aa0,
         0x1a7ec40, 0x0e542b0, 0x03acc40, 0,
         0x044a500, 0x047e090,
-        0, 0, 0, 0, 0,
+        0x0185c30, 0, 0x1482e90, 0x1482a50, 0,
+        0x11f5460, 0x0ac6ce0, 0x053ecd0, 0x11dba20, 0x1080c10, 0x107dbe0, 0x01672f0,
     },
 };
 
@@ -182,6 +198,7 @@ static const GameBuild k_builds[] = {
 #define UWORLD_NETDRIVER   0x38   /* UNetDriver* UWorld::NetDriver */
 #define NETDRIVER_STEAM_PASSTHROUGH 0x390 /* USteamNetDriver::bIsPassthrough */
 #define VTBL_INITLISTEN    0x1F8  /* UNetDriver::InitListen */
+#define NETDRIVER_MAXINETRATE 0x4C /* int32 MaxInternetClientRate; MaxClientRate at +0x50 (main, reflection) */
 #define FURL_PORT          0x20
 #define FURL_MAP           0x28
 
@@ -292,6 +309,18 @@ static uint8_t HostListen(uint8_t *world, uint8_t *url)
     }
     fstring_log_free("InitListen message", &err);
     hlog("Listening with %s on port %d", kind, *(int32_t *)(url + FURL_PORT));
+    if (cfg.max_client_rate > 0) {
+        int32_t *rates = (int32_t *)((uint8_t *)driver + NETDRIVER_MAXINETRATE);
+        /* rates[0] = MaxInternetClientRate, rates[1] = MaxClientRate. Only write
+           over values that look like byte rates, in case the layout differs. */
+        if (rates[0] >= 1000 && rates[0] <= 10000000 && rates[1] >= 1000 && rates[1] <= 10000000) {
+            hlog("MaxInternetClientRate %d -> %d, MaxClientRate %d -> %d",
+                 rates[0], cfg.max_client_rate, rates[1], cfg.max_client_rate);
+            rates[0] = rates[1] = cfg.max_client_rate;
+        } else {
+            hlog("MaxClientRate not set: unexpected driver values %d %d", rates[0], rates[1]);
+        }
+    }
     return 1;
 }
 
@@ -445,6 +474,194 @@ static uint64_t h_eliminate(void *tm, uint8_t *ps)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Actor replication                                                         */
+/* ------------------------------------------------------------------------ */
+
+/* The shipping clients are built without server code: UNetDriver::TickFlush
+   never calls ServerReplicateActors. On a listen host the only actor channels
+   that open are the ones UNetDriver::ProcessRemoteFunction opens for an RPC
+   target (the joiner's PlayerController, the GameState), and nothing sends
+   later property changes. The joiner's own pawn never reaches it, so its camera
+   sits under the map. This pass does a small ServerReplicateActors before each
+   TickFlush, using the same calls ProcessRemoteFunction uses to open a channel.
+   No distance culling; actors placed in the map are skipped unless
+   ReplicateStartupActors=1 (the client already has them loaded). */
+
+#define DRV_SERVERCONN    0x70    /* UNetConnection* ServerConnection (0 on a server) */
+#define DRV_CLIENTCONNS   0x78    /* TArray<UNetConnection*> ClientConnections */
+#define DRV_WORLD         0xA0    /* UWorld* */
+#define DRV_NAME          0xE0    /* FName NetDriverName */
+#define DRV_MAXTICKRATE   0x48    /* int32 NetServerMaxTickRate */
+#define DRV_VT_LEVELINIT  0x300   /* bool IsLevelInitializedForActor(actor, conn) */
+#define WORLD_LEVELS      0x108   /* TArray<ULevel*> */
+#define WORLD_TIMESECONDS 0x878   /* float */
+#define LEVEL_ACTORS      0xA0    /* TArray<AActor*> */
+#define CONN_OWNINGACTOR  0x30
+#define CONN_STATE        0x124   /* 1 = closed */
+#define CONN_ACTORCHANNELS 0x51490 /* TMap<FWeakObjectPtr, UActorChannel*> elements */
+#define CONN_VT_ISNETREADY 0x240  /* int IsNetReady(bool bSaturate) */
+#define ACTOR_FLAGS       0x7C    /* 1 bHidden, 4 bNetStartup, 8 bOnlyRelevantToOwner, 0x10 bAlwaysRelevant */
+#define ACTOR_FLAGS2      0x7E    /* 4 bReplicates */
+#define ACTOR_NETDRIVER   0x80    /* FName NetDriverName */
+#define ACTOR_OWNER       0x90
+#define ACTOR_NETUPDATETIME 0x12C /* float; unused by the stripped engine, used here as the schedule */
+#define ACTOR_NETUPDATEFREQ 0x130 /* float */
+#define CH_REPFLAGS       0x88    /* 8 = bIsReplicatingActor */
+#define CHTYPE_ACTOR      2
+
+typedef void (*TickFlushFn)(uint8_t *drv, float dt);
+typedef void (*WeakCtorFn)(uint64_t *weak, void *obj);
+typedef void (*FindChannelFn)(void *map, int32_t *index, uint64_t *key);
+typedef uint8_t *(*CreateChannelFn)(void *conn, int type, int opened_locally, int index);
+typedef void (*SetChannelActorFn)(void *ch, void *actor);
+typedef uint8_t (*ReplicateActorFn)(void *ch);
+typedef uint8_t (*IsPendingKillFn)(void *obj);
+typedef uint8_t (*LevelInitFn)(void *drv, void *actor, void *conn);
+typedef int (*IsNetReadyFn)(void *conn, int saturate);
+
+static TickFlushFn o_tick_flush;
+static uint8_t **g_due;
+static int g_due_cap;
+static float g_next_pass;
+static unsigned g_opened, g_sent, g_passes;
+static DWORD g_last_report;
+
+#define VCALL(obj, off) (*(void **)(*(uint8_t **)(obj) + (off)))
+
+static uint8_t *find_actor_channel(uint8_t *conn, uint8_t *actor)
+{
+    uint64_t key;
+    int32_t index = -1;
+    ((WeakCtorFn)AT(g_build->weak_ctor))(&key, actor);
+    ((FindChannelFn)AT(g_build->find_channel))(conn + CONN_ACTORCHANNELS, &index, &key);
+    if (index < 0) return NULL;
+    uint8_t *elems = *(uint8_t **)(conn + CONN_ACTORCHANNELS);
+    return elems ? *(uint8_t **)(elems + (int64_t)index * 0x18 + 8) : NULL;
+}
+
+/* 1 = handled (or nothing to do), 0 = connection saturated, stop for now. */
+static int replicate_to(uint8_t *drv, uint8_t *conn, uint8_t *actor, int *opens_left)
+{
+    if (!((IsNetReadyFn)VCALL(conn, CONN_VT_ISNETREADY))(conn, 0)) return 0;
+    uint8_t *ch = find_actor_channel(conn, actor);
+    if (!ch) {
+        if (*opens_left <= 0) return 1;
+        if (!((LevelInitFn)VCALL(drv, DRV_VT_LEVELINIT))(drv, actor, conn)) return 1;
+        ch = ((CreateChannelFn)AT(g_build->create_channel))(conn, CHTYPE_ACTOR, 1, -1);
+        if (!ch) return 1;
+        ((SetChannelActorFn)AT(g_build->set_channel_actor))(ch, actor);
+        (*opens_left)--;
+        g_opened++;
+    }
+    if (ch[CH_REPFLAGS] & 8) return 1;
+    ((ReplicateActorFn)AT(g_build->replicate_actor))(ch);
+    g_sent++;
+    return 1;
+}
+
+static int relevant_to(uint8_t *actor, uint8_t *pc)
+{
+    if (!(actor[ACTOR_FLAGS] & 8)) return 1;           /* not owner-only */
+    uint8_t *top = actor;
+    for (int i = 0; i < 16; i++) {
+        uint8_t *owner = *(uint8_t **)(top + ACTOR_OWNER);
+        if (!owner) break;
+        top = owner;
+    }
+    return top == pc || actor == *(uint8_t **)(pc + PC_PAWN);
+}
+
+static void replicate_actors(uint8_t *drv)
+{
+    if (*(void **)(drv + DRV_SERVERCONN)) return;              /* client */
+    uint8_t **conns = *(uint8_t ***)(drv + DRV_CLIENTCONNS);
+    int nconns = *(int32_t *)(drv + DRV_CLIENTCONNS + 8);
+    uint8_t *world = *(uint8_t **)(drv + DRV_WORLD);
+    if (!conns || nconns <= 0 || !world) return;
+    if (*(uint8_t **)(world + UWORLD_NETDRIVER) != drv) return;  /* game driver only, not demo */
+
+    float now = *(float *)(world + WORLD_TIMESECONDS);
+    int rate = *(int32_t *)(drv + DRV_MAXTICKRATE);
+    if (rate < 5 || rate > 120) rate = 30;
+    if (now < g_next_pass && now + 5.0f > g_next_pass) return;
+    g_next_pass = now + 1.0f / rate;
+    g_passes++;
+
+    uint64_t drv_name = *(uint64_t *)(drv + DRV_NAME);
+    IsPendingKillFn pending_kill = (IsPendingKillFn)AT(g_build->is_pending_kill);
+
+    /* Due actors from every level. */
+    int ndue = 0;
+    uint8_t **levels = *(uint8_t ***)(world + WORLD_LEVELS);
+    int nlevels = *(int32_t *)(world + WORLD_LEVELS + 8);
+    for (int l = 0; levels && l < nlevels; l++) {
+        uint8_t *level = levels[l];
+        if (!level) continue;
+        uint8_t **acts = *(uint8_t ***)(level + LEVEL_ACTORS);
+        int nacts = *(int32_t *)(level + LEVEL_ACTORS + 8);
+        for (int i = 0; acts && i < nacts; i++) {
+            uint8_t *a = acts[i];
+            if (!a || !(a[ACTOR_FLAGS2] & 4)) continue;
+            if ((a[ACTOR_FLAGS] & 4) && !cfg.replicate_startup) continue;
+            if (*(uint64_t *)(a + ACTOR_NETDRIVER) != drv_name) continue;
+            float next = *(float *)(a + ACTOR_NETUPDATETIME);
+            if (next > now && next < now + 10.0f) continue;
+            if (pending_kill(a)) continue;
+            if (ndue == g_due_cap) {
+                int cap = g_due_cap ? g_due_cap * 2 : 4096;
+                uint8_t **p = (uint8_t **)realloc(g_due, cap * sizeof *p);
+                if (!p) break;
+                g_due = p; g_due_cap = cap;
+            }
+            g_due[ndue++] = a;
+        }
+    }
+
+    /* Actors before done_upto were offered to every connection. */
+    int done_upto = ndue;
+    for (int c = 0; c < nconns; c++) {
+        uint8_t *conn = conns[c];
+        if (!conn || *(int32_t *)(conn + CONN_STATE) == 1) continue;
+        uint8_t *pc = *(uint8_t **)(conn + CONN_OWNINGACTOR);
+        if (!pc) continue;
+        int opens_left = 64;
+        /* The joiner's own controller, pawn and player state first. */
+        uint8_t *own[3] = { pc, *(uint8_t **)(pc + PC_PAWN), *(uint8_t **)(pc + PC_PLAYERSTATE) };
+        int ok = 1;
+        for (int k = 0; k < 3 && ok; k++)
+            if (own[k] && (own[k][ACTOR_FLAGS2] & 4) && !pending_kill(own[k]))
+                ok = replicate_to(drv, conn, own[k], &opens_left);
+        int i = 0;
+        for (; ok && i < ndue; i++) {
+            uint8_t *a = g_due[i];
+            if (a == own[0] || a == own[1] || a == own[2] || !relevant_to(a, pc)) continue;
+            if (!replicate_to(drv, conn, a, &opens_left)) { ok = 0; break; }
+        }
+        if (!ok && i < done_upto) done_upto = i;
+    }
+
+    for (int i = 0; i < done_upto; i++) {
+        float f = *(float *)(g_due[i] + ACTOR_NETUPDATEFREQ);
+        if (!(f >= 1.0f)) f = 1.0f;
+        if (f > (float)rate) f = (float)rate;
+        *(float *)(g_due[i] + ACTOR_NETUPDATETIME) = now + 1.0f / f;
+    }
+
+    DWORD t = GetTickCount();
+    if (t - g_last_report >= 10000) {
+        g_last_report = t;
+        hlog("ReplicateActors: %d connection(s), %d due, %d fully served, %u channels opened, %u updates sent, %u passes",
+             nconns, ndue, done_upto, g_opened, g_sent, g_passes);
+    }
+}
+
+static void h_tick_flush(uint8_t *drv, float dt)
+{
+    if (cfg.replicate_actors) replicate_actors(drv);
+    o_tick_flush(drv, dt);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Patching                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -491,27 +708,28 @@ static uint8_t *alloc_near(uint8_t *target, size_t size)
    rip-relative) move to a trampoline that jumps back to fn+n; the function
    entry becomes jmp rel32 to a thunk that jumps to `hook`. The hook gets the
    original arguments and calls the returned trampoline to run the original.
-   rax is free at both points (no prologue here sets or reads it). Uses 48
-   bytes at *cursor. */
+   The trampoline returns with jmp [rip] (no register touched), so displaced
+   code may set rax; the entry stub clobbers rax before the hook runs. Uses
+   48 bytes at *cursor. */
 static void *hook_entry(uint8_t **cursor, uint32_t rva, const uint8_t *expect, size_t n,
                         void *hook, const char *what)
 {
     uint8_t *fn = g_base + rva;
     if (!rva || !*cursor) return NULL;
-    if (n < 5 || n > 16 || !bytes_equal(fn, expect, n)) {
+    if (n < 5 || n > 18 || !bytes_equal(fn, expect, n)) {
         hlog("%s: prologue mismatch at +%07x; not hooked", what, rva);
         return NULL;
     }
     uint8_t *tramp = *cursor, *entry = *cursor + 32;
     uint64_t back = (uint64_t)(uintptr_t)(fn + n), to = (uint64_t)(uintptr_t)hook;
     memcpy(tramp, fn, n);
-    tramp[n] = 0x48; tramp[n + 1] = 0xB8; memcpy(tramp + n + 2, &back, 8);
-    tramp[n + 10] = 0xFF; tramp[n + 11] = 0xE0;
+    tramp[n] = 0xFF; tramp[n + 1] = 0x25; memset(tramp + n + 2, 0, 4); /* jmp [rip+0] */
+    memcpy(tramp + n + 6, &back, 8);
     entry[0] = 0x48; entry[1] = 0xB8; memcpy(entry + 2, &to, 8); entry[10] = 0xFF; entry[11] = 0xE0;
     FlushInstructionCache(GetCurrentProcess(), tramp, 48);
     *cursor += 48;
 
-    uint8_t jmp[16];
+    uint8_t jmp[18];
     memset(jmp, 0x90, sizeof jmp);
     jmp[0] = 0xE9;
     int64_t rel = (int64_t)(entry - (fn + 5));
@@ -625,6 +843,14 @@ static void install(void)
         o_eliminate = (EliminateFn)hook_entry(&cursor, g_build->eliminate, p_elim, 5,
                                               (void *)h_eliminate, "TeamManager EliminatePlayer");
         hlog("FixJoinState=%d BlockEliminate=%d", cfg.fix_join_state, cfg.block_eliminate);
+        if (cfg.replicate_actors && g_build->tick_flush) {
+            static const uint8_t p_flush[15] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48,
+                                                 0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20 };
+            o_tick_flush = (TickFlushFn)hook_entry(&cursor, g_build->tick_flush, p_flush, 15,
+                                                   (void *)h_tick_flush, "UNetDriver::TickFlush");
+        }
+        hlog("ReplicateActors=%d ReplicateStartupActors=%d", cfg.replicate_actors && o_tick_flush,
+             cfg.replicate_startup);
     }
 
     if (cfg.unfilter_cmdline) {
