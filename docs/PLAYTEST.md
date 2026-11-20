@@ -57,6 +57,7 @@ Until that branch is merged here, pass `--sos-host-dir <path to mod\sos_host>` t
 
 **Find your public address.** It must be an IPv4 address like `203.0.113.5`. The game does no DNS lookups, so a name will not work.
 
+- With a VPS relay (easiest, see [No port forwarding](#no-port-forwarding)): the VPS's public IPv4.
 - On the internet: search "what is my IP" and use the IPv4 shown.
 - With Tailscale or ZeroTier: use the IPv4 of that virtual network (see [No port forwarding](#no-port-forwarding)).
 
@@ -113,6 +114,8 @@ node tools/host_classic.js --dry-run --public-host 203.0.113.5
 
 If you changed `--port` or `--game-port`, open those instead.
 
+With a VPS relay, skip the router step: the VPS's firewall and the Windows firewall rules are enough.
+
 ### 1. Router port forward
 
 1. Find your PC's LAN address:
@@ -147,6 +150,36 @@ Remove-NetFirewallRule -DisplayName "SOS Revival game (UDP 7777)"
 ```
 
 ## No port forwarding
+
+### Recommended: a cheap Linux VPS as a relay
+
+The VPS only forwards ports. The game host and the backend still run on your PC. Friends connect to the VPS's public IP, and it relays TCP 7781 and UDP 7777 to your PC over Tailscale. You need no router change, CGNAT does not matter, and your home IP stays private.
+
+Any small Linux VPS works, for example the cheapest Ubuntu plan from your provider. The game traffic is light. Pick a region close to the players: every packet makes an extra hop through it.
+
+1. Install Tailscale on your PC and on the VPS, and sign both into the same tailnet (`tailscale up` on the VPS).
+2. Note your PC's Tailscale IPv4: run `tailscale ip -4` on the PC. It looks like `100.x.y.z`.
+3. Copy `tools/vps_relay.sh` to the VPS and run it:
+
+```bash
+sudo bash vps_relay.sh 100.x.y.z
+```
+
+4. In the VPS provider's dashboard, allow inbound TCP 7781 and UDP 7777 in its firewall (also called a security group).
+5. On your PC, add the Windows firewall rules from [Windows Defender Firewall](#2-windows-defender-firewall). Traffic arrives over Tailscale, so Windows still has to let it in.
+6. Host with the VPS's **public** IPv4:
+
+```powershell
+node tools/host_classic.js --public-host <VPS public IPv4> --min-players 2
+```
+
+7. Friends run `node launcher/launcher.js --classic --server <VPS public IPv4>:7781`. They install nothing besides the usual list.
+
+`sudo bash vps_relay.sh --status` shows the rules. `sudo bash vps_relay.sh 100.x.y.z --remove` removes them. The rules do not survive a VPS reboot, so run the script again after one.
+
+Running the game host itself on a VPS is not supported. It is the full Classic client: it needs Windows, Steam signed in, and a GPU.
+
+### Other options
 
 | Option | Works? | Notes |
 |---|---|---|
