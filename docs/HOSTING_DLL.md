@@ -65,6 +65,8 @@ The DLL is inert for players who do not pass `?listen`. Only the command-line fi
 | `LoginPendingTimeout` | 0 | Main client only. If above 0, sets `blackbird.LoginPendingTimeout` to this many seconds when Listen runs. |
 | `LogFile` | `sos_host.log` | Relative to the DLL folder, or absolute; `-` disables it. |
 | `GameLog` | 1 | Mirror every `UE_LOG` line to `sos_game_<pid>.log` in the DLL folder (see below). |
+| `FixJoinState` | 1 | Main client only. After the host sends `ClientRetryClientRestart` to a remote controller that is Playing with a pawn, also send `ClientGotoState(Playing)`, so the joiner leaves LoginPending at once (see "Join flow hooks"). |
+| `BlockEliminate` | 0 | Main client only, test switch. 1 skips `UTeamManager::EliminatePlayer`. Logged either way. |
 
 ## Game log mirror
 
@@ -159,7 +161,17 @@ How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
   - App data is a replicated PlayerState property that the host loads (FUN_1401ba330, which needs authority and a UniqueNetId). With an empty key list it is marked valid at once with no HTTP. The retry (FUN_1401bf0a0 / FUN_1401a3260) then restarts the player, so the host's copy of the controller goes to Playing and a pawn spawns.
   - On the client, only `ClientRestart` with a non-null pawn (FUN_14132e250) or a `ClientGotoState(Playing)` RPC sets Playing. If `ClientRestart` arrives before the pawn has replicated, the client asks the server to restart. The server's controller is already Playing, so the server only resends `ClientRetryClientRestart`, which does not change the client's state. The client then sits in LoginPending until some later server event sends Playing.
   - The stock "Spectating" recovery (`ServerSetSpectatorLocation`) does not run in LoginPending.
-- **Proposed fix (not implemented):** in `sos_host` on the host, hook FUN_1401cd360 (and/or the `ClientRetryClientRestart` sender FUN_1414e9160). After it runs, call `ClientGotoState(PC, Playing)` (FUN_1414e8d20 with FName index `0x140`) when the controller is remote, has a pawn (`PC+0x388`) and the host's copy is Playing. A client-side alternative: in FUN_141343f00 (the LoginPending tick), switch to Playing once `Pawn (+0x388) == AcknowledgedPawn (+0x3f8) != 0`.
+- **Join flow hooks (implemented, `FixJoinState`).** `sos_host` hooks four main-client functions with a 5- or 6-byte `jmp` to a near thunk and a trampoline (same scheme as the log hook):
+  - `RestartPlayer` override FUN_1401cd360 (`48 89 5C 24 18`) and `ServerRestartPlayer_Implementation` FUN_1401c7370 (`40 53 48 83 EC 40`): logged only.
+  - `ClientRetryClientRestart` sender FUN_1414e9160 (`48 89 5C 24 10`): after the original runs, if the controller has authority (Role `+0x110` == 3), a pawn (`+0x388`) and is Playing (`StateName +0x3d0` == FName `0x140`), the hook calls the `ClientGotoState` sender FUN_1414e8d20 with Playing.
+  - `UTeamManager::EliminatePlayer` FUN_1401f0600 (`48 89 5C 24 18`): logged; skipped when `BlockEliminate=1`.
+  - The client-side alternative (in the LoginPending tick FUN_141343f00, switch to Playing once `Pawn == AcknowledgedPawn != 0`) was not needed.
+- **Join test round 4, 13:34, with the hooks and `BlockEliminate=1`.**
+  - Joiner: `Spectating -> LoginPending` at 13:34:58.210, `LoginPending -> Playing` at 13:34:58.542 (**0.33 s**, against 320 to 450 s before). `HideLoadingScreen - Map LaCuna_BR took 13.35 seconds`, all of it map loading.
+  - The joiner then flips `Playing -> Inactive -> Playing` about once a second (188 cycles in 3 minutes). Each time, its own pawn has not replicated yet, so the client tick demotes Playing with no pawn to Inactive, asks the server to restart, and the hook sends Playing again. The user still saw the pre-match hangar with the HUD ("Interact with a console to enter the skirmish area", "Waiting for players 0/1") but could not move.
+  - No `EliminatePlayer` call happened in this round (0 in `sos_host.log`), so the round-3 removal at 36 s did not recur.
+  - "Waiting for players 0/1" never changes: the TeamManager's joined count comes from the MMS session (`JoinMatch` FUN_1401fe6b0 needs tables filled from the session's groups and player map by FUN_140215150, `SOS_PLAYER_JOIN_SESSION`). A host started without `-SESSION_ID` has no session, so nobody joins and the match never starts. Next step: give the host a session id and token and have the backend serve `GET /session/<id>` and `POST /session/<id>/events`.
+  - Open: why the joiner's pawn takes minutes to replicate. Suspected cause: the stock per-connection rate cap (`MaxClientRate` 15000 / `MaxInternetClientRate` 10000 bytes/s) against the large BR map.
 - The backend's app-data reply `{"version":1,"data":{}}` is fine and needs no change.
 - With no `-SESSION_ID`, `ApproveLogin` skips the `AuthToken` check (Inferred, see `docs/HOSTING.md`). The join above confirms a connection without a session check is accepted.
 - The host player could get a real login with the `-AUTH_LOGIN=` / `-AUTH_PASSWORD=` / `-AUTH_TYPE=` switches (types `OutpostUser`, `OutpostOnceCodeUser`, `Steam`, `Auto`); the host logs `Outpost: AutoLogin missing AUTH_LOGIN`. Not tried.

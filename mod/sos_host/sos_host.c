@@ -63,7 +63,9 @@ static struct {
     int steam_sockets;        /* 0: force plain IP sockets on SteamNetDriver */
     int login_timeout;        /* >0: set blackbird.LoginPendingTimeout (main only) */
     int game_log;             /* 1: mirror every UE_LOG line to sos_game_<pid>.log */
-} cfg = { 1, 0, 1, 0, 0, 1 };
+    int fix_join_state;       /* 1: send ClientGotoState(Playing) after ClientRetryClientRestart */
+    int block_eliminate;      /* 1: skip UTeamManager::EliminatePlayer (test switch) */
+} cfg = { 1, 0, 1, 0, 0, 1, 1, 0 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_log_path[MAX_PATH];
@@ -112,6 +114,8 @@ static void load_config(HMODULE self)
     cfg.steam_sockets    = GetPrivateProfileIntW(L"Host", L"SteamSockets", cfg.steam_sockets, ini);
     cfg.login_timeout    = GetPrivateProfileIntW(L"Host", L"LoginPendingTimeout", cfg.login_timeout, ini);
     cfg.game_log         = GetPrivateProfileIntW(L"Host", L"GameLog", cfg.game_log, ini);
+    cfg.fix_join_state   = GetPrivateProfileIntW(L"Host", L"FixJoinState", cfg.fix_join_state, ini);
+    cfg.block_eliminate  = GetPrivateProfileIntW(L"Host", L"BlockEliminate", cfg.block_eliminate, ini);
 
     wchar_t log_name[MAX_PATH];
     GetPrivateProfileStringW(L"Host", L"LogFile", L"sos_host.log", log_name, MAX_PATH, ini);
@@ -146,6 +150,12 @@ typedef struct {
     uint32_t login_timeout_cvar;/* float* behind blackbird.LoginPendingTimeout, 0 if absent */
     uint32_t log_fn;            /* FMsg::Logf_Internal(File, Line, Category, Verbosity, Fmt, ...) */
     uint32_t fname_tostring;    /* FString* FName::ToString(const FName*, FString*) */
+    /* Join flow (main build only; 0 = not mapped) */
+    uint32_t restart_player;    /* void AShooterGameMode::RestartPlayer(GM*, AController*) */
+    uint32_t server_restart;    /* void APlayerController::ServerRestartPlayer_Implementation(PC*) */
+    uint32_t client_retry;      /* void PC::ClientRetryClientRestart(PC*, APawn*) RPC sender */
+    uint32_t client_goto_state; /* void PC::ClientGotoState(PC*, FName) RPC sender */
+    uint32_t eliminate;         /* UTeamManager::EliminatePlayer(TM*, APlayerState*) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -155,6 +165,7 @@ static const GameBuild k_builds[] = {
         0x2bf5818, 0x04d3280, 0x146a1c0, 0x1471a30, 0x146c3b0, 0x1258c90,
         0x1aeafc0, 0x0eb75b0, 0x040d1b0, 0x2a4b0b0,
         0x04a9f30, 0x04de7a0,
+        0x01cd360, 0x01c7370, 0x14e9160, 0x14e8d20, 0x01f0600,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -162,6 +173,7 @@ static const GameBuild k_builds[] = {
         0x2b766a0, 0x0472c50, 0x14048e0, 0x140c1d0, 0x1406ad0, 0x11f3aa0,
         0x1a7ec40, 0x0e542b0, 0x03acc40, 0,
         0x044a500, 0x047e090,
+        0, 0, 0, 0, 0,
     },
 };
 
@@ -362,6 +374,77 @@ __asm__(
     "  jmp *g_log_tramp(%rip)\n");
 
 /* ------------------------------------------------------------------------ */
+/* Join flow: release a joiner stuck in client-side LoginPending              */
+/* ------------------------------------------------------------------------ */
+/* The host's first RestartPlayer for a joiner fails IsLoggedIn (app data not
+   ready) and sends ClientGotoState(LoginPending). The retry spawns the pawn,
+   but if ClientRestart reaches the client before the pawn has replicated, the
+   client asks ServerRestartPlayer again; the server's copy is already Playing,
+   so it only sends ClientRetryClientRestart(Pawn), which sets the pawn on the
+   client but not its state. After that call we also send
+   ClientGotoState(Playing), which is what the client is missing. */
+
+#define PC_PAWN          0x388   /* APawn* AController::Pawn */
+#define PC_PLAYERSTATE   0x3a0   /* APlayerState* */
+#define PC_STATENAME     0x3d0   /* FName AController::StateName */
+#define PS_PLAYERID      0x3a8   /* int32 APlayerState::PlayerId */
+#define ACTOR_ROLE       0x110   /* uint8 AActor::Role (3 = authority) */
+#define NAME_PLAYING     0x140ull
+
+typedef void (*RestartPlayerFn)(void *gm, uint8_t *pc);
+typedef void (*ServerRestartFn)(uint8_t *pc);
+typedef void (*ClientRetryFn)(uint8_t *pc, void *pawn);
+typedef void (*GotoStateFn)(uint8_t *pc, uint64_t name);
+typedef uint64_t (*EliminateFn)(void *tm, uint8_t *ps);
+
+static RestartPlayerFn o_restart_player;
+static ServerRestartFn o_server_restart;
+static ClientRetryFn o_client_retry;
+static EliminateFn o_eliminate;
+
+static int pc_player_id(uint8_t *pc)
+{
+    uint8_t *ps = *(uint8_t **)(pc + PC_PLAYERSTATE);
+    return ps ? *(int32_t *)(ps + PS_PLAYERID) : -1;
+}
+
+static void h_restart_player(void *gm, uint8_t *pc)
+{
+    o_restart_player(gm, pc);
+    if (pc)
+        hlog("RestartPlayer: player %d state %#x pawn %p", pc_player_id(pc),
+             *(uint32_t *)(pc + PC_STATENAME), *(void **)(pc + PC_PAWN));
+}
+
+static void h_server_restart(uint8_t *pc)
+{
+    hlog("ServerRestartPlayer: player %d state %#x pawn %p", pc_player_id(pc),
+         *(uint32_t *)(pc + PC_STATENAME), *(void **)(pc + PC_PAWN));
+    o_server_restart(pc);
+}
+
+static void h_client_retry(uint8_t *pc, void *pawn)
+{
+    o_client_retry(pc, pawn);
+    int playing = *(uint64_t *)(pc + PC_STATENAME) == NAME_PLAYING;
+    int send = cfg.fix_join_state && pawn && playing && pc[ACTOR_ROLE] == 3;
+    hlog("ClientRetryClientRestart: player %d pawn %p state %#x%s", pc_player_id(pc), pawn,
+         *(uint32_t *)(pc + PC_STATENAME), send ? " -> sending ClientGotoState(Playing)" : "");
+    if (send) ((GotoStateFn)AT(g_build->client_goto_state))(pc, NAME_PLAYING);
+}
+
+static uint64_t h_eliminate(void *tm, uint8_t *ps)
+{
+    int id = ps ? *(int32_t *)(ps + PS_PLAYERID) : -1;
+    if (cfg.block_eliminate) {
+        hlog("TeamManager EliminatePlayer(player %d): blocked (BlockEliminate=1)", id);
+        return 0;
+    }
+    hlog("TeamManager EliminatePlayer(player %d)", id);
+    return o_eliminate(tm, ps);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Patching                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -402,6 +485,44 @@ static uint8_t *alloc_near(uint8_t *target, size_t size)
         if (p) return p;
     }
     return NULL;
+}
+
+/* Entry hook: the first n bytes of the function (whole instructions, nothing
+   rip-relative) move to a trampoline that jumps back to fn+n; the function
+   entry becomes jmp rel32 to a thunk that jumps to `hook`. The hook gets the
+   original arguments and calls the returned trampoline to run the original.
+   rax is free at both points (no prologue here sets or reads it). Uses 48
+   bytes at *cursor. */
+static void *hook_entry(uint8_t **cursor, uint32_t rva, const uint8_t *expect, size_t n,
+                        void *hook, const char *what)
+{
+    uint8_t *fn = g_base + rva;
+    if (!rva || !*cursor) return NULL;
+    if (n < 5 || n > 16 || !bytes_equal(fn, expect, n)) {
+        hlog("%s: prologue mismatch at +%07x; not hooked", what, rva);
+        return NULL;
+    }
+    uint8_t *tramp = *cursor, *entry = *cursor + 32;
+    uint64_t back = (uint64_t)(uintptr_t)(fn + n), to = (uint64_t)(uintptr_t)hook;
+    memcpy(tramp, fn, n);
+    tramp[n] = 0x48; tramp[n + 1] = 0xB8; memcpy(tramp + n + 2, &back, 8);
+    tramp[n + 10] = 0xFF; tramp[n + 11] = 0xE0;
+    entry[0] = 0x48; entry[1] = 0xB8; memcpy(entry + 2, &to, 8); entry[10] = 0xFF; entry[11] = 0xE0;
+    FlushInstructionCache(GetCurrentProcess(), tramp, 48);
+    *cursor += 48;
+
+    uint8_t jmp[16];
+    memset(jmp, 0x90, sizeof jmp);
+    jmp[0] = 0xE9;
+    int64_t rel = (int64_t)(entry - (fn + 5));
+    int32_t rel32 = (int32_t)rel;
+    memcpy(jmp + 1, &rel32, 4);
+    if (rel != rel32 || !write_code(fn, jmp, n)) {
+        hlog("%s: patch failed", what);
+        return NULL;
+    }
+    hlog("%s hooked at +%07x", what, rva);
+    return tramp;
 }
 
 static const GameBuild *identify(void)
@@ -487,6 +608,23 @@ static void install(void)
             else
                 hlog("Failed to patch the Listen call");
         }
+    }
+
+    if (near_page && g_build->restart_player) {
+        static const uint8_t p_restart[5] = { 0x48, 0x89, 0x5C, 0x24, 0x18 };
+        static const uint8_t p_server[6]  = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40 };
+        static const uint8_t p_retry[5]   = { 0x48, 0x89, 0x5C, 0x24, 0x10 };
+        static const uint8_t p_elim[5]    = { 0x48, 0x89, 0x5C, 0x24, 0x18 };
+        uint8_t *cursor = near_page + 128;
+        o_restart_player = (RestartPlayerFn)hook_entry(&cursor, g_build->restart_player, p_restart, 5,
+                                                       (void *)h_restart_player, "RestartPlayer");
+        o_server_restart = (ServerRestartFn)hook_entry(&cursor, g_build->server_restart, p_server, 6,
+                                                       (void *)h_server_restart, "ServerRestartPlayer");
+        o_client_retry = (ClientRetryFn)hook_entry(&cursor, g_build->client_retry, p_retry, 5,
+                                                   (void *)h_client_retry, "ClientRetryClientRestart");
+        o_eliminate = (EliminateFn)hook_entry(&cursor, g_build->eliminate, p_elim, 5,
+                                              (void *)h_eliminate, "TeamManager EliminatePlayer");
+        hlog("FixJoinState=%d BlockEliminate=%d", cfg.fix_join_state, cfg.block_eliminate);
     }
 
     if (cfg.unfilter_cmdline) {
