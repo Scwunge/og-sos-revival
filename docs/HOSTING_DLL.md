@@ -191,3 +191,15 @@ How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
   - Host 35104 exited about 80 s into the test with no crash report; the cause is unknown. The pass sent ~15k updates/s (no distance culling, frequency up to 30 Hz), which should be cut.
   - The main build has the same gap; its RVAs are not mapped.
 - **Game folders:** all sos_host files have been removed from the Classic Win64 folder.
+
+## Status, 21 Nov 2026 (SOS: Classic): joiner plays on the island
+
+- **Move acks (`AckMoves=1`).** Hooks the native exec thunks execServerMove 0x14161e450, execServerMoveDual 0x14161e770 and execServerMoveDualHybridRootMotion 0x14161ebd0 (13-byte prologue `48 89 5C 24 18 55 56 57 48 8D 6C 24 B9`).
+  - Before the original runs, the hook reads the parameters with FFrame::StepCompiledIn FUN_140537810 over `PropertyChainForCompiledIn` (+0x80), then puts the chain back. ServerMove: TimeStamp is parameter 1, ClientLoc parameter 3. Dual/Hybrid: parameters 5 and 7.
+  - After the original runs, the hook sends ClientAckGoodMove FUN_1414824b0(cmc, ts). If the host's pawn (UpdatedComponent +0xC8, ComponentToWorld translation +0x120) is more than 100 cm from ClientLoc, it sends ClientAdjustPosition FUN_1414824f0 instead, with the host location, zero velocity, no base and the packed movement mode. That is at most once per 0.25 s per CMC.
+  - Live result: thousands of moves acked, no "saved moves" warnings. The joiner was moved from the pregame spot onto the island (this was the "dark box"). On a movable base ClientLoc is base-relative (the pregame platform logged `(0 0 2)`), so a few extra corrections happen there.
+- **AutoJoin (`SOS_HOST_AUTOJOIN` env, test joiners).** After `LoadingLoginEnd` with a non-empty PlayerId, it writes the URL into the first world context's TravelURL (+0xD0, GMalloc 0x1429e7560) and TravelType 0. Joiners that travel this way get no matchmaking seat and end in CharacterSelect. A joiner that clicks PLAY in the frontend works.
+- **SkipLoginCheck** (test switch): it patches the `jne` at 0x140185ca0 in the RestartPlayer override. With it on, an unlogged joiner goes to CharacterSelect (FindPlayerStart returns null) instead of LoginPending.
+- **Remote backend.** `tools/host_classic.js --backend 167.114.157.172:7781 --public-host 167.114.157.172` works. The joiner traveled to the relay at `167.114.157.172:7777` and played.
+- **`ReplicateStartupActors=2`** (new, not tested live yet): map-placed actors are replicated only within `StartupActorRadius` (default 15000 cm) of each joiner's pawn. Once a channel is open it keeps updating. The env var `SOS_HOST_REPLICATE_STARTUP` overrides the ini, because `host_classic.js` forces the ini key to 0.
+- **Joiner reports after the fix:** it can run around the island, but it can't break objects and sees no loot. The intro sequences play only on the host. Suspected cause: crates, breakables and sequence actors are map-placed and were skipped. A static review of what else is stripped is in progress (`host-dll-what-breaks.md` in the session notes).
