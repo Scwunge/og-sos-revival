@@ -103,8 +103,8 @@ function classicRoles(accountId, steamId, asked) {
   const roles = new Set([...(Array.isArray(asked) ? asked.map(String) : []), 'app-user', 'user', 'testserver', ...CLASSIC_COSMETIC_ROLES, ...CLASSIC.extraRoles]);
   if (CLASSIC.devAccounts.includes(accountId) || (steamId && CLASSIC.devAccounts.includes(steamId))) roles.add('dev');
   // moderation: admins get the dev role (Director button and server browser in Classic); env read each time
-  const admins = String(process.env.OGSOS_ADMINS || '').split(/[\s,]+/).filter(Boolean);
-  if (admins.includes(accountId) || (steamId && admins.includes(steamId))) roles.add('dev');
+  // (owners from OGSOS_ADMINS plus the mods an owner added in the panel)
+  if (moderation.isAdmin(accountId) || (steamId && moderation.isAdmin(steamId))) roles.add('dev');
   return [...roles];
 }
 
@@ -136,6 +136,10 @@ const KV_DIR_CLASSIC = path.join(DATA_DIR, 'kv-classic');
 fs.mkdirSync(KV_DIR, { recursive: true });
 function handleKv(rel, res, req) {
   const dir = isClassic(req.headers['app-id']) ? KV_DIR_CLASSIC : KV_DIR;
+  if (dir === KV_DIR_CLASSIC) {   // moderation: the owner's announcement/config overlay (new revision per change, docs/ADMIN.md)
+    const o = moderation.kvServe(rel);
+    if (o) return send(res, 200, o.body, o.type);
+  }
   if (rel === 'live-rev.txt') {
     const f = path.join(dir, 'live-rev.txt');
     return send(res, 200, fs.existsSync(f) ? fs.readFileSync(f) : '1', 'text/plain');
@@ -299,6 +303,7 @@ function handleApi(req, url, body, res) {
       const st = community.status(decodeURIComponent(r[1]));
       out = st ? { status: 200, body: st } : { status: 404, body: { error: 'not-found' } };
     }
+    if (out && out.status === 200 && out.body && out.body.sessionId) moderation.reapplyLobbyOptions(out.body.sessionId);   // moderation: lock/overrides survive a re-register
     if (out) return send(res, out.status, out.body);
   }
   // moderation: an admin's spectate/director join link from the client mod (game JWT; OGSOS_ADMINS only), docs/ADMIN.md
@@ -666,8 +671,10 @@ const mmClassic = createMatchmaker({
 });
 
 // Third-party Classic hosts register here (docs/COMMUNITY_HOSTS.md); only the Classic matchmaker takes them.
+const COMMUNITY_CFG = loadCommunityConfig(process.env);
+const ENV_COMMUNITY_BANS = [...COMMUNITY_CFG.bans];   // moderation: panel host blocks are added to these
 const community = createCommunityRegistry({
-  mm: mmClassic, config: loadCommunityConfig(process.env),
+  mm: mmClassic, config: COMMUNITY_CFG,
   log: (m) => { log('ws.jsonl', { event: 'community', text: m }); console.log(`community ${m}`); },
 });
 setInterval(() => { try { community.sweep(); } catch (e) { console.warn(`community sweep: ${e}`); } }, 15000).unref();
@@ -726,6 +733,8 @@ const moderation = createModeration({
   db, saveDb, log, secret: SECRET, jwtAccount,
   displayName: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
   progression, matchmakers: { classic: mmClassic, main: mm }, env: process.env,
+  fame, community, kvDir: KV_DIR_CLASSIC,
+  onHostBlocksChanged: (vals) => { community._cfg.bans = [...ENV_COMMUNITY_BANS, ...vals]; try { community.sweep(); } catch { /* next sweep */ } },
 });
 
 function wsAccount(req, token) {   // hero-tv: optional token (stream sockets from our embed pages)

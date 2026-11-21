@@ -14,7 +14,7 @@ Add these to the backend `.env` (compose `environment:`):
 
 | Key | Meaning |
 |---|---|
-| `OGSOS_ADMINS` | Steam ID64s of the admins, separated by commas or spaces. Only these can sign in. Re-read on every request, but the container needs a restart to see a changed `.env`. |
+| `OGSOS_ADMINS` | Steam ID64s of the **owners**, separated by commas or spaces. Owners (plus the mods an owner adds in the panel, section 3a) can sign in. Re-read on every request, but the container needs a restart to see a changed `.env`. |
 | `OGSOS_ADMIN_ORIGIN` | The public origin, e.g. `https://sos.joltora.com`. Used for the Steam OpenID `realm` and `return_to`. **Set it in production**; without it the origin is built from the `Host` and `X-Forwarded-Proto` headers. |
 | `OGSOS_ADMIN_DEV_LOGIN` | `1` enables `GET /admin/dev-login?steamid=<admin id>` for loopback requests without `X-Forwarded-For`. Tests only. **Never in production.** The backend warns at startup when it is on. |
 | `OGSOS_ADMIN_GAME_WATCH` | `1` enables the client mod's `POST /api/servers/<id>/watch` (game JWT of an admin). **Leave off until game logins verify the Steam ticket** (section 7): today anyone can claim an admin's Steam id at game login. |
@@ -27,7 +27,7 @@ Reverse proxy (Caddy) for `sos.joltora.com`, when the lead sets up the HTTPS blo
 
 ```
 sos.joltora.com {
-    reverse_proxy 167.114.157.172:7781
+    reverse_proxy <backend-host>:7781
 }
 ```
 
@@ -42,24 +42,140 @@ backend; the panel only owns `/admin` and `/admin/*`, so both fit behind the sam
 3. The backend checks the assertion with Steam (`check_authentication`, `is_valid:true`), that `return_to`,
    `op_endpoint` and `claimed_id` are what it expects, and that your Steam id is in `OGSOS_ADMINS`.
 4. You get a signed cookie `ogsos_admin` (HMAC-SHA256, `HttpOnly`, `SameSite=Strict`, path `/admin`, 12 h).
-   Removing your id from `OGSOS_ADMINS` (and restarting) ends your access even with a live cookie.
+   The role is checked again on every request: removing your id from `OGSOS_ADMINS` (and restarting), or an owner
+   removing you as a mod, ends your access even with a live cookie.
 
 Every admin API call needs the cookie; every state-changing call is a `POST` that also needs the header
 `X-OGSOS-Admin: 1` (CSRF guard). The panel sends a strict CSP (`default-src 'self'`), `X-Frame-Options: DENY`
 and no-store caching. `/admin` requests are not written to `http.jsonl`, so cookies never reach the logs.
 
-An admin also gets the `dev` role at game login (Classic). That shows the Director button and the Director server
+An admin (owner or mod) also gets the `dev` role at game login (Classic). That shows the Director button and the Director server
 browser in the game (docs/CLASSIC.md, "roles").
 
 ## 3. Using the panel
 
 | Page | What it does |
 |---|---|
-| **Servers** | Every hosted lobby (official, and community ones once that branch is merged), its state and map, the players seated in it, and admins watching it. Per player: **Kick**, **Ban**. Per server: **Spectate**. Refreshes every 10 s. |
-| **Players** | Search by name or Steam id. A player's page has their stats (from `/api/stats`), match history, reports against them and by them, ban state and ban history, and the lobby they are in now. |
-| **Reports** | Queue with tabs open / actioned / dismissed / all. A report shows the reason, the player's notes, the evidence link, a snapshot of both players' stats at report time, the session, and the match record (linked automatically at match-end, or by hand from the candidate list). Actions: mark actioned, dismiss, reopen (with a note), ban the target, kick the target, spectate the session. |
+| **Dashboard** | Players online (matchmaker connections), queue, seated players, matches today / last 7 days (UTC), open and investigating reports, active bans, and every lobby with its state and host health. `GET /admin/api/dashboard`. |
+| **Servers** | Every hosted lobby (official and community), its state and map, the players seated in it, and admins watching it. Per player: **Kick**, **Ban**. Per server: **Spectate** and the lobby controls (section 3b). Refreshes every 10 s. |
+| **Players** | Search by name or Steam id. A player's page has level, XP and ratings from their Classic blob, Fame stats, match history, reports against and by them, ban / kick / warning history, notes, and the lobby they are in now, plus the player actions (section 3c). |
+| **Matches** | The match records the hosts post at match-end: list (filters: player, session, `before`), and a detail page with the server, duration, every player's numbers and the reports linked to it. |
+| **Reports** | Queue with tabs open / investigating / resolved / dismissed / all, an assignee and a notes thread (section 3d). A report shows the reason, the player's notes, the evidence link, a snapshot of both players' stats at report time, the session, and the match record (linked automatically at match-end, or by hand from the candidate list). |
 | **Bans** | Steam-id bans with a reason, the code shown to the player, and an expiry (1 h, 24 h, 7 d, 30 d, permanent, custom). Lift a ban. Below: host blocks for community servers (IPv4, CIDR or community session id). |
-| **Audit** | Every admin action: sign-in (and refused sign-ins), report status changes, bans, lifts, kicks, host blocks, spectate. Also appended to `<logs>/admin.jsonl`. |
+| **Community** | Registered community hosts with status, players, verified / listed, and Block id / Block IP / Unblock (section 3f). |
+| **Config** (owner) | MOTD and a few allowlisted KV values (section 3e). Mods see it read-only. |
+| **Admins** | Owners, mods, add / remove mod (owner only; section 3a). |
+| **Audit** | Every admin action with filters (admin, action, target) and a CSV export (section 3g). Also appended to `<logs>/admin.jsonl`. |
+
+### 3a. Roles
+
+- **Owners** are the Steam ids in `OGSOS_ADMINS`. They can do everything.
+- **Mods** are stored in `db.moderation.mods` (`{steamId: {addedBy, at, name}}`), added and removed by an owner
+  (`POST /admin/api/admins {steamId}`, `POST /admin/api/admins/<id>/remove`; audit `mod-add` / `mod-remove`). A mod
+  signs in through Steam like an owner (and through dev-login in tests), gets the `dev` role at game login, and can do
+  everything except what is **owner-only**: managing mods, changing KV / MOTD, lifting a ban on a mod. Owner-only
+  endpoints answer `403 {"error":"owner-only"}`.
+- Owners cannot be banned. A mod cannot ban an owner or another mod; an owner can ban a mod.
+- `GET /admin/api/me` returns `{steamId, name, role}` (`owner` or `mod`); `GET /admin/api/admins` returns
+  `{owners:[{steamId,name}], mods:[{steamId,name,addedBy,at}]}` to any admin.
+
+### 3b. Lobby control
+
+`POST /admin/api/lobbies/<sessionId>/<action>` (owners and mods), reusing the matchmaker's own state machine:
+
+| Action | Body | Effect |
+|---|---|---|
+| `force-start` | | Starts a `waiting` or `countdown` lobby with 1 or more seated, skipping minimum and countdown. 409 `no-players` with nobody seated (nothing changes), 409 `closed` when started or ended. |
+| `countdown` | `{sec?}` (0..600) | Starts the start countdown now (default: the lobby's countdown override, else `START_COUNTDOWN_SECONDS`); a running countdown is only ever shortened. 409 `no-players` / `closed`. |
+| `end` | | Ends the match: seated players get `session-closed`, the lobby is `ended` and refuses seats. The host supervisor recycles it after the post-game drain. 409 `closed` if already ended. |
+| `reset` | | Back to `waiting`, seats cleared, the host counts as offline until its next poll. Overrides and the lock are kept. |
+| `lock` / `unlock` | | A locked lobby is never picked by find-session, join hints are refused (409 `closed`), and `lateJoinOpen` is false. Players already seated stay. |
+| `options` | `{minPlayers?, countdownSec?, maxPlayers?}` | Per-lobby overrides; `null` or `""` clears one. Validation: min 1..max, countdown 0..600, max 1..`MAX_PLAYERS` (400 `bad-<field>`). Lowering the minimum to the seated count or below starts the countdown at once; raising it cancels a countdown. |
+
+Every action answers `{ok:true, lobby:<listHosted entry>}` (the entry has `locked`, `overrides`, `effective:{minPlayers,
+countdownSec,maxPlayers}`, `community`, `verified`) or 404 / 409 / 400 `{error}`, and is audited as `lobby-<action>`
+with the lobby id as target (options: `old -> new`, as JSON).
+
+Persistence: locks and overrides are stored in `db.moderation.lobbyOptions[sessionId]` and re-applied when the backend
+starts and when a community host registers again with its old session id. A community host that is removed (expired,
+blocked, unregistered) and registers under a new id starts clean.
+
+### 3c. Player actions
+
+- **Notes** (`POST players/<id>/notes {text<=1000}`, audit `note`) and **warnings** (`POST players/<id>/warn
+  {reason<=200}`, audit `warn`) are stored in `db.moderation` and shown on the player page. **Warnings are not
+  delivered to the player in game yet**: the game has a "Violation Warning" dialog, but where it gets its data from
+  was not found, so a warning is an internal record for now.
+- **Adjust** (`POST players/<id>/adjust {level?, levelProgress?, ratings?, fame?}`) and **reset stats**
+  (`POST players/<id>/reset-stats`, owner or mod). Rules:
+  - Refused with `409 {"error":"player-in-lobby","sessionId"}` while the player is seated in any hosted lobby or is
+    on a lobby's watcher list: the game host holds the blob during a match and writes it back at the end, so an edit
+    then would be lost or would race its compare-and-swap write.
+  - The edit changes `db.appData["<id>/sostest"]` and bumps its `version` by one, exactly like a host write
+    (`progression.handleAppData`), so the host's next GET sees the new blob. A player without a blob gets one
+    (version 2).
+  - `level` is an integer 1..200, `levelProgress` a number in [0, 1), `ratings` takes `fameSolo`, `fameDuo`,
+    `survivalSolo`, `survivalDuo`, `toxicity` as integers (raw rating points, +-1,000,000; the game shows
+    `rating/100`). They are written to `ratings.soloRatings.<fame|survival>.rating`, `ratings.duoRatings...` and
+    `ratings.toxicity.rating` (docs/PROGRESSION.md section 2).
+  - **Fame**: `server/fame.js` overwrites `ratings.soloRatings.fame.rating` from `db.heroStats[id].soloFameRating` on
+    every blob GET and POST (`applyToBlob`), so editing the blob alone would be undone. Adjusting `fameSolo` therefore
+    also changes the Fame source through `fame.adjust(accountId, patch, {create})` (only for an account that already
+    has hero stats). `fame: {soloFameRating, fameWins, matches}` edits the Fame record directly and creates it when
+    missing.
+  - **Reset stats** zeroes `stats`, `badges` and every rating entry the blob already has (leaderboard ids kept), sets
+    `progression` to level 1 / progress 0, clears `db.playerStats[id]` and zeroes the account's Fame stats (so no Fame
+    comes back through `applyToBlob`). `permissions` and `social` are kept. Leaderboard rows already posted to
+    `db.leaderboards` are **not** changed; the host's next score post overwrites them.
+  - Audit `adjust` / `reset-stats` with a JSON detail `{old:{...}, new:{...}}` of the changed fields (at most 2000
+    characters).
+
+### 3d. Reports workflow
+
+Statuses: `open`, `investigating`, `resolved`, `dismissed`. Stored `actioned` reports are migrated to `resolved` at
+startup, and the old single `note` string becomes the first entry of `notes`; the status `actioned` is still accepted in
+requests and in the `?status=` filter as `resolved`. `POST /admin/api/reports/<id>` takes any of `{status, note,
+matchId, assignee}`: `assignee` is an admin's Steam id, `"me"`, or `null` to unassign; a `note` is appended to
+`notes:[{at,by,byName,text}]`. Audit `report-status` / `report-assign` / `report-note` (`old -> new`). The list takes
+`?status=&assignee=<id|me|none>&target=`. The detail adds `links:{match, target, reporter, spectate:{sessionId, live}}`.
+
+### 3e. Announcements and live config (KV overlay)
+
+How the client reads the KV: it fetches `<EndpointClient>/live-rev.txt` and then `runtime-<rev>.json`; the revision is
+part of the **file name** (docs/CLASSIC.md). A client that already holds `runtime-3.json` has no reason to refetch it, so
+changing the file content under the same revision would not reach running clients. The overlay therefore **changes the
+served revision**: `live-rev.txt` answers `<base rev> + <number of overlay changes>`, and `runtime-<that rev>.json` is
+the base file with the overlay values applied (the older file name is overlaid too). Clearing a value is also a change
+and gets a new revision. Whether the running game rechecks `live-rev.txt` after startup or only reads it at launch
+and login is not proven; assume players see a change at their next launch.
+
+- The base files `data/kv-classic/*` are never written (read-only in the image); the overlay lives in
+  `db.moderation.kv` (plus a revision counter), is applied only to keys that exist in the base file, and only for
+  Classic (`app-id: sostest`); the Main game's KV is untouched.
+- Allowlist (constant `KV_ALLOW` in `server/admin.js`): `UE_CLIENT_MOTD`, `UE_CLIENT_TEST_SERVER_MOTD`,
+  `UE_CLIENT_INACTIVE_SERVER_TEXT`, `UE_CLIENT_DUOS_QUEUE_WARNING_TIME_SEC`, `UE_CLIENT_VOTING_ENABLED`,
+  `UE_CLIENT_SURVIVAL_REQUIRED_GAMES` (also `_SOLO_` / `_DUO_`), `UE_CLIENT_SURVIVAL_ELO_K_FACTOR` (also `_SOLO_` /
+  `_DUO_`). No auth, URL, role, director, test-server-enabled or matchmaking-gate keys. A value must keep the base
+  value's JSON type (strings up to 500 characters, numbers within the key's range, booleans).
+- `GET /admin/api/kv` (any admin) -> `{keys:[{key, base, value, overridden, type, description, min?, max?}], baseRev,
+  servedRev}`. `POST /admin/api/kv {key, value}` and `POST /admin/api/kv/<key>/clear` are **owner only**; 400
+  `not-allowed` (key off the list), `not-in-base`, `bad-value`; clear on a key without an override is 404
+  `not-overridden`. Audit `kv-set` / `kv-clear` with `old -> new`.
+
+### 3f. Community hosts
+
+`GET /admin/api/community` -> `{enabled, hosts:[{id, name, ip, port, verified, listed, probe, online, state, players,
+maxPlayers, registeredAt, lastRenewSec, blocked, blockedBy:{id, ip}}]}`; `blockedBy` holds the host-block ids to lift.
+Block / unblock use the existing host-block endpoints (value = session id or IPv4/CIDR). server.js feeds the active
+blocks into the registry's ban list (next to `OGSOS_COMMUNITY_BANS`) and sweeps at once, so blocking an id or IP removes
+a registered host immediately and it cannot register again. The panel shows host IPs; they are never committed.
+
+### 3g. Audit
+
+`GET /admin/api/audit?by=&action=&target=&limit=500&before=<ISO>` (newest first) and `GET /admin/api/audit.csv` with the
+same filters (`text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="ogsos-audit-YYYYMMDD.csv"`,
+columns `at,by,byName,action,target,detail`). Cells are CSV-quoted, and a cell starting with `=`, `+`, `-`, `@`, tab or
+CR gets a leading `'` so a spreadsheet does not run it as a formula. The log keeps the last 20,000 entries.
 
 ### What a ban does
 
@@ -183,17 +299,22 @@ additions:
 - Bans are by Steam id only, no hardware or IP bans for players.
 - Kick removes the seat; the game host does the disconnect on its next poll (up to ~5 s).
 - Spectator invisibility and the in-game `open` command are untested (no second game client in these tests).
-- Community hosts: blocks are stored and exposed (`isHostBlocked(ip)`, `onHostBlocksChanged`) but only take effect
-  once `claude/community-hosts` is merged and wired (two lines: feed the active block values into
-  `community._cfg.bans`). Community lobbies then show on the Servers page like official ones.
-- Reports, bans and the audit log live in the backend's `db.json` (`db.moderation`), capped at 5000 reports and
-  5000 audit entries.
+- Warnings are an internal record only (section 3c).
+- Player adjust needs the player out of every lobby; a player who is only queued is not seated and can be edited.
+- Reports, bans, notes and the audit log live in the backend's `db.json` (`db.moderation`), capped at 5000 reports and
+  20000 audit entries.
 
 ## 8. Tests
 
 - `node tools/moderation_test.js` (offline): report routes and limits, bans, kicks, host blocks, cookie tampering
-  and expiry, CSRF, dev-login gates, static-file safety, OpenID against a fake Steam endpoint.
+  and expiry, CSRF, dev-login gates, static-file safety, OpenID against a fake Steam endpoint, and the v2 features
+  (roles, lobby control and its persistence, dashboard, player adjust / reset, matches, report workflow and migration,
+  KV overlay, community blocks, audit filters and CSV).
 - `node tools/moderation_live_test.js http://127.0.0.1:<port>` against a running backend (dev-login on).
 - `node tools/moderation_kick_test.js <port>` (end to end through a hosted Classic lobby): seat two players over
   `/ws`, report while seated, admin kick drops the player from the host's `player-map`, match-end links the
-  report, ban closes the socket and refuses `/ws` and login, lift restores login. The file header shows the env.
+  report, ban closes the socket and refuses `/ws` and login, lift restores login, then the v2 flows over HTTP (lobby
+  actions against a real countdown, roles, KV served on `/kv/runtime-N.json`, adjust, reports workflow, CSV). The file
+  header shows the env (`OGSOS_TEST_ADMIN` must be an owner in `OGSOS_ADMINS`).
+- `node tools/smoke_test.js <host> <port>` (post-deploy): also checks `/admin/api/me` is 401 without a cookie and
+  `/admin/` serves HTML; with `OGSOS_SMOKE_ADMIN_COOKIE` set it checks the admin API reads (me, dashboard, servers).

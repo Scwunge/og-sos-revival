@@ -2,6 +2,9 @@
 //   node tools/smoke_test.js <ipv4|host> <port> [expectedLobbies=3]
 // Checks /servers (lobbies online), KV live revision, a Classic Steam login (test account
 // 76561190000000042), the account fetch, and the matchmaking WebSocket handshake ("ready").
+// Admin panel: always checks that GET /admin/api/me without a cookie is 401 and /admin/ serves HTML. With env
+// OGSOS_SMOKE_ADMIN_COOKIE (the value of the ogsos_admin cookie from a signed-in browser, never logged) it also checks
+// GET /admin/api/me, /dashboard and /servers return 200 and the role is owner or mod.
 'use strict';
 const net = require('net');
 const http = require('http');
@@ -120,6 +123,24 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
   await r.ws.next('ready', 5000);
   r.ws.close();
   console.log('PASS  matchmaking WebSocket ready');
+  // admin panel (read-only)
+  const anon = await get('/admin/api/me');
+  assert(anon.status === 401, `/admin/api/me without a cookie should be 401, got ${anon.status}`);
+  console.log('PASS  /admin/api/me without a cookie is 401');
+  const page = await get('/admin/');
+  assert(page.status === 200 && /<html|<!doctype html/i.test(page.body), `/admin/ should serve HTML, got ${page.status}`);
+  console.log('PASS  /admin/ serves the panel page');
+  const ck = process.env.OGSOS_SMOKE_ADMIN_COOKIE;
+  if (ck) {
+    const h = { Cookie: `ogsos_admin=${ck.replace(/^ogsos_admin=/, '')}` };
+    const me = await get('/admin/api/me', h);
+    assert(me.status === 200 && ['owner', 'mod'].includes(JSON.parse(me.body).role), `/admin/api/me with the cookie: ${me.status}`);
+    for (const p of ['/admin/api/dashboard', '/admin/api/servers']) {
+      const r = await get(p, h);
+      assert(r.status === 200, `${p} returned ${r.status}`);
+    }
+    console.log('PASS  admin api with the cookie: me, dashboard, servers');
+  } else console.log('SKIP  admin api with a cookie (set OGSOS_SMOKE_ADMIN_COOKIE to run it)');
   console.log('ALL OK');
   process.exit(0);
 })().catch((e) => { console.error('FAIL ', e.message); process.exit(1); });

@@ -13,7 +13,7 @@ const WEB_DIR = path.join(__dirname, 'web', 'admin');
 const COOKIE = 'ogsos_admin';
 const COOKIE_TTL_SEC = 12 * 3600;
 const MAX_REPORTS = 5000;
-const MAX_AUDIT = 5000;
+const MAX_AUDIT = 20000;
 const MAX_BODY = 16 * 1024;
 const ID_RE = /^[\w.-]{1,64}$/;
 const SESSION_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
@@ -24,6 +24,37 @@ const HOUR = 3600 * 1000;
 const BAN_CODES = ['cheating', 'harassment', 'spam', 'bad-username', 'toxicity', 'stream-sniping', 'ban-evasion', 'other'];
 const PERMANENT_SECONDS = 315360000;   // the client words only 86400 (1 day) and 604800 (7 days); anything else reads as "permanently"
 const WATCH_TTL_MS = 3 * HOUR;
+const REPORT_STATUSES = ['open', 'investigating', 'resolved', 'dismissed'];
+const LOBBY_ACTIONS = ['force-start', 'countdown', 'end', 'reset', 'lock', 'unlock', 'options'];
+const RATING_PATHS = {   // adjust.ratings key -> path inside the blob (docs/PROGRESSION.md section 2)
+  fameSolo: ['soloRatings', 'fame'], fameDuo: ['duoRatings', 'fame'], survivalSolo: ['soloRatings', 'survival'],
+  survivalDuo: ['duoRatings', 'survival'], toxicity: ['toxicity'],
+};
+// Level curve (docs/PROGRESSION.md section 1): XP to the next level, linear between the keys, constant after 20.
+const XP_KEYS = [[1, 500], [3, 1900], [6, 3400], [10, 5000], [20, 7000]];
+function xpToNext(level) {
+  if (level <= XP_KEYS[0][0]) return XP_KEYS[0][1];
+  for (let i = 1; i < XP_KEYS.length; i++) {
+    const [x1, y1] = XP_KEYS[i];
+    if (level <= x1) { const [x0, y0] = XP_KEYS[i - 1]; return Math.round(y0 + ((y1 - y0) * (level - x0)) / (x1 - x0)); }
+  }
+  return XP_KEYS[XP_KEYS.length - 1][1];
+}
+// KV keys an owner may override (never auth, URL, role, director, test-server or matchmaking-gate keys).
+// min/max apply to numbers; strings are capped at 500 characters.
+const KV_ALLOW = {
+  UE_CLIENT_MOTD: { description: 'Message of the day shown in the main menu' },
+  UE_CLIENT_TEST_SERVER_MOTD: { description: 'Message of the day shown on the test server screen' },
+  UE_CLIENT_INACTIVE_SERVER_TEXT: { description: 'Text shown when matchmaking is closed' },
+  UE_CLIENT_DUOS_QUEUE_WARNING_TIME_SEC: { min: 0, max: 600, description: 'Seconds in the duos queue before the long-wait warning' },
+  UE_CLIENT_VOTING_ENABLED: { description: 'Show the vote UI' },
+  UE_CLIENT_SURVIVAL_REQUIRED_GAMES: { min: 0, max: 100, description: 'Games before a survival rating shows (instead of UNRATED)' },
+  UE_CLIENT_SURVIVAL_SOLO_REQUIRED_GAMES: { min: 0, max: 100, description: 'Games before a solo survival rating shows' },
+  UE_CLIENT_SURVIVAL_DUO_REQUIRED_GAMES: { min: 0, max: 100, description: 'Games before a duo survival rating shows' },
+  UE_CLIENT_SURVIVAL_ELO_K_FACTOR: { min: 1, max: 200, description: 'Survival rating K factor' },
+  UE_CLIENT_SURVIVAL_SOLO_ELO_K_FACTOR: { min: 1, max: 200, description: 'Solo survival rating K factor' },
+  UE_CLIENT_SURVIVAL_DUO_ELO_K_FACTOR: { min: 1, max: 200, description: 'Duo survival rating K factor' },
+};
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const b64u = (b) => Buffer.from(b).toString('base64url');
@@ -75,6 +106,9 @@ function createModeration(opts = {}) {
   const displayName = opts.displayName || ((id) => String(id));
   const matchmakers = opts.matchmakers || {};
   const onHostBlocksChanged = opts.onHostBlocksChanged || null;
+  const fame = opts.fame || null;               // server/fame.js instance: heroStats, applyToBlob, adjust
+  const community = opts.community || null;     // server/community.js registry
+  const kvDir = opts.kvDir || path.join(__dirname, '..', 'data', 'kv-classic');   // read-only base files of the Classic KV
   const cookieKey = crypto.createHmac('sha256', String(opts.secret || 'ogsos-dev-secret')).update('ogsos-admin-cookie-v1').digest();
 
   const nowIso = () => new Date(now()).toISOString();
@@ -85,20 +119,40 @@ function createModeration(opts = {}) {
     m.hostBlocks = Array.isArray(m.hostBlocks) ? m.hostBlocks : [];
     m.audit = Array.isArray(m.audit) ? m.audit : [];
     m.seq = Number.isInteger(m.seq) ? m.seq : 0;
+    m.mods = isObj(m.mods) ? m.mods : {};
+    m.notes = isObj(m.notes) ? m.notes : {};
+    m.warnings = isObj(m.warnings) ? m.warnings : {};
+    m.lobbyOptions = isObj(m.lobbyOptions) ? m.lobbyOptions : {};
+    m.kv = isObj(m.kv) ? m.kv : {};
+    m.kvRev = Number.isInteger(m.kvRev) ? m.kvRev : 0;
     return m;
   };
   store();
+  // Stored reports from before the v2 workflow: 'actioned' became 'resolved', the single note string became a notes list.
+  for (const r of store().reports) {
+    if (r.status === 'actioned') r.status = 'resolved';
+    if (!Array.isArray(r.notes)) r.notes = [];
+    if (typeof r.note === 'string') {
+      if (r.note) r.notes.push({ at: r.resolvedAt || r.at, by: r.resolvedBy || '', byName: r.resolvedBy ? displayName(r.resolvedBy) : '', text: r.note });
+      delete r.note;
+    }
+    if (r.assignee === undefined) r.assignee = null;
+  }
   const save = () => { try { saveDb(); } catch { /* keep serving */ } };
   const matches = () => (Array.isArray(db.matches) ? db.matches : []);
   const accounts = () => (isObj(db.accounts) ? db.accounts : {});
-  const admins = () => new Set(String(env.OGSOS_ADMINS || '').split(/[\s,]+/).filter(Boolean));
+  // Roles: owners come from env OGSOS_ADMINS, mods from the db (added by an owner in the panel).
+  const owners = () => new Set(String(env.OGSOS_ADMINS || '').split(/[\s,]+/).filter(Boolean));
+  const admins = () => new Set([...owners(), ...Object.keys(store().mods)]);
+  const roleOf = (id) => { const s = String(id); return owners().has(s) ? 'owner' : Object.prototype.hasOwnProperty.call(store().mods, s) ? 'mod' : null; };
+  const isAdmin = (id) => !!roleOf(id);
 
   if (env.OGSOS_ADMIN_DEV_LOGIN === '1') console.warn('moderation: OGSOS_ADMIN_DEV_LOGIN=1, /admin/dev-login is enabled for loopback requests. Never set this in production.');
 
   // ---------- audit ----------
   function audit(by, byName, action, target, detail) {
     const m = store();
-    const e = { at: nowIso(), by: by || '', byName: byName || '', action, target: target === undefined || target === null ? '' : String(target), detail: detail === undefined ? '' : clip(detail, 500) };
+    const e = { at: nowIso(), by: by || '', byName: byName || '', action, target: target === undefined || target === null ? '' : String(target), detail: detail === undefined ? '' : clip(detail, 2000) };
     m.audit.push(e);
     while (m.audit.length > MAX_AUDIT) m.audit.shift();
     try { log('admin.jsonl', { ...e }); } catch { /* keep serving */ }
@@ -212,11 +266,11 @@ function createModeration(opts = {}) {
       sessionId: sessionIn || snap.sid,
       matchId: f.matchId && ID_RE.test(f.matchId) ? f.matchId : null,
       evidenceUrl: /^https?:\/\/\S+$/i.test(f.evidenceUrl || '') ? String(f.evidenceUrl).slice(0, 500) : null,
-      snapshot: snap.snapshot, resolvedBy: null, resolvedAt: null, note: '', raw,
+      snapshot: snap.snapshot, resolvedBy: null, resolvedAt: null, notes: [], assignee: null, raw,
     };
     m.reports.push(report);
     while (m.reports.length > MAX_REPORTS) {
-      const i = m.reports.findIndex((r) => r.status !== 'open');
+      const i = m.reports.findIndex((r) => r.status === 'resolved' || r.status === 'dismissed');
       m.reports.splice(i >= 0 ? i : 0, 1);
     }
     save();
@@ -332,8 +386,9 @@ function createModeration(opts = {}) {
     if (want.length !== got.length || !crypto.timingSafeEqual(want, got)) return null;
     let j; try { j = JSON.parse(Buffer.from(p, 'base64url').toString('utf8')); } catch { return null; }
     if (!j || typeof j.sid !== 'string' || !(j.exp > now() / 1000)) return null;
-    if (!admins().has(j.sid)) return null;
-    return { steamId: j.sid, name: String(j.n || j.sid) };
+    const role = roleOf(j.sid);   // re-checked on every request: a removed mod loses access at once
+    if (!role) return null;
+    return { steamId: j.sid, name: String(j.n || j.sid), role };
   }
 
   // ---------- http helpers ----------
@@ -436,11 +491,221 @@ function createModeration(opts = {}) {
   const listReportsBy = (id) => store().reports.filter((r) => r.reporter.id === id);
   const stripRaw = ({ raw, ...rest }) => rest;
   const activeBanFor = (id) => isBanned(id);
+  const forbidOwnerOnly = (res) => json(res, 403, { error: 'owner-only' });
+
+  // The lobby entry (listHosted shape) for a session id, plus its matchmaker.
+  const findLobby = (sessionId, game) => hostedAll().find((y) => y.h.id === sessionId && (!game || y.game === game)) || null;
+  const lobbyView = (x) => {
+    const fresh = x.mm.listHosted().find((h) => h.id === x.h.id) || x.h;
+    return { game: x.game, ...fresh };
+  };
+  const serverOf = (sessionId) => {
+    const x = sessionId ? findLobby(sessionId) : null;
+    return x ? { name: x.h.name, game: x.game, community: !!x.h.community } : null;
+  };
+
+  // ---- Classic player blob helpers ----
+  const BLOB_APP = 'sostest';
+  const blobKey = (id) => `${id}/${BLOB_APP}`;
+  const rawBlob = (id) => { const b = isObj(db.appData) ? db.appData[blobKey(id)] : null; return b && isObj(b.data) ? b.data : null; };
+  // What the game host sees on GET (the stored blob with Fame filled in).
+  const seenBlob = (id) => {
+    const d = rawBlob(id);
+    if (!d) return null;
+    try { const o = fame && typeof fame.applyToBlob === 'function' ? fame.applyToBlob(id, d) : d; return isObj(o) ? o : d; } catch { return d; }
+  };
+  const ratingOf = (d, key) => {
+    let o = d && d.ratings;
+    for (const k of RATING_PATHS[key]) o = isObj(o) ? o[k] : undefined;
+    return isObj(o) && typeof o.rating === 'number' ? o.rating : null;
+  };
+  function profileOf(id) {
+    const d = seenBlob(id);
+    let heroStats = null;
+    try { heroStats = fame && typeof fame.heroStats === 'function' ? fame.heroStats(id) : null; } catch { /* none */ }
+    if (!d) return { level: null, levelProgress: null, ratings: {}, fame: heroStats };
+    const prog = isObj(d.progression) ? d.progression : {};
+    const level = Number.isFinite(prog.level) ? prog.level : null;
+    const levelProgress = Number.isFinite(prog.levelProgress) ? prog.levelProgress : null;
+    const out = { level, levelProgress, ratings: {}, fame: heroStats };
+    if (level !== null && levelProgress !== null) { const need = xpToNext(level); out.xpToNext = need; out.xpIntoLevel = Math.round(levelProgress * need); }
+    for (const k of Object.keys(RATING_PATHS)) out.ratings[k] = ratingOf(d, k);
+    return out;
+  }
+  const watchedBy = (id) => hostedAll().find((x) => x.watchers.includes(id)) || null;
+
+  // ---- lobby control ----
+  function persistLobby(sessionId, view) {
+    const m = store();
+    const o = view.overrides || {};
+    if (view.locked || Object.keys(o).length) m.lobbyOptions[sessionId] = { locked: !!view.locked, overrides: { ...o } };
+    else delete m.lobbyOptions[sessionId];
+  }
+  // Re-apply the stored options (startup, and when a community host registers again with its old session id).
+  function reapplyLobbyOptions(onlyId) {
+    let n = 0;
+    for (const [sid, o] of Object.entries(store().lobbyOptions)) {
+      if (onlyId && sid !== onlyId) continue;
+      for (const mmx of Object.values(matchmakers)) {
+        if (!mmx || typeof mmx.setLobbyOptions !== 'function') continue;
+        const ov = o.overrides || {};
+        const r = mmx.setLobbyOptions(sid, { locked: !!o.locked, minPlayers: ov.minPlayers ?? null, countdownSec: ov.countdownSec ?? null, maxPlayers: ov.maxPlayers ?? null });
+        if (!r.error) { n++; break; }
+      }
+    }
+    return n;
+  }
+  reapplyLobbyOptions();
+
+  function lobbyAction(admin, sessionId, action, b) {
+    const x = findLobby(sessionId, b.game);
+    if (!x) return { status: 404, body: { error: 'not-found' } };
+    const mmx = x.mm, id = x.h.id;
+    const view = () => lobbyView(x);
+    const seated = x.h.players;
+    const done = (detail) => { audit(admin.steamId, admin.name, `lobby-${action}`, id, detail); save(); return { status: 200, body: { ok: true, lobby: view() } }; };
+    const opts = (o) => {
+      const before = view();
+      const r = mmx.setLobbyOptions(id, o);
+      if (r.error) return { status: r.error === 'not-found' ? 404 : 400, body: { error: r.error } };
+      persistLobby(id, r);
+      const fmt = (v) => JSON.stringify({ locked: v.locked, ...v.overrides });
+      return done(`${fmt(before)} -> ${fmt(r)}`);
+    };
+    if (action === 'force-start') {
+      if (x.h.state !== 'waiting' && x.h.state !== 'countdown') return { status: 409, body: { error: 'closed', state: x.h.state } };
+      if (!seated) return { status: 409, body: { error: 'no-players' } };
+      mmx.forceStartHosted(id);
+      return done(`${seated} seated`);
+    }
+    if (action === 'countdown') {
+      let sec;
+      if (b.sec !== undefined && b.sec !== null && b.sec !== '') {
+        sec = typeof b.sec === 'string' ? Number(b.sec) : b.sec;
+        if (!Number.isInteger(sec) || sec < 0 || sec > 600) return { status: 400, body: { error: 'bad-sec' } };
+      }
+      const r = mmx.countdownHosted(id, sec);
+      if (r.error) return { status: r.error === 'not-found' ? 404 : 409, body: { error: r.error, ...(r.state ? { state: r.state } : {}) } };
+      return done(sec === undefined ? 'default' : `${sec}s`);
+    }
+    if (action === 'end') {
+      if (x.h.state === 'ended') return { status: 409, body: { error: 'closed', state: 'ended' } };
+      const n = mmx.endHosted(id);
+      return done(`${n} released`);
+    }
+    if (action === 'reset') {
+      const n = mmx.resetHosted(id);
+      return done(`${n} released`);
+    }
+    if (action === 'lock' || action === 'unlock') return opts({ locked: action === 'lock' });
+    if (action === 'options') {
+      const o = {};
+      for (const k of ['minPlayers', 'countdownSec', 'maxPlayers']) if (b[k] !== undefined) o[k] = b[k];
+      if (!Object.keys(o).length) return { status: 400, body: { error: 'no-options' } };
+      return opts(o);
+    }
+    return { status: 404, body: { error: 'not-found' } };
+  }
+
+  // ---- announcements / KV overlay ----
+  const readBaseRev = () => {
+    try { const t = fs.readFileSync(path.join(kvDir, 'live-rev.txt'), 'utf8').trim(); return /^\d{1,9}$/.test(t) ? Number(t) : null; } catch { return null; }
+  };
+  const readBaseKv = (rev) => {
+    if (rev === null) return null;
+    try { const j = JSON.parse(fs.readFileSync(path.join(kvDir, `runtime-${rev}.json`), 'utf8')); return isObj(j) ? j : null; } catch { return null; }
+  };
+  // Does `value` keep the base value's JSON type and the key's limits? -> null when fine, else an error code.
+  function kvCheck(key, base, value) {
+    const spec = KV_ALLOW[key];
+    if (!spec) return 'not-allowed';
+    if (typeof base === 'string') return typeof value === 'string' && value.length <= 500 && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value) ? null : 'bad-value';
+    if (typeof base === 'number') return typeof value === 'number' && Number.isFinite(value) && value >= (spec.min ?? -1e9) && value <= (spec.max ?? 1e9) ? null : 'bad-value';
+    if (typeof base === 'boolean') return typeof value === 'boolean' ? null : 'bad-value';
+    return 'bad-value';
+  }
+  function applyKv(obj) {
+    const out = { ...obj };
+    for (const [k, v] of Object.entries(store().kv)) if (k in out && !kvCheck(k, out[k], v)) out[k] = v;
+    return out;
+  }
+  // The revision clients see: the base revision plus one step per overlay change. The file name depends on the revision
+  // (runtime-<rev>.json), so a changed overlay needs a NEW revision or running clients keep their cached copy.
+  const servedRev = () => { const b = readBaseRev(); return b === null ? null : b + store().kvRev; };
+  // For server.js handleKv (Classic only): {body, type} to serve instead of the plain file, or null to fall through.
+  function kvServe(rel) {
+    const m = store();
+    if (!m.kvRev) return null;
+    const base = readBaseRev();
+    if (base === null) return null;
+    const served = base + m.kvRev;
+    if (rel === 'live-rev.txt') return { body: String(served), type: 'text/plain' };
+    const r = String(rel).match(/^runtime-(\d{1,9})\.json$/);
+    if (!r) return null;
+    const n = Number(r[1]);
+    const file = n > base && n <= served ? base : n;   // every overlay revision served so far is the base file + the overlay
+    let j;
+    try { j = JSON.parse(fs.readFileSync(path.join(kvDir, `runtime-${file}.json`), 'utf8')); } catch { return null; }
+    if (!isObj(j)) return null;
+    return { body: JSON.stringify(applyKv(j), null, 2), type: 'application/json' };
+  }
+
+  // ---- audit filters / csv ----
+  function auditFiltered(url, defLimit, maxLimit) {
+    const by = url.searchParams.get('by') || '', action = url.searchParams.get('action') || '', target = url.searchParams.get('target') || '';
+    const before = url.searchParams.get('before') || '';
+    const limit = Math.min(maxLimit, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || defLimit));
+    const out = [];
+    const a = store().audit;
+    for (let i = a.length - 1; i >= 0 && out.length < limit; i--) {
+      const e = a[i];
+      if (by && e.by !== by) continue;
+      if (action && e.action !== action) continue;
+      if (target && e.target !== target) continue;
+      if (before && !(e.at < before)) continue;
+      out.push(e);
+    }
+    return out;
+  }
+  const csvCell = (v) => {
+    let s = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;   // spreadsheet formula injection
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const toCsv = (rows) => ['at,by,byName,action,target,detail', ...rows.map((e) => [e.at, e.by, e.byName, e.action, e.target, e.detail].map(csvCell).join(','))].join('\r\n') + '\r\n';
 
   function apiGet(admin, sub, url, res) {
     const m = store();
     let r;
-    if (sub === 'me') return json(res, 200, { steamId: admin.steamId, name: admin.name });
+    if (sub === 'me') return json(res, 200, { steamId: admin.steamId, name: admin.name, role: admin.role });
+
+    if (sub === 'admins') {
+      return json(res, 200, {
+        owners: [...owners()].map((id) => ({ steamId: id, name: nameOf(id) })),
+        mods: Object.entries(m.mods).map(([id, v]) => ({ steamId: id, name: nameOf(id) || v.name || id, addedBy: v.addedBy, at: v.at })),
+      });
+    }
+
+    if (sub === 'dashboard') {
+      const t = now();
+      const dayStart = Date.UTC(new Date(t).getUTCFullYear(), new Date(t).getUTCMonth(), new Date(t).getUTCDate());
+      let today = 0, week = 0;
+      for (const mt of matches()) { const e = Date.parse(mt.endedAt); if (e >= dayStart) today++; if (e >= t - 7 * 24 * HOUR) week++; }
+      const cnt = (k) => (matchmakers[k] && matchmakers[k]._state && matchmakers[k]._state.clients ? matchmakers[k]._state.clients.size : 0);
+      const qn = (k) => (matchmakers[k] && matchmakers[k]._state && matchmakers[k]._state.queue ? matchmakers[k]._state.queue.length : 0);
+      const lobbies = hostedAll().map((x) => ({
+        id: x.h.id, game: x.game, name: x.h.name, state: x.h.state, players: x.h.players, maxPlayers: x.h.maxPlayers, online: x.h.online,
+        lastSeenSec: x.h.lastSeenSec, locked: !!x.h.locked, community: !!x.h.community, verified: !!x.h.verified, countdownEndsAt: x.h.countdownEndsAt,
+      }));
+      return json(res, 200, {
+        playersOnline: { classic: cnt('classic'), main: cnt('main') }, queue: { classic: qn('classic'), main: qn('main') },
+        seated: lobbies.reduce((n, l) => n + (l.players || 0), 0), lobbies,
+        hosts: { up: lobbies.filter((l) => l.online).length, down: lobbies.filter((l) => !l.online).length },
+        matches: { today, week },
+        reports: { open: m.reports.filter((x) => x.status === 'open').length, investigating: m.reports.filter((x) => x.status === 'investigating').length },
+        bansActive: Object.values(m.bans).filter(banActive).length, generatedAt: new Date(t).toISOString(),
+      });
+    }
 
     if (sub === 'servers') {
       const servers = [];
@@ -450,6 +715,8 @@ function createModeration(opts = {}) {
           game: x.game, id: x.h.id, name: x.h.name, region: x.h.region, online: x.h.online, state: x.h.state, map: x.h.map,
           address: `${x.h.publicHost || x.h.host}:${x.h.port}`, players, playerCount: x.h.players, maxPlayers: x.h.maxPlayers,
           startedAt: x.h.startedAt, watchers: x.watchers.map((id) => ({ id, name: nameOf(id) })),
+          minPlayers: x.h.minPlayers, locked: !!x.h.locked, overrides: x.h.overrides || {}, effective: x.h.effective || null, maxCap: x.h.maxCap || null,
+          community: !!x.h.community, verified: !!x.h.verified, countdownEndsAt: x.h.countdownEndsAt, lastSeenSec: x.h.lastSeenSec,
         });
       }
       const cnt = (k) => (matchmakers[k] && matchmakers[k]._state && matchmakers[k]._state.clients ? matchmakers[k]._state.clients.size : 0);
@@ -485,13 +752,15 @@ function createModeration(opts = {}) {
       const ms = matches();
       for (let i = ms.length - 1; i >= 0 && mine.length < 50; i--) {
         const e = matchEntry(ms[i], id);
-        if (e) mine.push({ id: ms[i].id, sessionId: ms[i].sessionId, endedAt: ms[i].endedAt, durationSec: ms[i].durationSec, me: e, players: (ms[i].players || []).length });
+        if (e) mine.push({ id: ms[i].id, matchId: ms[i].id, sessionId: ms[i].sessionId, server: (serverOf(ms[i].sessionId) || {}).name || null, endedAt: ms[i].endedAt, durationSec: ms[i].durationSec, me: e, players: (ms[i].players || []).length });
       }
       const seat = seatOf(id);
       const history = m.audit.filter((e) => (e.action === 'ban' || e.action === 'unban') && e.target === id).reverse();
       return json(res, 200, {
         account: { id, name: String(a['display-name'] || a.alias || id), created: a.created || null, lastAccess: a['last-access'] || null },
-        stats: summaryOf(id) || {}, matches: mine,
+        stats: summaryOf(id) || {}, matches: mine, profile: profileOf(id),
+        notes: [...(m.notes[id] || [])].reverse(), warnings: [...(m.warnings[id] || [])].reverse(),
+        kicks: m.audit.filter((e) => e.action === 'kick' && e.target === id).reverse(),
         reportsAgainst: listReportsAgainst(id).reverse().map(stripRaw), reportsBy: listReportsBy(id).reverse().map(stripRaw),
         ban: activeBanFor(id), banHistory: history,
         current: seat ? { game: seat.game, sessionId: seat.h.id, state: seat.h.state } : null,
@@ -499,13 +768,17 @@ function createModeration(opts = {}) {
     }
 
     if (sub === 'reports') {
-      const st = url.searchParams.get('status') || 'open';
+      let st = url.searchParams.get('status') || 'open';
+      if (st === 'actioned') st = 'resolved';
       const target = url.searchParams.get('target');
+      let assignee = url.searchParams.get('assignee');
+      if (assignee === 'me') assignee = admin.steamId;
       const out = [];
       for (let i = m.reports.length - 1; i >= 0 && out.length < 500; i--) {
         const rp = m.reports[i];
         if (st !== 'all' && rp.status !== st) continue;
         if (target && rp.target.id !== target) continue;
+        if (assignee === 'none' ? rp.assignee : assignee && !(rp.assignee && rp.assignee.id === assignee)) continue;
         out.push(stripRaw(rp));
       }
       return json(res, 200, out);
@@ -515,16 +788,40 @@ function createModeration(opts = {}) {
       if (!rp) return json(res, 404, { error: 'not-found' });
       const at = Date.parse(rp.at);
       const candidates = rp.sessionId ? matches().filter((mt) => mt.sessionId === rp.sessionId && Date.parse(mt.endedAt) >= at - 60000 && Date.parse(mt.endedAt) <= at + 4 * HOUR).slice(0, 5) : [];
+      const lobby = rp.sessionId ? findLobby(rp.sessionId) : null;
       return json(res, 200, {
         report: rp, match: rp.matchId ? (matches().find((x) => x.id === rp.matchId) || null) : null, candidates,
         target: summaryOf(rp.target.id), reporter: summaryOf(rp.reporter.id),
         priorReportsAgainstTarget: m.reports.filter((x) => x.target.id === rp.target.id && x.id !== rp.id).length,
         ban: activeBanFor(rp.target.id),
+        links: { match: rp.matchId || null, target: rp.target.id, reporter: rp.reporter.id, spectate: { sessionId: rp.sessionId || null, live: !!lobby && lobby.h.state === 'started' } },
       });
+    }
+
+    if (sub === 'matches') {
+      const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || 50));
+      const before = url.searchParams.get('before') || '', player = url.searchParams.get('player') || '', session = url.searchParams.get('session') || '';
+      const ms = matches();
+      const out = [];
+      for (let i = ms.length - 1; i >= 0 && out.length < limit; i--) {
+        const mt = ms[i];
+        if (before && !(String(mt.endedAt) < before)) continue;
+        if (session && mt.sessionId !== session) continue;
+        if (player && !matchEntry(mt, player)) continue;
+        let top = null;
+        for (const p of mt.players || []) if (typeof p.kills === 'number' && (!top || p.kills > top.kills)) top = { kills: p.kills, name: p.name || nameOf(p.playerId), playerId: p.playerId };
+        out.push({
+          id: mt.id, sessionId: mt.sessionId, server: (serverOf(mt.sessionId) || {}).name || null, startedAt: mt.startedAt || null, endedAt: mt.endedAt,
+          durationSec: mt.durationSec ?? null, players: (mt.players || []).length, top,
+        });
+      }
+      return json(res, 200, out);
     }
     if ((r = sub.match(/^matches\/(.+)$/))) {
       const mt = matches().find((x) => x.id === decodeURIComponent(r[1]));
-      return mt ? json(res, 200, mt) : json(res, 404, { error: 'not-found' });
+      if (!mt) return json(res, 404, { error: 'not-found' });
+      const players = (mt.players || []).map((p) => ({ ...p, name: p.name || nameOf(p.playerId) || p.playerId }));
+      return json(res, 200, { ...mt, players, server: serverOf(mt.sessionId), reports: m.reports.filter((x) => x.matchId === mt.id).map(stripRaw) });
     }
     if (sub === 'bans') {
       const all = url.searchParams.get('all') === '1';
@@ -533,33 +830,255 @@ function createModeration(opts = {}) {
         hostBlocks: m.hostBlocks.filter((h) => all || !h.lifted),
       });
     }
-    if (sub === 'audit') {
-      const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || 200));
-      return json(res, 200, m.audit.slice(-limit).reverse());
+    if (sub === 'audit') return json(res, 200, auditFiltered(url, 500, 5000));
+    if (sub === 'audit.csv') {
+      const d = new Date(now()).toISOString().slice(0, 10).replace(/-/g, '');
+      return respond(res, 200, toCsv(auditFiltered(url, 20000, 20000)), 'text/csv; charset=utf-8', { 'Content-Disposition': `attachment; filename="ogsos-audit-${d}.csv"` });
+    }
+
+    if (sub === 'kv') {
+      const rev = readBaseRev();
+      const base = readBaseKv(rev) || {};
+      const keys = Object.entries(KV_ALLOW).filter(([k]) => k in base).map(([k, spec]) => {
+        const ov = Object.prototype.hasOwnProperty.call(m.kv, k) && !kvCheck(k, base[k], m.kv[k]);
+        return { key: k, base: base[k], value: ov ? m.kv[k] : base[k], overridden: ov, type: typeof base[k], description: spec.description, ...(spec.min !== undefined ? { min: spec.min, max: spec.max } : {}) };
+      });
+      return json(res, 200, { keys, baseRev: rev, servedRev: servedRev() });
+    }
+
+    if (sub === 'community') {
+      const hostsMap = community ? community._hosts : new Map();
+      const live = new Map();
+      for (const mmx of Object.values(matchmakers)) if (mmx && typeof mmx.listHosted === 'function') for (const h of mmx.listHosted()) if (h.community) live.set(h.id, h);
+      const active = m.hostBlocks.filter((h) => !h.lifted);
+      const blockFor = (value) => { const b = active.find((h) => h.value === value); return b ? b.id : null; };
+      const out = [];
+      for (const h of hostsMap.values()) {
+        const v = live.get(h.id) || {};
+        const st = community.status(h.id) || {};
+        out.push({
+          id: h.id, name: h.name, ip: h.ip, port: h.port, verified: !!h.verified, listed: !!st.listed, probe: h.probe, online: !!v.online, state: v.state || 'waiting',
+          players: v.players || 0, maxPlayers: v.maxPlayers || null, registeredAt: new Date(h.registeredAt).toISOString(),
+          lastRenewSec: Math.max(0, Math.floor((now() - h.registeredAt) / 1000)),
+          blocked: !!blockFor(h.id) || isHostBlocked(h.ip) || !!blockFor(h.ip), blockedBy: { id: blockFor(h.id), ip: blockFor(h.ip) },
+        });
+      }
+      return json(res, 200, { enabled: community ? !!community._cfg.enabled : false, hosts: out });
     }
     return json(res, 404, { error: 'not-found' });
+  }
+
+  function changeReport(admin, rp, b, res) {
+    const before = { status: rp.status, assignee: rp.assignee ? rp.assignee.id : null };
+    const status = b.status === 'actioned' ? 'resolved' : b.status;
+    if (status !== undefined && !REPORT_STATUSES.includes(status)) return json(res, 400, { error: 'bad-status' });
+    let assignee;   // undefined = unchanged
+    if (b.assignee !== undefined) {
+      if (b.assignee === null || b.assignee === '') assignee = null;
+      else {
+        const id = b.assignee === 'me' ? admin.steamId : scalar(b.assignee);
+        if (!ID_RE.test(id) || !isAdmin(id)) return json(res, 400, { error: 'bad-assignee' });
+        assignee = { id, name: nameOf(id) };
+      }
+    }
+    const noteText = typeof b.note === 'string' ? clip(b.note, 1000) : '';
+    const matchId = typeof b.matchId === 'string' && b.matchId ? clip(b.matchId, 64) : null;
+    if (status === undefined && assignee === undefined && !noteText && !matchId) return json(res, 400, { error: 'bad-status' });
+    if (status !== undefined && status !== rp.status) {
+      rp.status = status;
+      const closed = status === 'resolved' || status === 'dismissed';
+      rp.resolvedBy = closed ? admin.steamId : null;
+      rp.resolvedAt = closed ? nowIso() : null;
+      audit(admin.steamId, admin.name, 'report-status', rp.id, `${before.status} -> ${status}`);
+    }
+    if (assignee !== undefined && (assignee ? assignee.id : null) !== before.assignee) {
+      rp.assignee = assignee;
+      audit(admin.steamId, admin.name, 'report-assign', rp.id, `${before.assignee || 'none'} -> ${assignee ? assignee.id : 'none'}`);
+    }
+    if (noteText) {
+      rp.notes.push({ at: nowIso(), by: admin.steamId, byName: admin.name, text: noteText });
+      audit(admin.steamId, admin.name, 'report-note', rp.id, noteText);
+    }
+    if (matchId) rp.matchId = matchId;
+    save();
+    return json(res, 200, { ok: true, report: rp });
+  }
+
+  // Player adjust / reset-stats. The game host holds a player's blob during a match and writes it back at the end, so
+  // nobody seated (or watching) may be edited. The edit bumps the blob version like a host write does.
+  function editPlayer(admin, id, b, reset, res) {
+    if (!accounts()[id]) return json(res, 404, { error: 'not-found' });
+    const busy = seatOf(id) || watchedBy(id);
+    if (busy) return json(res, 409, { error: 'player-in-lobby', sessionId: busy.h.id });
+    const old = {}, nu = {};
+    const set = (k, from, to) => { old[k] = from; nu[k] = to; };
+    db.appData = isObj(db.appData) ? db.appData : {};
+    const key = blobKey(id);
+    const cur = db.appData[key];
+    const version = cur && Number.isInteger(cur.version) ? cur.version : 1;
+    const data = cur && isObj(cur.data) ? JSON.parse(JSON.stringify(cur.data)) : {};
+    const ratingEntry = (name) => {
+      data.ratings = isObj(data.ratings) ? data.ratings : {};
+      let o = data.ratings;
+      for (const k of RATING_PATHS[name]) { o[k] = isObj(o[k]) ? o[k] : {}; o = o[k]; }
+      return o;
+    };
+    const intIn = (v, lo, hi) => (typeof v === 'number' && Number.isInteger(v) && v >= lo && v <= hi ? v : null);
+    const fameWanted = {};
+    if (reset) {
+      const prog = isObj(data.progression) ? data.progression : {};
+      set('progression', { level: prog.level ?? null, levelProgress: prog.levelProgress ?? null }, { level: 1, levelProgress: 0 });
+      data.progression = { ...prog, level: 1, levelProgress: 0 };
+      const zero = (o) => { if (!isObj(o)) return o; const c = {}; for (const [k, v] of Object.entries(o)) c[k] = typeof v === 'number' ? 0 : isObj(v) ? zero(v) : v; return c; };
+      if (data.stats !== undefined) { set('stats', 'cleared', 'zeroed'); data.stats = zero(data.stats); }
+      if (data.badges !== undefined) data.badges = zero(data.badges);
+      for (const name of Object.keys(RATING_PATHS)) {
+        let e = data.ratings;
+        for (const k of RATING_PATHS[name]) e = isObj(e) ? e[k] : undefined;
+        if (!isObj(e)) continue;   // never create rating entries the game did not write
+        if (e.rating || e.matchesPlayed) { old[name] = { rating: e.rating ?? null, matchesPlayed: e.matchesPlayed ?? null }; nu[name] = { rating: 0, matchesPlayed: 0 }; }
+        e.rating = 0; e.matchesPlayed = 0;
+      }
+      Object.assign(fameWanted, { soloFameRating: 0, fameWins: 0, matches: 0, anger: 0, applause: 0, laughter: 0, love: 0, shock: 0 });
+      if (db.playerStats && db.playerStats[id]) { set('playerStats', db.playerStats[id], 'cleared'); delete db.playerStats[id]; }
+    } else {
+      const progOld = isObj(data.progression) ? data.progression : {};
+      const prog = { ...progOld };
+      if (b.level !== undefined) {
+        const v = intIn(b.level, 1, 200); if (v === null) return json(res, 400, { error: 'bad-level' });
+        prog.level = v; set('level', progOld.level ?? null, v);
+      }
+      if (b.levelProgress !== undefined) {
+        const v = b.levelProgress;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v >= 1) return json(res, 400, { error: 'bad-levelProgress' });
+        prog.levelProgress = v; set('levelProgress', progOld.levelProgress ?? null, v);
+      }
+      if (b.ratings !== undefined) {
+        if (!isObj(b.ratings)) return json(res, 400, { error: 'bad-ratings' });
+        for (const [name, val] of Object.entries(b.ratings)) {
+          if (!RATING_PATHS[name]) return json(res, 400, { error: 'bad-rating-key' });
+          const v = intIn(val, -1000000, 1000000); if (v === null) return json(res, 400, { error: `bad-${name}` });
+          const e = ratingEntry(name);
+          set(`ratings.${name}`, e.rating ?? null, v);
+          e.rating = v;
+          if (name === 'fameSolo') fameWanted.soloFameRating = v;   // the Fame module overwrites the blob's solo Fame rating on every read
+        }
+      }
+      if (b.fame !== undefined) {
+        if (!isObj(b.fame)) return json(res, 400, { error: 'bad-fame' });
+        const FAME_ALIAS = { totalFameWins: 'fameWins', fameMatches: 'matches', newSoloFameRating: 'soloFameRating' };   // the heroStats names the panel shows
+        for (const [k0, val] of Object.entries(b.fame)) {
+          const k = FAME_ALIAS[k0] || k0;
+          if (!['soloFameRating', 'fameWins', 'matches'].includes(k)) return json(res, 400, { error: 'bad-fame-key' });
+          const v = intIn(val, k === 'soloFameRating' ? -1000000 : 0, 1000000); if (v === null) return json(res, 400, { error: `bad-${k}` });
+          fameWanted[k] = v;
+        }
+      }
+      if (b.level !== undefined || b.levelProgress !== undefined) data.progression = prog;
+      if (!Object.keys(nu).length && !Object.keys(fameWanted).length) return json(res, 400, { error: 'nothing-to-change' });
+    }
+    if (Object.keys(fameWanted).length && fame && typeof fame.adjust === 'function') {
+      // Only an account that already has Fame stats, or an explicit fame{} block, gets a Fame record created/changed.
+      const explicit = reset ? false : isObj(b.fame) && Object.keys(b.fame).length > 0;
+      let d = null;
+      try { d = fame.adjust(id, fameWanted, { create: explicit }); } catch { d = null; }
+      if (d && Object.keys(d.new || {}).length) { old.fame = d.old; nu.fame = d.new; }
+    }
+    db.appData[key] = { version: version + 1, data };
+    audit(admin.steamId, admin.name, reset ? 'reset-stats' : 'adjust', id, JSON.stringify({ old, new: nu }));
+    save();
+    return json(res, 200, { ok: true, version: version + 1, old, new: nu, profile: profileOf(id) });
   }
 
   function apiPost(admin, sub, b, res) {
     const m = store();
     let r;
+    if (sub === 'admins') {
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const id = scalar(b.steamId);
+      if (!/^\d{5,20}$/.test(id)) return json(res, 400, { error: 'bad-steam-id' });
+      if (isAdmin(id)) return json(res, 409, { error: 'already-admin' });
+      m.mods[id] = { addedBy: admin.steamId, at: nowIso(), name: nameOf(id) };
+      audit(admin.steamId, admin.name, 'mod-add', id, '');
+      save();
+      return json(res, 200, { ok: true, mod: { steamId: id, ...m.mods[id] } });
+    }
+    if ((r = sub.match(/^admins\/([^/]+)\/remove$/))) {
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const id = decodeURIComponent(r[1]);
+      if (owners().has(id)) return json(res, 400, { error: 'cannot-remove-owner' });
+      if (!Object.prototype.hasOwnProperty.call(m.mods, id)) return json(res, 404, { error: 'not-found' });
+      delete m.mods[id];
+      audit(admin.steamId, admin.name, 'mod-remove', id, '');
+      save();
+      return json(res, 200, { ok: true });
+    }
+    if ((r = sub.match(/^lobbies\/([^/]+)\/([a-z-]+)$/))) {
+      const action = r[2];
+      if (!LOBBY_ACTIONS.includes(action)) return json(res, 404, { error: 'not-found' });
+      const out = lobbyAction(admin, decodeURIComponent(r[1]), action, b);
+      return json(res, out.status, out.body);
+    }
+    if (sub === 'kv') {
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const key = typeof b.key === 'string' ? b.key : '';
+      if (!KV_ALLOW[key]) return json(res, 400, { error: 'not-allowed' });
+      const base = readBaseKv(readBaseRev());
+      if (!base || !(key in base)) return json(res, 400, { error: 'not-in-base' });
+      const bad = kvCheck(key, base[key], b.value);
+      if (bad) return json(res, 400, { error: bad });
+      const old = Object.prototype.hasOwnProperty.call(m.kv, key) ? m.kv[key] : base[key];
+      m.kv[key] = b.value;
+      m.kvRev += 1;
+      audit(admin.steamId, admin.name, 'kv-set', key, `${JSON.stringify(old)} -> ${JSON.stringify(b.value)}`);
+      save();
+      return json(res, 200, { ok: true, key, value: b.value, servedRev: servedRev() });
+    }
+    if ((r = sub.match(/^kv\/([A-Z0-9_]+)\/clear$/))) {
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const key = r[1];
+      if (!KV_ALLOW[key]) return json(res, 400, { error: 'not-allowed' });
+      if (!Object.prototype.hasOwnProperty.call(m.kv, key)) return json(res, 404, { error: 'not-overridden' });
+      const old = m.kv[key];
+      delete m.kv[key];
+      m.kvRev += 1;   // clients holding the overlaid file must refetch the plain one
+      audit(admin.steamId, admin.name, 'kv-clear', key, `${JSON.stringify(old)} -> base`);
+      save();
+      return json(res, 200, { ok: true, key, servedRev: servedRev() });
+    }
+    if ((r = sub.match(/^players\/([^/]+)\/(notes|warn|adjust|reset-stats)$/))) {
+      const id = decodeURIComponent(r[1]);
+      if (r[2] === 'adjust' || r[2] === 'reset-stats') return editPlayer(admin, id, b, r[2] === 'reset-stats', res);
+      if (!accounts()[id]) return json(res, 404, { error: 'not-found' });
+      if (r[2] === 'notes') {
+        const text = clip(b.text, 1000);
+        if (!text) return json(res, 400, { error: 'empty' });
+        m.seq += 1;
+        const note = { id: `n${m.seq}`, at: nowIso(), by: admin.steamId, byName: admin.name, text };
+        (m.notes[id] = m.notes[id] || []).push(note);
+        audit(admin.steamId, admin.name, 'note', id, text);
+        save();
+        return json(res, 200, { ok: true, note });
+      }
+      const reason = clip(b.reason, 200);
+      if (!reason) return json(res, 400, { error: 'empty' });
+      m.seq += 1;
+      const w = { id: `w${m.seq}`, at: nowIso(), by: admin.steamId, byName: admin.name, reason };
+      (m.warnings[id] = m.warnings[id] || []).push(w);
+      audit(admin.steamId, admin.name, 'warn', id, reason);
+      save();
+      return json(res, 200, { ok: true, warning: w });
+    }
     if ((r = sub.match(/^reports\/([^/]+)$/))) {
       const rp = m.reports.find((x) => x.id === decodeURIComponent(r[1]));
       if (!rp) return json(res, 404, { error: 'not-found' });
-      if (!['open', 'actioned', 'dismissed'].includes(b.status)) return json(res, 400, { error: 'bad-status' });
-      rp.status = b.status;
-      rp.resolvedBy = b.status === 'open' ? null : admin.steamId;
-      rp.resolvedAt = b.status === 'open' ? null : nowIso();
-      if (typeof b.note === 'string') rp.note = clip(b.note, 1000);
-      if (typeof b.matchId === 'string' && b.matchId) rp.matchId = clip(b.matchId, 64);
-      audit(admin.steamId, admin.name, 'report-status', rp.id, `${b.status}${rp.note ? `: ${rp.note}` : ''}`);
-      save();
-      return json(res, 200, { ok: true, report: rp });
+      return changeReport(admin, rp, b, res);
     }
     if (sub === 'bans') {
       const id = scalar(b.steamId);
       if (!ID_RE.test(id)) return json(res, 400, { error: 'bad-steam-id' });
-      if (admins().has(id)) return json(res, 403, { error: 'cannot-ban-admin' });
+      const role = roleOf(id);
+      if (role === 'owner' || (role === 'mod' && admin.role !== 'owner')) return json(res, 403, { error: 'cannot-ban-admin' });
       let hours = b.hours === null || b.hours === undefined || b.hours === '' ? 0 : Number(b.hours);
       if (!Number.isFinite(hours) || hours < 0 || hours > 87600) return json(res, 400, { error: 'bad-hours' });
       const ban = {
@@ -577,6 +1096,7 @@ function createModeration(opts = {}) {
       const id = decodeURIComponent(r[1]);
       const ban = m.bans[id];
       if (!banActive(ban)) return json(res, 404, { error: 'no-active-ban' });
+      if (isAdmin(id) && admin.role !== 'owner') return forbidOwnerOnly(res);
       ban.lifted = { by: admin.steamId, at: nowIso() };
       audit(admin.steamId, admin.name, 'unban', id, '');
       save();
@@ -699,7 +1219,7 @@ function createModeration(opts = {}) {
     return true;
   }
 
-  return { isBanned, banBody, filterPlayerMap, handleReport, handleReportApi, handleEvidence, handleWatchApi, onMatchEnd, handleHttp, isHostBlocked, kickEverywhere };
+  return { isBanned, banBody, filterPlayerMap, handleReport, handleReportApi, handleEvidence, handleWatchApi, onMatchEnd, handleHttp, isHostBlocked, kickEverywhere, isAdmin, roleOf, kvServe, reapplyLobbyOptions };
 }
 
 module.exports = { createModeration };

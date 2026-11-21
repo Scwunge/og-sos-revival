@@ -164,8 +164,17 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   // (PUBLIC_HOST is the official pool's address).
   const hostFor = (s) => (s.hosted && s.hosted.community ? s.host : publicHost || s.host);
   // Per-host player cap (community hosts choose their own) and the matching start minimum.
-  const maxFor = (s) => (s.hosted && s.hosted.maxPlayers) || config.MAX_PLAYERS;
-  const minFor = (s) => Math.min(startMin, Math.max(1, maxFor(s)));
+  // moderation: s.overrides = { minPlayers?, countdownSec?, maxPlayers? } set by admins (setLobbyOptions) win over the above.
+  const maxFor = (s) => {
+    const o = s.overrides && s.overrides.maxPlayers;
+    if (o) return Math.min(config.MAX_PLAYERS, Math.max(1, o));
+    return (s.hosted && s.hosted.maxPlayers) || config.MAX_PLAYERS;
+  };
+  const minFor = (s) => {
+    const o = s.overrides && s.overrides.minPlayers;
+    return Math.min(o || startMin, Math.max(1, maxFor(s)));
+  };
+  const countdownFor = (s) => (s.overrides && s.overrides.countdownSec !== undefined ? s.overrides.countdownSec * 1000 : countdownMs);
   const beaconUrl = () => config.BEACON_URL || publicHost || config.GAME_SERVER_HOST;
 
   const uname = (id) => getUname(id) || id;
@@ -269,6 +278,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     });
     s.countdownTimer = null; s.countdownEndsAt = null; s.countdownVote = false; s.countdownHeld = false; s.emptyTimer = null;
     s.state = 'waiting'; s.startedAt = null; s.endedAt = null; s.votes = new Set();
+    s.overrides = {}; s.locked = false;   // moderation lobby control
     hostedById.set(entry.sessionId, { s, entry });
     hostedMeta.set(entry.sessionId, { name: entry.name || DEFAULT_SERVER_NAME, region: entry.region || '', lastPoll: null, lastPollAny: null });
     return s;
@@ -368,6 +378,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
         map: s.opts.map || '',
         publicHost: entry.community ? '' : publicHost,
         community: !!entry.community, verified: !!entry.verified,
+        locked: !!s.locked, overrides: { ...s.overrides },
+        effective: { minPlayers: minFor(s), countdownSec: countdownFor(s) / 1000, maxPlayers: maxFor(s) }, maxCap: config.MAX_PLAYERS,
       };
     });
   }
@@ -562,7 +574,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (vote) { s.countdownVote = true; setCountdown(s, voteCountdownMs, 'vote'); }
     if (s.state === 'ended' || s.started) return;
     if (auto) {
-      setCountdown(s, countdownMs, 'minimum players reached');
+      setCountdown(s, countdownFor(s), 'minimum players reached');
       if (s.started) return;
       if (n >= maxFor(s) && s.countdownTimer) setCountdown(s, fullCountdownMs, 'session full');
     } else if (!vote && !(s.countdownVote && n >= voteMin)) cancelCountdown(s);
@@ -649,6 +661,48 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   }
   const endHosted = (id) => { const h = hostedById.get(String(id)); return h ? endSession(h.s, 'host') : null; };
   const forceStartHosted = (id) => { const h = hostedById.get(String(id)); return h ? startSession(h.s, 'forced') : null; };
+  // moderation: start the countdown now (default: override or START_COUNTDOWN_SECONDS). Errors: not-found | closed | no-players.
+  function countdownHosted(id, sec) {
+    const h = hostedById.get(String(id));
+    if (!h) return { error: 'not-found' };
+    const s = h.s;
+    if (s.state !== 'waiting' && s.state !== 'countdown') return { error: 'closed', state: s.state };
+    if (!s.players.size) return { error: 'no-players' };
+    const ms = (sec === undefined || sec === null ? countdownFor(s) : Math.max(0, Number(sec) * 1000));
+    setCountdown(s, ms, 'admin');
+    sendWaitingSummary(s);
+    return { result: true, state: s.state };
+  }
+  // moderation: { locked?, minPlayers?, countdownSec?, maxPlayers? }; null or '' clears an override. Returns
+  // { locked, overrides, effective } or { error: 'not-found' | 'bad-<field>' }.
+  function setLobbyOptions(id, o = {}) {
+    const h = hostedById.get(String(id));
+    if (!h) return { error: 'not-found' };
+    const s = h.s;
+    const blank = (v) => v === null || v === '';
+    const intIn = (v, lo, hi) => { const n = typeof v === 'string' ? Number(v) : v; return Number.isInteger(n) && n >= lo && n <= hi ? n : null; };
+    const next = { ...s.overrides };
+    if (o.maxPlayers !== undefined) {
+      if (blank(o.maxPlayers)) delete next.maxPlayers;
+      else { const n = intIn(o.maxPlayers, 1, config.MAX_PLAYERS); if (n === null) return { error: 'bad-maxPlayers' }; next.maxPlayers = n; }
+    }
+    const maxNow = next.maxPlayers || (s.hosted && s.hosted.maxPlayers) || config.MAX_PLAYERS;
+    if (o.minPlayers !== undefined) {
+      if (blank(o.minPlayers)) delete next.minPlayers;
+      else { const n = intIn(o.minPlayers, 1, maxNow); if (n === null) return { error: 'bad-minPlayers' }; next.minPlayers = n; }
+    }
+    if (o.countdownSec !== undefined) {
+      if (blank(o.countdownSec)) delete next.countdownSec;
+      else { const n = intIn(o.countdownSec, 0, 600); if (n === null) return { error: 'bad-countdownSec' }; next.countdownSec = n; }
+    }
+    if (o.locked !== undefined && typeof o.locked !== 'boolean') return { error: 'bad-locked' };
+    s.overrides = {};   // fixed key order
+    for (const k of ['minPlayers', 'countdownSec', 'maxPlayers']) if (next[k] !== undefined) s.overrides[k] = next[k];
+    if (o.locked !== undefined) s.locked = o.locked;
+    log(`hosted session ${s.id} options: locked=${s.locked} ${JSON.stringify(s.overrides)}`);
+    if (s.state === 'waiting' || s.state === 'countdown') afterSeatChange(s);
+    return { locked: !!s.locked, overrides: { ...s.overrides }, effective: { minPlayers: minFor(s), countdownSec: countdownFor(s) / 1000, maxPlayers: maxFor(s) } };
+  }
   const forceStartAll = () => [...hostedById.values()].map(({ s }) => ({ id: s.id, players: startSession(s, 'forced') }));
 
   // ---------- queue / matching ----------
@@ -716,7 +770,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   // Can new players be seated into this hosted session right now? (not ended; after the start only inside LATE_JOIN_SECONDS)
   function hostedOpen(s) {
-    if (s.state === 'ended') return false;
+    if (s.state === 'ended' || s.locked) return false;
     if (s.state !== 'started') return true;
     return lateJoinMs < 0 || (lateJoinMs > 0 && Date.now() - s.startedAt < lateJoinMs);
   }
@@ -1041,7 +1095,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, addWatcher, removeWatcher, listWatchers, watcherExpiry, watchToken, kickHosted, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, addWatcher, removeWatcher, listWatchers, watcherExpiry, watchToken, kickHosted, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, countdownHosted, setLobbyOptions, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
 module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };

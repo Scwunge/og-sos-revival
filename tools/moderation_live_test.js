@@ -2,13 +2,13 @@
 //   node tools/moderation_live_test.js [baseUrl]      (default http://127.0.0.1:7795)
 // The backend must run on loopback with OGSOS_ADMINS=<admin steam id> and OGSOS_ADMIN_DEV_LOGIN=1, and a throwaway state dir
 // (e.g. OGSOS_STATE_DIR / OGSOS_LOG_DIR in a temp folder), because this test bans and unbans test accounts.
-// Optional: OGSOS_TEST_ADMIN (default 76561198000000001). Uses test Steam ids 765611980000009xx only.
+// Optional: OGSOS_TEST_ADMIN (default 76561190000080001). Uses test Steam ids 765611900000809xx only.
 'use strict';
 const http = require('http');
 
 const BASE = new URL(process.argv[2] || 'http://127.0.0.1:7795');
-const ADMIN = process.env.OGSOS_TEST_ADMIN || '76561198000000001';
-const REPORTER = '76561198000000901', TARGET = '76561198000000902', BLOCK_IP = '203.0.113.77';
+const ADMIN = process.env.OGSOS_TEST_ADMIN || '76561190000080001';
+const REPORTER = '76561190000080901', TARGET = '76561190000080902', BLOCK_IP = '203.0.113.77';
 
 function req(method, path, { body, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
@@ -61,7 +61,8 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
     assert(/HttpOnly/.test(r.headers['set-cookie'][0]), 'HttpOnly');
   });
   await check('/admin/api/me', async () => {
-    const r = await A('GET', '/admin/api/me'); assert(r.status === 200 && r.body.steamId === ADMIN, r.text);
+    const r = await A('GET', '/admin/api/me'); assert(r.status === 200 && r.body.steamId === ADMIN && r.body.role === 'owner', r.text);
+    const d = await A('GET', '/admin/api/dashboard'); assert(d.status === 200 && d.body.reports && d.body.matches && Array.isArray(d.body.lobbies) && d.body.generatedAt, d.text);
   });
   await check('cookie tampering refused', async () => {
     const v = cookie.split('=')[1];
@@ -86,9 +87,10 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
     assert(l.status === 200 && l.body.length >= 2, l.text);
     rid = l.body[0].id;
     const d = await A('GET', `/admin/api/reports/${rid}`); assert(d.status === 200 && d.body.report.id === rid && d.body.target !== undefined, d.text);
-    const u = await A('POST', `/admin/api/reports/${rid}`, { status: 'actioned', note: 'live test' });
-    assert(u.status === 200 && u.body.report.status === 'actioned' && u.body.report.resolvedBy === ADMIN, u.text);
-    const a = await A('GET', '/admin/api/reports?status=actioned'); assert(a.body.some((x) => x.id === rid), 'now actioned');
+    const u = await A('POST', `/admin/api/reports/${rid}`, { status: 'resolved', note: 'live test' });
+    assert(u.status === 200 && u.body.report.status === 'resolved' && u.body.report.resolvedBy === ADMIN && u.body.report.notes[0].text === 'live test', u.text);
+    const a = await A('GET', '/admin/api/reports?status=resolved'); assert(a.body.some((x) => x.id === rid), 'now resolved');
+    const legacy = await A('GET', '/admin/api/reports?status=actioned'); assert(legacy.body.some((x) => x.id === rid), "'actioned' is still accepted as a filter");
   });
 
   await check('ban -> login refused 403 -> lift -> login ok', async () => {

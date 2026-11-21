@@ -5,7 +5,7 @@ const http = require('http');
 const { createModeration } = require('../server/admin');
 const { createMatchmaker } = require('../server/matchmaking');
 
-const ADMIN = '76561198000000001', ADMIN2 = '76561198000000009', P1 = '76561198000000011', P2 = '76561198000000012', P3 = '76561198000000013';
+const ADMIN = '76561190000080001', ADMIN2 = '76561190000080009', P1 = '76561190000080011', P2 = '76561190000080012', P3 = '76561190000080013';
 const SID = '11111111-2222-3333-4444-555555555555';
 const SECRET_TOKEN = 'lobby-secret-token-xyz';
 const ENTRY = { host: '127.0.0.1', port: 7777, sessionId: SID, sessionToken: SECRET_TOKEN, hostIds: ['hostacct'], name: 'T', region: 'eu' };
@@ -42,11 +42,11 @@ function makeEnv(extra = {}) {
   const T = { now: Date.parse('2026-06-01T12:00:00Z') };
   const saves = { n: 0 };
   const logs = [];
-  const db = { accounts: {}, appData: {}, tokens: {}, matches: [] };
-  for (const id of [ADMIN, ADMIN2, P1, P2, P3]) {
+  const db = extra.db || { accounts: {}, appData: {}, tokens: {}, matches: [] };
+  for (const id of (extra.db ? [] : [ADMIN, ADMIN2, P1, P2, P3])) {
     db.accounts[id] = { id, 'account-id': id, alias: `player-${id.slice(-4)}`, 'display-name': `Name${id.slice(-3)}`, created: '2026-01-01T00:00:00Z', 'last-access': `2026-05-0${id.slice(-1) === '1' ? 1 : 2}T00:00:00Z` };
   }
-  const { mm, mk, seat } = makeMm();
+  const { mm, mk, seat } = extra.mmx || makeMm();
   const env = { OGSOS_ADMINS: `${ADMIN}, ${ADMIN2}`, OGSOS_ADMIN_ORIGIN: 'http://127.0.0.1:7795', OGSOS_ADMIN_DEV_LOGIN: '1', ...(extra.env || {}) };
   const jwt = { 'tok-p1': P1, 'tok-p2': P2, 'tok-p3': P3 };
   const blocks = [];
@@ -56,6 +56,7 @@ function makeEnv(extra = {}) {
     progression: { playerSummary: (id) => (db.accounts[id] ? { matches: 1, kills: 2 } : {}) },
     matchmakers: { classic: mm, main: null }, env, now: () => T.now,
     onHostBlocksChanged: (l) => { blocks.length = 0; blocks.push(...l); },
+    ...(extra.modOpts || {}),
   });
   return { T, db, mod, env, mm, mk, seat, saves, logs, blocks };
 }
@@ -111,7 +112,7 @@ test('report: tolerant bodies (json, form, nested), rate limits, validation', as
   assert(e.mod.handleReport({}, P2, '{}', 'tok-p1').status === 200, 'window passes');
   // per reporter limit: 10 / hour
   const e2 = makeEnv();
-  const ids = Array.from({ length: 11 }, (_, i) => `7656119800000010${String(i).padStart(1, '0')}${i}`.slice(0, 17));
+  const ids = Array.from({ length: 11 }, (_, i) => `7656119000008010${String(i).padStart(1, '0')}${i}`.slice(0, 17));
   let last;
   for (const t of ids) last = e2.mod.handleReport({}, t, JSON.stringify({ target: t }), 'tok-p1');
   assert(last.status === 429, `eleventh report 429 got ${last.status}`);
@@ -239,7 +240,7 @@ test('players search, detail, reports list/detail/status', async () => {
   const ck = await login(e);
   e.db.matches.push({ id: 'm1', sessionId: SID, endedAt: new Date(e.T.now).toISOString(), durationSec: 60, players: [{ playerId: P2, kills: 1 }, { playerId: P3 }] });
   e.mod.handleReport({}, P2, JSON.stringify({ reason: 'cheat' }), 'tok-p1');
-  let r = await api(e, ck, 'GET', '/admin/api/me'); eq(r.json, { steamId: ADMIN, name: `Name${ADMIN.slice(-3)}` });
+  let r = await api(e, ck, 'GET', '/admin/api/me'); eq(r.json, { steamId: ADMIN, name: `Name${ADMIN.slice(-3)}`, role: 'owner' });
   r = await api(e, ck, 'GET', '/admin/api/players?q=');
   eq(r.json.length, 5); eq(r.json[0].id, P2 === r.json[0].id ? P2 : r.json[0].id);
   assert(r.json.find((x) => x.id === P2).reportsAgainst === 1 && r.json.find((x) => x.id === P2).matches === 1, 'counts');
@@ -254,14 +255,15 @@ test('players search, detail, reports list/detail/status', async () => {
   assert(r.json.report.id === id && r.json.priorReportsAgainstTarget === 0 && r.json.target && r.json.ban === null, r.text);
   assert((await api(e, ck, 'GET', '/admin/api/reports/zzz')).status === 404);
   r = await api(e, ck, 'POST', `/admin/api/reports/${id}`, { status: 'actioned', note: 'banned' });
-  assert(r.status === 200 && r.json.report.resolvedBy === ADMIN && r.json.report.note === 'banned', r.text);
+  assert(r.status === 200 && r.json.report.resolvedBy === ADMIN && r.json.report.status === 'resolved' && r.json.report.notes[0].text === 'banned', r.text);   // 'actioned' is accepted as 'resolved'
   eq((await api(e, ck, 'GET', '/admin/api/reports?status=open')).json.length, 0);
+  eq((await api(e, ck, 'GET', '/admin/api/reports?status=resolved')).json.length, 1);
   eq((await api(e, ck, 'GET', '/admin/api/reports?status=actioned')).json.length, 1);
   eq((await api(e, ck, 'GET', `/admin/api/reports?status=all&target=${P3}`)).json.length, 0);
   assert((await api(e, ck, 'POST', `/admin/api/reports/${id}`, { status: 'bogus' })).status === 400, 'bad status');
   eq((await api(e, ck, 'GET', '/admin/api/matches/m1')).json.id, 'm1');
   assert((await api(e, ck, 'GET', '/admin/api/matches/zz')).status === 404);
-  const au = (await api(e, ck, 'GET', '/admin/api/audit?limit=1')).json; eq(au.length, 1); eq(au[0].action, 'report-status');
+  const au = (await api(e, ck, 'GET', '/admin/api/audit?limit=1')).json; eq(au.length, 1); eq(au[0].action, 'report-note');
 });
 
 // ---- auth ----
@@ -498,6 +500,497 @@ test('watchers expire and survive a match end', async () => {
   assert(mm.removeWatcher(SID, 'w2') && !mm.removeWatcher(SID, 'w2'));
   eq(mm.addWatcher('nope', 'w'), null);
   mm.shutdown();
+});
+
+// ================= admin v2 =================
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { createFame } = require('../server/fame');
+const { createCommunityRegistry } = require('../server/community');
+const MOD = '76561190000000002', MOD2 = '76561190000000003';
+const post = (e, ck, p, body) => api(e, ck, 'POST', `/admin/api/${p}`, body);
+const get = (e, ck, p) => api(e, ck, 'GET', `/admin/api/${p}`);
+const lobbyState = (e) => e.mm.listHosted()[0].state;
+const newOwner = async (e) => login(e, ADMIN);
+async function addMod(e, ck, id = MOD) {
+  const r = await post(e, ck, 'admins', { steamId: id });
+  assert(r.status === 200, `add mod ${r.status} ${r.text}`);
+  return login(e, id);
+}
+
+// ---- roles ----
+test('roles: owner adds a mod, the mod logs in, owner-only endpoints 403, mod can lobby-control, owner removes the mod', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  eq((await get(e, ck, 'me')).json.role, 'owner');
+  // not yet an admin: dev-login refused
+  assert((await call(e.mod, 'GET', `/admin/dev-login?steamid=${MOD}`)).status === 403, 'not yet admin');
+  const mk = await addMod(e, ck);
+  eq((await get(e, mk, 'me')).json, { steamId: MOD, name: MOD, role: 'mod' });
+  assert(e.mod.isAdmin(MOD) && e.mod.roleOf(MOD) === 'mod' && e.mod.roleOf(ADMIN) === 'owner' && e.mod.roleOf(P1) === null, 'roleOf / isAdmin');
+  eq((await get(e, mk, 'admins')).json.mods.map((x) => x.steamId), [MOD]);
+  eq((await get(e, mk, 'admins')).json.owners.map((x) => x.steamId).sort(), [ADMIN, ADMIN2].sort());
+  assert((await post(e, ck, 'admins', { steamId: MOD })).status === 409, 'duplicate');
+  assert((await post(e, ck, 'admins', { steamId: ADMIN2 })).status === 409, 'owner already admin');
+  assert((await post(e, ck, 'admins', { steamId: 'abc' })).status === 400, 'bad id');
+  // owner-only for a mod
+  let r = await post(e, mk, 'admins', { steamId: MOD2 }); eq([r.status, r.json], [403, { error: 'owner-only' }]);
+  r = await post(e, mk, `admins/${MOD}/remove`, {}); eq(r.status, 403);
+  r = await post(e, mk, 'kv', { key: 'UE_CLIENT_MOTD', value: 'x' }); eq([r.status, r.json], [403, { error: 'owner-only' }]);
+  r = await post(e, mk, 'kv/UE_CLIENT_MOTD/clear', {}); eq(r.status, 403);
+  // mod can ban a normal player and lobby-control; cannot ban owners or mods
+  r = await post(e, mk, 'bans', { steamId: P1, hours: 1, code: 'spam', reason: 'x' }); eq(r.status, 200);
+  r = await post(e, mk, 'bans', { steamId: ADMIN2, hours: 1 }); eq([r.status, r.json.error], [403, 'cannot-ban-admin']);
+  await post(e, ck, 'admins', { steamId: MOD2 });
+  r = await post(e, mk, 'bans', { steamId: MOD2, hours: 1 }); eq([r.status, r.json.error], [403, 'cannot-ban-admin']);
+  r = await post(e, ck, 'bans', { steamId: ADMIN2 }); eq([r.status, r.json.error], [403, 'cannot-ban-admin']);   // owners are never bannable
+  r = await post(e, ck, 'bans', { steamId: MOD2, hours: 1, code: 'other' }); eq(r.status, 200);                 // an owner can ban a mod
+  r = await post(e, mk, `bans/${MOD2}/lift`, {}); eq([r.status, r.json.error], [403, 'owner-only']);
+  e.mm.markHostPolled(SID);
+  r = await post(e, mk, `lobbies/${SID}/lock`, {}); eq(r.status, 200);
+  assert((await get(e, mk, 'audit?action=lobby-lock')).json[0].by === MOD, 'audited as the mod');
+  // remove: the mod's existing cookie stops working at once
+  eq((await post(e, ck, `admins/${MOD}/remove`, {})).status, 200);
+  eq((await get(e, mk, 'me')).status, 401);
+  eq((await post(e, ck, `admins/${MOD}/remove`, {})).status, 404);
+  eq((await post(e, ck, `admins/${ADMIN2}/remove`, {})).status, 400);
+  eq(e.db.moderation.audit.filter((x) => x.action === 'mod-add' || x.action === 'mod-remove').map((x) => x.action), ['mod-add', 'mod-add', 'mod-remove']);
+});
+
+// ---- lobby control ----
+test('lobby control: force-start, countdown, options, lock/unlock, end, reset, validation, audit', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  const c1 = e.mk(P1); e.seat(c1);
+  const url = (a) => `lobbies/${SID}/${a}`;
+  eq(lobbyState(e), 'waiting');
+  let r = await get(e, ck, 'servers');
+  const sv = r.json.servers[0];
+  eq([sv.locked, sv.overrides, sv.effective, sv.playerCount], [false, {}, { minPlayers: 4, countdownSec: 30, maxPlayers: 8 }, 1]);
+  // csrf + unknown
+  eq((await api(e, ck, 'POST', `/admin/api/${url('lock')}`, {}, false)).status, 403);
+  eq((await post(e, ck, 'lobbies/zzzzzzzz-nope/lock', {})).status, 404);
+  eq((await post(e, ck, url('explode'), {})).status, 404);
+  // countdown with an explicit time
+  r = await post(e, ck, url('countdown'), { sec: 20 });
+  assert(r.status === 200 && r.json.ok && r.json.lobby.state === 'countdown', r.text);
+  const ms = r.json.lobby.countdownEndsAt - Date.now();
+  assert(ms > 15000 && ms <= 20500, `countdownEndsAt ${r.json.lobby.countdownEndsAt}`);
+  eq((await post(e, ck, url('countdown'), { sec: 601 })).json.error, 'bad-sec');
+  eq((await post(e, ck, url('countdown'), { sec: 1.5 })).status, 400);
+  // force start with 1 seated
+  r = await post(e, ck, url('force-start'), {});
+  assert(r.status === 200 && r.json.lobby.state === 'started' && r.json.lobby.players === 1, r.text);
+  assert(c1.msgs.some((m) => m.type === 'session-started'), 'seated player got session-started');
+  r = await post(e, ck, url('force-start'), {}); eq([r.status, r.json.error], [409, 'closed']);
+  r = await post(e, ck, url('countdown'), {}); eq([r.status, r.json.error], [409, 'closed']);
+  // end -> ended, again -> 409
+  r = await post(e, ck, url('end'), {}); eq([r.status, r.json.lobby.state], [200, 'ended']);
+  r = await post(e, ck, url('end'), {}); eq(r.status, 409);
+  // reset -> waiting, nobody seated: force-start / countdown refuse (409 no-players)
+  r = await post(e, ck, url('reset'), {}); eq([r.status, r.json.lobby.state], [200, 'waiting']);
+  e.mm.markHostPolled(SID);
+  r = await post(e, ck, url('force-start'), {}); eq([r.status, r.json.error], [409, 'no-players']);
+  eq(lobbyState(e), 'waiting', 'matchmaker unchanged');
+  r = await post(e, ck, url('countdown'), {}); eq([r.status, r.json.error], [409, 'no-players']);
+  // options: lowering the minimum triggers the countdown (4 needed, 1 seated)
+  const c2 = e.mk(P2); e.seat(c1); e.seat(c2);
+  eq(lobbyState(e), 'waiting');
+  eq(e.mm.listHosted()[0].players, 2);
+  r = await post(e, ck, url('options'), { minPlayers: 2, countdownSec: 15 });
+  assert(r.status === 200 && r.json.lobby.state === 'countdown', r.text);
+  eq(r.json.lobby.overrides, { minPlayers: 2, countdownSec: 15 });
+  eq(r.json.lobby.effective, { minPlayers: 2, countdownSec: 15, maxPlayers: 8 });
+  assert(r.json.lobby.countdownEndsAt - Date.now() <= 15500 && r.json.lobby.countdownEndsAt - Date.now() > 10000, 'uses the override countdown');
+  // raising it back (clearing) cancels the countdown again
+  r = await post(e, ck, url('options'), { minPlayers: null, countdownSec: '' });
+  eq([r.json.lobby.state, r.json.lobby.overrides], ['waiting', {}]);
+  eq(e.db.moderation.lobbyOptions[SID], undefined, 'nothing stored when nothing is overridden');
+  // validation
+  eq((await post(e, ck, url('options'), { minPlayers: 0 })).json.error, 'bad-minPlayers');
+  eq((await post(e, ck, url('options'), { minPlayers: 9 })).json.error, 'bad-minPlayers');
+  eq((await post(e, ck, url('options'), { maxPlayers: 9 })).json.error, 'bad-maxPlayers');
+  eq((await post(e, ck, url('options'), { countdownSec: -1 })).json.error, 'bad-countdownSec');
+  eq((await post(e, ck, url('options'), { minPlayers: 'x' })).json.error, 'bad-minPlayers');
+  eq((await post(e, ck, url('options'), {})).json.error, 'no-options');
+  r = await post(e, ck, url('options'), { maxPlayers: 3, minPlayers: 3 });
+  eq(r.json.lobby.effective.maxPlayers, 3); eq(r.json.lobby.maxPlayers, 3);
+  r = await post(e, ck, url('options'), { maxPlayers: 2 });
+  eq([r.status, r.json.lobby.effective.minPlayers, r.json.lobby.effective.maxPlayers], [200, 2, 2], 'the minimum is clamped to the maximum');
+  await post(e, ck, url('options'), { maxPlayers: null, minPlayers: null });
+  // lock / unlock
+  r = await post(e, ck, url('lock'), {}); eq([r.status, r.json.lobby.locked, r.json.lobby.lateJoinOpen], [200, true, false]);
+  const c3 = e.mk(P3); e.seat(c3);
+  assert(!c3.msgs.some((m) => m.type === 'session'), 'locked: find-session is not seated here');
+  eq(e.mm.listHosted()[0].players, 2);
+  eq(e.mm.setJoinHint(SID, P3).error, 'closed');
+  r = await post(e, ck, url('unlock'), {}); eq([r.json.lobby.locked, r.json.lobby.lateJoinOpen], [false, true]);
+  assert(!e.mm.setJoinHint(SID, P3).error, 'join hint works after unlock');
+  eq(e.db.moderation.lobbyOptions[SID], undefined);
+  // audit
+  const acts = e.db.moderation.audit.filter((x) => x.action.startsWith('lobby-')).map((x) => x.action);
+  for (const a of ['lobby-countdown', 'lobby-force-start', 'lobby-end', 'lobby-reset', 'lobby-options', 'lobby-lock', 'lobby-unlock']) assert(acts.includes(a), `audit ${a}`);
+  const od = e.db.moderation.audit.find((x) => x.action === 'lobby-options');
+  assert(od.target === SID && od.detail.includes('->') && od.detail.includes('minPlayers'), od.detail);
+});
+
+test('lobby overrides persist in the db and are re-applied after a restart', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  assert((await post(e, ck, `lobbies/${SID}/options`, { minPlayers: 2, countdownSec: 7, maxPlayers: 5 })).status === 200);
+  assert((await post(e, ck, `lobbies/${SID}/lock`, {})).status === 200);
+  eq(e.db.moderation.lobbyOptions[SID], { locked: true, overrides: { minPlayers: 2, countdownSec: 7, maxPlayers: 5 } });
+  // "restart": a fresh matchmaker and a new moderation over the same db
+  const e2 = makeEnv({ db: JSON.parse(JSON.stringify(e.db)) });
+  const l = e2.mm.listHosted()[0];
+  eq([l.locked, l.overrides, l.effective, l.lateJoinOpen], [true, { minPlayers: 2, countdownSec: 7, maxPlayers: 5 }, { minPlayers: 2, countdownSec: 7, maxPlayers: 5 }, false]);
+  // re-applied for a session that appears later (community host re-register)
+  const e3 = makeEnv({ db: JSON.parse(JSON.stringify(e.db)) });
+  e3.db.moderation.lobbyOptions['aaaaaaaa-0000-4000-8000-000000000009'] = { locked: true, overrides: { minPlayers: 1 } };
+  eq(e3.mod.reapplyLobbyOptions('aaaaaaaa-0000-4000-8000-000000000009'), 0, 'unknown session: nothing applied, entry kept');
+  assert(e3.db.moderation.lobbyOptions['aaaaaaaa-0000-4000-8000-000000000009'], 'entry kept');
+});
+
+// ---- dashboard ----
+test('dashboard: counts', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  const c1 = e.mk(P1); e.seat(c1); e.mk(P2);
+  const iso = (ms) => new Date(e.T.now - ms).toISOString();
+  e.db.matches.push({ id: 'old', sessionId: SID, endedAt: iso(20 * 86400e3), players: [] }, { id: 'wk', sessionId: SID, endedAt: iso(3 * 86400e3), players: [] },
+    { id: 'td', sessionId: SID, endedAt: iso(1000), players: [] });   // e.T.now is 12:00 UTC: 1 s ago is today
+  e.mod.handleReport({}, P2, '{}', 'tok-p1'); e.mod.handleReport({}, P3, '{}', 'tok-p1');
+  await post(e, ck, 'reports/r2', { status: 'investigating' });
+  await post(e, ck, 'bans', { steamId: P3, hours: 1 });
+  const d = (await get(e, ck, 'dashboard')).json;
+  eq(d.playersOnline, { classic: 2, main: 0 }); eq(d.seated, 1); eq(d.queue.main, 0);
+  eq(d.matches, { today: 1, week: 2 }); eq(d.reports, { open: 1, investigating: 1 }); eq(d.bansActive, 1);
+  eq(d.hosts, { up: 1, down: 0 });
+  eq(d.lobbies.length, 1);
+  const l = d.lobbies[0];
+  eq([l.id, l.game, l.name, l.state, l.players, l.maxPlayers, l.online, l.locked, l.community, l.verified, l.countdownEndsAt], [SID, 'classic', 'T', 'waiting', 1, 8, true, false, false, false, null]);
+  assert(typeof l.lastSeenSec === 'number' && d.generatedAt, 'lastSeenSec, generatedAt');
+});
+
+// ---- players ----
+const mkBlob = () => ({ version: 8, permissions: { allowCheats: false }, social: { mutedPlayers: [] },
+  stats: { objectives: { classic: { totalGamesPlayed: 9, totalEscapes: 3 } }, social: { totalFameWins: 2 }, hero: { totalLoveFeedbackReceived: 4 } },
+  progression: { level: 4, levelProgress: 0.5 }, badges: { amusing: 3 },
+  ratings: { soloRatings: { fame: { leaderboardId: 'fame_solo', matchesPlayed: 5, rating: 11 }, survival: { leaderboardId: 'survival_solo', matchesPlayed: 5, rating: 22 } }, toxicity: { leaderboardId: 'toxicity', matchesPlayed: 5, rating: 33 } } });
+
+test('players: profile, notes, warnings, kicks; adjust refused while seated, version bump, audit old/new; reset-stats', async () => {
+  const fameDb = { heroStats: { [P1]: { anger: 1, applause: 2, laughter: 0, love: 4, shock: 0, fame: 9, fameWins: 2, matches: 5, soloFameRating: 11, prevSoloFameRating: 6 } } };
+  const db = { accounts: {}, appData: {}, tokens: {}, matches: [], ...fameDb };
+  for (const id of [ADMIN, ADMIN2, P1, P2, P3]) db.accounts[id] = { id, alias: `a${id.slice(-3)}`, 'display-name': `Name${id.slice(-3)}` };
+  const fame = createFame({ db, saveDb: () => {}, displayName: (id) => id });
+  const e = makeEnv({ db, modOpts: { fame } });
+  const ck = await newOwner(e);
+  db.appData[`${P1}/sostest`] = { version: 5, data: mkBlob() };
+  db.appData[`${P3}/sostest`] = { version: 2, data: mkBlob() };
+  db.playerStats = { [P1]: { matches: 3, kills: 4 } };
+  let r = await get(e, ck, `players/${P1}`);
+  const pf = r.json.profile;
+  eq([pf.level, pf.levelProgress, pf.xpToNext, pf.xpIntoLevel], [4, 0.5, 2400, 1200]);   // level 4 needs 2400 XP
+  eq(pf.ratings, { fameSolo: 11, fameDuo: null, survivalSolo: 22, survivalDuo: null, toxicity: 33 });
+  eq(pf.fame.soloFameRating, 11);
+  eq((await get(e, ck, `players/${P2}`)).json.profile.level, null, 'no blob: nulls');
+  // notes / warn
+  eq((await post(e, ck, `players/${P1}/notes`, { text: '' })).status, 400);
+  r = await post(e, ck, `players/${P1}/notes`, { text: 'n'.repeat(1500) });
+  assert(r.status === 200 && r.json.note.text.length === 1000 && r.json.note.by === ADMIN && r.json.note.id, r.text);
+  await post(e, ck, `players/${P1}/notes`, { text: 'second' });
+  eq((await post(e, ck, `players/${P1}/warn`, { reason: '' })).status, 400);
+  r = await post(e, ck, `players/${P1}/warn`, { reason: 'w'.repeat(300) });
+  assert(r.status === 200 && r.json.warning.reason.length === 200, r.text);
+  eq((await post(e, ck, 'players/nobody/notes', { text: 'x' })).status, 404);
+  const d = (await get(e, ck, `players/${P1}`)).json;
+  eq(d.notes.map((x) => x.text.length > 10 ? 'long' : x.text), ['second', 'long']);
+  eq(d.warnings.length, 1); eq(d.warnings[0].byName, `Name${ADMIN.slice(-3)}`);
+  assert(e.db.moderation.audit.some((x) => x.action === 'note') && e.db.moderation.audit.some((x) => x.action === 'warn'), 'audited');
+  // adjust refused while seated, and while watching
+  e.mm.markHostPolled(SID);
+  const c1 = e.mk(P1); e.seat(c1);
+  r = await post(e, ck, `players/${P1}/adjust`, { level: 9 });
+  eq([r.status, r.json.error, r.json.sessionId], [409, 'player-in-lobby', SID]);
+  eq((await post(e, ck, `players/${P1}/reset-stats`, {})).status, 409);
+  eq(db.appData[`${P1}/sostest`].version, 5, 'untouched');
+  assert((await post(e, ck, 'spectate', { sessionId: SID, steamId: ADMIN2 })).status === 200);
+  eq((await post(e, ck, `players/${ADMIN2}/adjust`, { level: 3 })).json.error, 'player-in-lobby');
+  await post(e, ck, 'spectate/stop', { sessionId: SID, steamId: ADMIN2 });
+  assert((await post(e, ck, 'kick', { sessionId: SID, playerId: P1, reason: 'kicked for test' })).status === 200);
+  eq((await get(e, ck, `players/${P1}`)).json.kicks.length, 1);
+  // adjust
+  for (const [b, err] of [[{ level: 0 }, 'bad-level'], [{ level: 1.5 }, 'bad-level'], [{ level: '5' }, 'bad-level'], [{ levelProgress: 1 }, 'bad-levelProgress'],
+    [{ levelProgress: -0.1 }, 'bad-levelProgress'], [{ ratings: { bogus: 1 } }, 'bad-rating-key'], [{ ratings: { toxicity: 'x' } }, 'bad-toxicity'], [{ ratings: [] }, 'bad-ratings'], [{ fame: { nope: 1 } }, 'bad-fame-key'], [{}, 'nothing-to-change']]) {
+    r = await post(e, ck, `players/${P1}/adjust`, b); eq([r.status, r.json.error], [400, err], JSON.stringify(b));
+  }
+  eq(db.appData[`${P1}/sostest`].version, 5, 'failed edits changed nothing');
+  r = await post(e, ck, `players/${P1}/adjust`, { level: 10, levelProgress: 0.25, ratings: { toxicity: 40, survivalSolo: 50, fameSolo: 60 } });
+  assert(r.status === 200 && r.json.version === 6, r.text);
+  const blob = db.appData[`${P1}/sostest`];
+  eq(blob.version, 6);
+  eq([blob.data.progression, blob.data.ratings.toxicity.rating, blob.data.ratings.soloRatings.survival.rating, blob.data.ratings.soloRatings.fame.rating], [{ level: 10, levelProgress: 0.25 }, 40, 50, 60]);
+  eq(blob.data.permissions, { allowCheats: false }, 'rest of the blob kept');
+  eq(db.heroStats[P1].soloFameRating, 60, 'Fame module source adjusted (it overwrites the blob rating on every read)');
+  // what the game host reads on GET is what we set
+  eq(fame.applyToBlob(P1, blob.data).ratings.soloRatings.fame.rating, 60);
+  const ad = e.db.moderation.audit.filter((x) => x.action === 'adjust').pop();
+  const det = JSON.parse(ad.detail);
+  eq(ad.target, P1); eq(det.old.level, 4); eq(det.new.level, 10); eq(det.old['ratings.toxicity'], 33); eq(det.new['ratings.fameSolo'], 60); eq(det.old.fame.soloFameRating, 11);
+  eq(r.json.profile.level, 10);
+  // a player with no Fame stats: only the blob changes, no hero stats record is created
+  r = await post(e, ck, `players/${P3}/adjust`, { ratings: { fameSolo: 7 } });
+  eq(r.status, 200); eq(db.appData[`${P3}/sostest`].data.ratings.soloRatings.fame.rating, 7); eq(db.heroStats[P3], undefined);
+  r = await post(e, ck, `players/${P3}/adjust`, { fame: { soloFameRating: 70, fameWins: 1, matches: 2 } });
+  eq(r.status, 200); eq(db.heroStats[P3].soloFameRating, 70, 'explicit fame block creates the record');
+  // reset-stats
+  r = await post(e, ck, `players/${P1}/reset-stats`, {});
+  assert(r.status === 200 && r.json.version === 7, r.text);
+  const z = db.appData[`${P1}/sostest`].data;
+  eq(z.progression, { level: 1, levelProgress: 0 });
+  eq([z.stats.objectives.classic.totalGamesPlayed, z.stats.hero.totalLoveFeedbackReceived, z.badges.amusing, z.ratings.soloRatings.fame.rating, z.ratings.soloRatings.fame.matchesPlayed, z.ratings.toxicity.rating], [0, 0, 0, 0, 0, 0]);
+  eq(z.ratings.soloRatings.fame.leaderboardId, 'fame_solo');
+  eq(z.permissions, { allowCheats: false }); eq(z.social, { mutedPlayers: [] }, 'permissions and social kept');
+  eq(db.playerStats[P1], undefined, 'db.playerStats cleared');
+  eq(db.heroStats[P1].soloFameRating, 0); eq(db.heroStats[P1].fameWins, 0);
+  eq(fame.applyToBlob(P1, z).ratings.soloRatings.fame.rating, 0, 'no stale Fame comes back through the blob');
+  assert(JSON.parse(e.db.moderation.audit.filter((x) => x.action === 'reset-stats').pop().detail).old.progression.level === 10, 'reset audited with old level');
+  eq((await post(e, ck, 'players/nobody/adjust', { level: 2 })).status, 404);
+  // no blob yet: adjust creates one (version 2, like a first host write after the default version 1)
+  r = await post(e, ck, `players/${P2}/adjust`, { level: 3 });
+  eq([r.status, db.appData[`${P2}/sostest`].version], [200, 2]);
+  // a mod may adjust too
+  const mk = await addMod(e, ck);
+  eq((await post(e, mk, `players/${P2}/adjust`, { level: 4 })).status, 200);
+  eq((await post(e, mk, `players/${P2}/reset-stats`, {})).status, 200);
+});
+
+// ---- matches ----
+test('matches: list with filters, detail with server and linked reports', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  const t0 = Date.parse('2026-05-30T10:00:00Z');
+  for (let i = 0; i < 5; i++) {
+    e.db.matches.push({ id: `m${i}`, sessionId: i < 4 ? SID : 'other-session-1', startedAt: new Date(t0 + i * 3600e3).toISOString(), endedAt: new Date(t0 + i * 3600e3 + 600e3).toISOString(), durationSec: 600,
+      players: [{ playerId: P1, kills: i, deaths: 1, damageDealt: 10 * i, survivalSec: 5, escaped: false }, ...(i % 2 ? [{ playerId: P2, kills: 9, name: 'Bob' }] : [])] });
+  }
+  let r = await get(e, ck, 'matches');
+  eq(r.json.map((x) => x.id), ['m4', 'm3', 'm2', 'm1', 'm0']);
+  eq(r.json[0], { id: 'm4', sessionId: 'other-session-1', server: null, startedAt: new Date(t0 + 4 * 3600e3).toISOString(), endedAt: new Date(t0 + 4 * 3600e3 + 600e3).toISOString(), durationSec: 600, players: 1, top: { kills: 4, name: `Name${P1.slice(-3)}`, playerId: P1 } });
+  eq(r.json[1].server, 'T'); eq(r.json[1].top, { kills: 9, name: 'Bob', playerId: P2 }); eq(r.json[1].players, 2);
+  eq((await get(e, ck, 'matches?limit=2')).json.map((x) => x.id), ['m4', 'm3']);
+  eq((await get(e, ck, `matches?player=${P2}`)).json.map((x) => x.id), ['m3', 'm1']);
+  eq((await get(e, ck, `matches?session=${SID}`)).json.map((x) => x.id), ['m3', 'm2', 'm1', 'm0']);
+  eq((await get(e, ck, `matches?before=${encodeURIComponent(e.db.matches[2].endedAt)}`)).json.map((x) => x.id), ['m1', 'm0']);
+  // detail + reports linking the match
+  e.mod.handleReport({}, P2, JSON.stringify({ sessionId: SID }), 'tok-p1');
+  await post(e, ck, 'reports/r1', { matchId: 'm3' });
+  r = await get(e, ck, 'matches/m3');
+  assert(r.status === 200 && r.json.id === 'm3' && r.json.server.name === 'T' && r.json.server.game === 'classic' && r.json.server.community === false, r.text);
+  eq(r.json.reports.map((x) => x.id), ['r1']);
+  eq(r.json.players[1].kills, 9); assert(r.json.players[0].damageDealt === 30, 'numeric fields kept');
+  eq((await get(e, ck, 'matches/m0')).json.reports, []);
+  eq((await get(e, ck, 'matches/m4')).json.server, null);
+  eq((await get(e, ck, 'players/' + P2)).json.matches[0].matchId, 'm3');
+  eq((await get(e, ck, 'players/' + P2)).json.matches[0].server, 'T');
+});
+
+// ---- reports workflow ----
+test('reports: statuses, assignee, notes thread, filters, links; stored actioned/note migrate on load', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  e.mod.handleReport({}, P2, JSON.stringify({ reason: 'cheat' }), 'tok-p1');
+  e.mod.handleReport({}, P3, JSON.stringify({ reason: 'rude' }), 'tok-p1');
+  let r = await get(e, ck, 'reports/r1');
+  eq(r.json.report.notes, []); eq(r.json.report.assignee, null);
+  eq(r.json.links, { match: null, target: P2, reporter: P1, spectate: { sessionId: null, live: false } });
+  eq((await post(e, ck, 'reports/r1', { status: 'bogus' })).json.error, 'bad-status');
+  eq((await post(e, ck, 'reports/r1', {})).status, 400);
+  r = await post(e, ck, 'reports/r1', { status: 'investigating', assignee: 'me', note: 'looking' });
+  assert(r.status === 200 && r.json.report.status === 'investigating' && r.json.report.assignee.id === ADMIN && r.json.report.notes.length === 1 && r.json.report.resolvedBy === null, r.text);
+  eq(r.json.report.notes[0].by, ADMIN); eq(r.json.report.notes[0].text, 'looking'); assert(r.json.report.notes[0].at && r.json.report.notes[0].byName, 'note fields');
+  eq((await get(e, ck, 'reports?status=investigating')).json.map((x) => x.id), ['r1']);
+  eq((await get(e, ck, 'reports?status=all&assignee=me')).json.map((x) => x.id), ['r1']);
+  eq((await get(e, ck, 'reports?status=all&assignee=none')).json.map((x) => x.id), ['r2']);
+  eq((await get(e, ck, `reports?status=all&assignee=${ADMIN2}`)).json.length, 0);
+  eq((await post(e, ck, 'reports/r1', { assignee: P1 })).json.error, 'bad-assignee');
+  r = await post(e, ck, 'reports/r1', { assignee: ADMIN2 }); eq(r.json.report.assignee, { id: ADMIN2, name: `Name${ADMIN2.slice(-3)}` });
+  r = await post(e, ck, 'reports/r1', { assignee: null }); eq(r.json.report.assignee, null);
+  r = await post(e, ck, 'reports/r1', { status: 'dismissed', note: 'not enough' });
+  eq([r.json.report.status, r.json.report.resolvedBy, r.json.report.notes.length], ['dismissed', ADMIN, 2]);
+  r = await post(e, ck, 'reports/r1', { status: 'open' }); eq([r.json.report.resolvedBy, r.json.report.resolvedAt], [null, null]);
+  r = await post(e, ck, 'reports/r2', { status: 'resolved' }); eq(r.json.report.status, 'resolved');
+  eq((await get(e, ck, 'reports?status=resolved')).json.map((x) => x.id), ['r2']);
+  const au = e.db.moderation.audit;
+  const st = au.filter((x) => x.action === 'report-status').map((x) => x.detail);
+  eq(st, ['open -> investigating', 'investigating -> dismissed', 'dismissed -> open', 'open -> resolved']);
+  eq(au.filter((x) => x.action === 'report-assign').map((x) => x.detail), [`none -> ${ADMIN}`, `${ADMIN} -> ${ADMIN2}`, `${ADMIN2} -> none`]);
+  eq(au.filter((x) => x.action === 'report-note').map((x) => x.detail), ['looking', 'not enough']);
+  // links with a live session
+  e.mm.markHostPolled(SID);
+  const c1 = e.mk(P1); e.seat(c1);
+  e.mod.handleReport({}, P2, JSON.stringify({ sessionId: SID }), 'tok-p1');
+  await post(e, ck, `lobbies/${SID}/force-start`, {});
+  eq((await get(e, ck, 'reports/r3')).json.links.spectate, { sessionId: SID, live: true });
+  // migration: an old db with 'actioned' + a single note string
+  const old = { accounts: {}, appData: {}, tokens: {}, matches: [], moderation: { reports: [
+    { id: 'r1', at: '2026-01-01T00:00:00Z', status: 'actioned', reporter: { id: P1 }, target: { id: P2 }, resolvedBy: ADMIN, resolvedAt: '2026-01-02T00:00:00Z', note: 'banned them' },
+    { id: 'r2', at: '2026-01-01T00:00:00Z', status: 'open', reporter: { id: P1 }, target: { id: P2 }, resolvedBy: null, resolvedAt: null, note: '' }], seq: 2 } };
+  for (const id of [ADMIN, P1, P2]) old.accounts[id] = { id, 'display-name': `Name${id.slice(-3)}` };
+  const e2 = makeEnv({ db: old });
+  const ck2 = await login(e2);
+  const [a, b] = old.moderation.reports;
+  eq([a.status, a.assignee, a.notes.length, a.notes[0].text, a.notes[0].by, 'note' in a], ['resolved', null, 1, 'banned them', ADMIN, false]);
+  eq([b.notes, b.assignee, 'note' in b], [[], null, false]);
+  eq((await get(e2, ck2, 'reports?status=resolved')).json.map((x) => x.id), ['r1']);
+});
+
+// ---- KV overlay ----
+function kvTmp() {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ogsos-kv-'));
+  const src = path.join(__dirname, '..', 'data', 'kv-classic');
+  for (const f of fs.readdirSync(src)) fs.copyFileSync(path.join(src, f), path.join(d, f));
+  return d;
+}
+test('kv overlay: owner-only writes, allowlist, type checks, served with a new revision, clear restores, survives restart', async () => {
+  const dir = kvTmp();
+  const baseRev = Number(fs.readFileSync(path.join(dir, 'live-rev.txt'), 'utf8').trim());
+  const baseFile = JSON.parse(fs.readFileSync(path.join(dir, `runtime-${baseRev}.json`), 'utf8'));
+  const e = makeEnv({ modOpts: { kvDir: dir } });
+  const ck = await newOwner(e);
+  const mk = await addMod(e, ck);
+  eq(e.mod.kvServe('live-rev.txt'), null, 'no overlay: the plain files are served by server.js');
+  let r = await get(e, mk, 'kv');   // any admin can view
+  assert(r.status === 200 && r.json.keys.length >= 5, r.text);
+  const motd = r.json.keys.find((k) => k.key === 'UE_CLIENT_MOTD');
+  eq([motd.base, motd.value, motd.overridden, motd.type], [baseFile.UE_CLIENT_MOTD, baseFile.UE_CLIENT_MOTD, false, 'string']);
+  assert(motd.description, 'description');
+  assert(!r.json.keys.some((k) => /TEST_SERVER_ENABLED|DIRECTOR|ROLES|ENDPOINT|URL/.test(k.key)), 'no gate/auth keys offered');
+  // validation
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_TEST_SERVER_ENABLED', value: false })).status, 400);
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_DIRECTOR_USERS', value: ['x'] })).json.error, 'not-allowed');
+  eq((await post(e, ck, 'kv', { key: 'NOPE', value: 1 })).json.error, 'not-allowed');
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_MOTD', value: 5 })).json.error, 'bad-value');
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_MOTD', value: 'x'.repeat(501) })).json.error, 'bad-value');
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_DUOS_QUEUE_WARNING_TIME_SEC', value: '30' })).json.error, 'bad-value');
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_DUOS_QUEUE_WARNING_TIME_SEC', value: 99999 })).json.error, 'bad-value');
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_VOTING_ENABLED', value: 'yes' })).json.error, 'bad-value');
+  eq((await post(e, ck, 'kv/UE_CLIENT_MOTD/clear', {})).json.error, 'not-overridden');
+  eq((await post(e, ck, 'kv/UE_CLIENT_TEST_SERVER_ENABLED/clear', {})).json.error, 'not-allowed');
+  // set
+  r = await post(e, ck, 'kv', { key: 'UE_CLIENT_MOTD', value: 'Server maintenance at 20:00' });
+  assert(r.status === 200 && r.json.servedRev === baseRev + 1, r.text);
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_DUOS_QUEUE_WARNING_TIME_SEC', value: 90 })).json.servedRev, baseRev + 2);
+  eq((await post(e, ck, 'kv', { key: 'UE_CLIENT_VOTING_ENABLED', value: true })).status, 200);
+  eq(e.mod.kvServe('live-rev.txt'), { body: String(baseRev + 3), type: 'text/plain' }, 'a changed overlay is a NEW revision');
+  for (const rel of [`runtime-${baseRev + 3}.json`, `runtime-${baseRev}.json`]) {   // the new name falls back to the base file; the old name is overlaid too
+    const o = e.mod.kvServe(rel);
+    const j = JSON.parse(o.body);
+    eq([o.type, j.UE_CLIENT_MOTD, j.UE_CLIENT_DUOS_QUEUE_WARNING_TIME_SEC, j.UE_CLIENT_VOTING_ENABLED], ['application/json', 'Server maintenance at 20:00', 90, true], rel);
+    eq(j.UE_CLIENT_TEST_SERVER_ENABLED, baseFile.UE_CLIENT_TEST_SERVER_ENABLED, 'other keys untouched');
+    eq(Object.keys(j), Object.keys(baseFile), 'same keys, same order');
+  }
+  eq(e.mod.kvServe('runtime-999.json'), null, 'unknown file: fall through to the 404 in server.js');
+  eq(e.mod.kvServe('../secret.txt'), null);
+  r = await get(e, mk, 'kv');
+  const m2 = r.json.keys.find((k) => k.key === 'UE_CLIENT_MOTD');
+  eq([m2.value, m2.base, m2.overridden], ['Server maintenance at 20:00', baseFile.UE_CLIENT_MOTD, true]);
+  eq(r.json.servedRev, baseRev + 3);
+  // survives a restart (stored in the db, never in data/kv-classic)
+  const e2 = makeEnv({ db: JSON.parse(JSON.stringify(e.db)), modOpts: { kvDir: dir } });
+  eq(JSON.parse(e2.mod.kvServe(`runtime-${baseRev + 3}.json`).body).UE_CLIENT_MOTD, 'Server maintenance at 20:00');
+  eq(fs.readFileSync(path.join(dir, 'live-rev.txt'), 'utf8').trim(), String(baseRev), 'base files untouched');
+  // clear restores the base value under yet another revision
+  r = await post(e, ck, 'kv/UE_CLIENT_MOTD/clear', {});
+  assert(r.status === 200 && r.json.servedRev === baseRev + 4, r.text);
+  eq(JSON.parse(e.mod.kvServe(`runtime-${baseRev + 4}.json`).body).UE_CLIENT_MOTD, baseFile.UE_CLIENT_MOTD);
+  const au = e.db.moderation.audit.filter((x) => x.action.startsWith('kv-'));
+  eq(au.map((x) => x.action), ['kv-set', 'kv-set', 'kv-set', 'kv-clear']);
+  assert(au[0].detail.includes('->') && au[0].detail.includes('Server maintenance') && au[0].target === 'UE_CLIENT_MOTD', au[0].detail);
+});
+
+// ---- community hosts ----
+test('community: list, block by id removes the host from the registry, block by ip, env bans kept, unblock', async () => {
+  const e0 = makeMm();
+  const reg = createCommunityRegistry({ mm: e0.mm, config: { probe: false, allowPrivate: false, bans: ['198.51.100.99'] } });
+  const ENV_BANS = ['198.51.100.99'];
+  const e = makeEnv({ mmx: e0, modOpts: { community: reg, onHostBlocksChanged: (vals) => { reg._cfg.bans = [...ENV_BANS, ...vals]; reg.sweep(); } } });
+  const ck = await newOwner(e);
+  let r = reg.register('203.0.113.10', { name: 'Cool Server', port: 7777 });
+  assert(r.status === 200, JSON.stringify(r));
+  const id = r.body.sessionId;
+  const r2 = reg.register('203.0.113.11', { name: 'Other Server', port: 7777 });
+  e0.mm.markHostPolled(id);
+  r = await get(e, ck, 'community');
+  eq(r.json.enabled, true);
+  const h = r.json.hosts.find((x) => x.id === id);
+  eq([h.name, h.ip, h.port, h.verified, h.listed, h.probe, h.online, h.state, h.players, h.maxPlayers, h.blocked], ['Cool Server', '203.0.113.10', 7777, false, true, 'off', true, 'waiting', 0, 8, false]);
+  assert(h.registeredAt && typeof h.lastRenewSec === 'number', 'times');
+  eq(r.json.hosts.find((x) => x.id === r2.body.sessionId).listed, false, 'not polled: not listed');
+  eq(r.json.hosts.length, 2);
+  // block by id: gone from the registry at once
+  r = await post(e, ck, 'host-blocks', { value: id, reason: 'bad host' });
+  eq(r.status, 200);
+  assert(!reg._hosts.has(id), 'blocked host removed from the registry');
+  assert(reg._hosts.has(r2.body.sessionId), 'the other host stays');
+  assert(!e0.mm.listHosted().some((x) => x.id === id), 'and from the matchmaker');
+  eq(reg._cfg.bans, ['198.51.100.99', id], 'env bans kept next to the panel blocks');
+  // a blocked id cannot register again
+  eq(reg.register('203.0.113.10', { name: 'Cool Server', port: 7777, sessionId: id, sessionToken: 'a'.repeat(40) }).status, 403);
+  // block by ip
+  r = await post(e, ck, 'host-blocks', { value: '203.0.113.11' });
+  assert(!reg._hosts.has(r2.body.sessionId), 'ip block removes the other host');
+  eq(reg.register('203.0.113.11', { name: 'Other Server', port: 7777 }).status, 403);
+  eq(reg.register('198.51.100.99', { name: 'Env Banned', port: 7777 }).status, 403, 'env ban still applies');
+  // unblock the ip -> can register again; the blocks list shows up in /bans
+  const hb = e.db.moderation.hostBlocks.find((x) => x.value === '203.0.113.11');
+  eq((await post(e, ck, `host-blocks/${hb.id}/lift`, {})).status, 200);
+  eq(reg._cfg.bans, ['198.51.100.99', id]);
+  eq(reg.register('203.0.113.11', { name: 'Other Server', port: 7777 }).status, 200);
+  // blocked flag in the list for a still-registered host, with the block id for the unblock button
+  const r3 = reg.register('203.0.113.12', { name: 'Third Server', port: 7777 });
+  e.db.moderation.hostBlocks.push({ id: 'hX', value: r3.body.sessionId, kind: 'id', reason: '', by: ADMIN, at: '', lifted: false });
+  const l = (await get(e, ck, 'community')).json.hosts.find((x) => x.id === r3.body.sessionId);
+  eq([l.blocked, l.blockedBy.id], [true, 'hX']);
+});
+
+// ---- audit ----
+test('audit: filters and CSV export with escaping and formula-injection protection', async () => {
+  const e = makeEnv();
+  const ck = await newOwner(e);
+  const ck2 = await login(e, ADMIN2);
+  await post(e, ck, `players/${P1}/notes`, { text: '=HYPERLINK("http://x","click"),a' });
+  await post(e, ck, `players/${P2}/notes`, { text: '+1 plus' });
+  await post(e, ck2, `players/${P1}/notes`, { text: 'line1\nline2 "q"' });
+  await post(e, ck2, `players/${P3}/warn`, { reason: '-cmd' });
+  await post(e, ck2, `players/${P3}/notes`, { text: '@sum' });
+  await post(e, ck, `players/${P3}/notes`, { text: '\tTab' });
+  eq((await get(e, ck, 'audit')).json.length, 8);   // 2 logins + 6 entries
+  eq((await get(e, ck, `audit?by=${ADMIN2}`)).json.every((x) => x.by === ADMIN2), true);
+  eq((await get(e, ck, `audit?action=note&target=${P1}`)).json.length, 2);
+  eq((await get(e, ck, 'audit?action=warn')).json.map((x) => x.target), [P3]);
+  eq((await get(e, ck, `audit?by=${ADMIN}&action=note&limit=1`)).json.length, 1);
+  const all = (await get(e, ck, 'audit')).json;
+  eq(all[0].action, 'note'); assert(all[0].at >= all[all.length - 1].at, 'newest first');
+  const before = all[2].at;
+  assert((await get(e, ck, `audit?before=${encodeURIComponent(before)}`)).json.every((x) => x.at < before), 'before filter');
+  // csv
+  const r = await api(e, ck, 'GET', `/admin/api/audit.csv?action=note`);
+  eq(r.status, 200);
+  eq(r.headers['Content-Type'], 'text/csv; charset=utf-8');
+  assert(/^attachment; filename="ogsos-audit-20260601\.csv"$/.test(r.headers['Content-Disposition']), r.headers['Content-Disposition']);
+  const lines = r.text.split('\r\n');
+  eq(lines[0], 'at,by,byName,action,target,detail');
+  assert(r.text.includes(`,${P1},"'=HYPERLINK(""http://x"",""click""),a"`), 'quotes doubled, formula neutralised: ' + r.text);
+  assert(r.text.includes(`,${P2},'+1 plus`), '+ prefixed');
+  assert(r.text.includes(`"line1 line2 ""q"""`), 'newline flattened by the audit, quotes doubled: ' + r.text);
+  assert(r.text.includes(`,${P3},'@sum`), '@ prefixed');
+  const rows = lines.slice(1).filter(Boolean);
+  eq(rows.length, 5);
+  const w = await api(e, ck, 'GET', '/admin/api/audit.csv?action=warn');
+  assert(w.text.includes(`,warn,${P3},'-cmd`), '- prefixed: ' + w.text);
+  eq((await call(e.mod, 'GET', '/admin/api/audit.csv')).status, 401, 'needs a cookie');
 });
 
 // ---- run ----

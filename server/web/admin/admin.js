@@ -1,8 +1,11 @@
 'use strict';
-/* OG SOS admin panel. Vanilla JS, no innerHTML with data, CSP-safe (no inline code/styles). */
+/* OG SOS admin panel, core. Vanilla JS, no innerHTML with data, CSP-safe (no inline code/styles).
+ * Loads first; pages-ops.js and pages-people.js register pages on window.OGA.pages; the router starts on DOMContentLoaded. */
 (function () {
   const $ = (id) => document.getElementById(id);
   const main = $('main');
+  const OGA = { pages: {}, me: null };
+  window.OGA = OGA;
 
   // ---------- DOM helpers ----------
   function h(tag, attrs, ...children) {
@@ -79,7 +82,13 @@
     return h('a', { href: u, rel: 'noopener noreferrer nofollow', target: '_blank' }, label || short(u, 40));
   }
   const idLink = (id, name) => h('a', { href: '#/player/' + encodeURIComponent(id), title: id }, name || id);
-  const mid = (id) => h('span', { class: 'mono' }, id == null ? '' : String(id));
+  const mid = (id) => h('span', { class: 'mono', text: id == null ? '' : String(id) });
+  const matchLink = (id, label) => id ? h('a', { href: '#/match/' + encodeURIComponent(id), class: 'mono', title: 'Open match page', text: label || short(id, 14) }) : h('span', { class: 'muted' }, '-');
+  const num = (v, d) => (typeof v === 'number' && isFinite(v) ? v : (d === undefined ? 0 : d));
+  const isOwner = () => !!(OGA.me && OGA.me.role === 'owner');
+  // A value that may be a steam id string or {id,name} (assignee and similar).
+  const refId = (v) => (v && typeof v === 'object' ? v.id || v.steamId || '' : (v || ''));
+  const refName = (v) => (v && typeof v === 'object' ? v.name || '' : '');
 
   // ---------- toasts ----------
   function toast(msg, ok) {
@@ -124,6 +133,13 @@
       return undefined;
     }
   }
+  const okData = (r) => (r && r !== true ? r : null);
+  const listOf = (r, key) => (Array.isArray(r) ? r : (r && Array.isArray(r[key]) ? r[key] : []));
+  const qs = (o) => {
+    const p = [];
+    for (const k of Object.keys(o)) if (o[k] !== undefined && o[k] !== null && o[k] !== '') p.push(encodeURIComponent(k) + '=' + encodeURIComponent(o[k]));
+    return p.length ? '?' + p.join('&') : '';
+  };
 
   // ---------- dialogs ----------
   function openDialog(title, body, buttons, opts) {
@@ -273,7 +289,7 @@
   }
 
   // ---------- generic renderers ----------
-  function kvTable(obj, hlKeys) {
+  function kvTable(obj) {
     const rows = [];
     const put = (k, v) => rows.push(h('tr', {}, h('th', { text: k }), h('td', { text: fmtVal(v) })));
     if (!obj || typeof obj !== 'object') return h('p', { class: 'muted' }, 'No data');
@@ -298,49 +314,73 @@
       h('tbody', {}, rows)));
   }
 
-  function statusBadge(s) { return h('span', { class: 'badge ' + s, text: s }); }
+  function statusBadge(s) { return h('span', { class: 'badge ' + String(s || '').replace(/[^a-z-]/g, ''), text: s || '?' }); }
+  // State pill for lobbies (waiting / countdown / started / ended).
+  function statePill(s) { return h('span', { class: 'pill st-' + String(s || 'unknown').replace(/[^a-z-]/gi, '').toLowerCase(), text: s || 'unknown' }); }
 
-  // Match record dialog: table of all players in the match.
-  async function matchDialog(matchId, highlight) {
-    const m = await act(() => api('matches/' + encodeURIComponent(matchId)));
-    if (!m || m === true) return;
-    const hl = highlight || {};
-    const players = Array.isArray(m.players) ? m.players : [];
-    const colSet = [];
+  // Sortable per-player match table. cols: stat keys; hl: {reporter,target} ids to highlight.
+  function playersTable(players, hl) {
+    hl = hl || {};
+    const cols = [];
     for (const p of players) for (const k of Object.keys(p)) {
       if (k === 'playerId' || k === 'name') continue;
-      if (typeof p[k] !== 'object' && !colSet.includes(k)) colSet.push(k);
+      if (typeof p[k] !== 'object' && !cols.includes(k)) cols.push(k);
     }
-    const rows = players.map((p) => {
-      const cls = hl.reporter && p.playerId === hl.reporter ? 'hl-a' : (hl.target && p.playerId === hl.target ? 'hl-b' : '');
-      return h('tr', { class: cls },
-        h('td', {}, idLink(p.playerId, p.name || p.playerId)),
+    const state = { key: null, dir: -1 };
+    const box = h('div', {});
+    const draw = () => {
+      let rows = players.slice();
+      if (state.key) {
+        const k = state.key;
+        rows.sort((a, b) => {
+          const x = a[k], y = b[k];
+          if (typeof x === 'number' && typeof y === 'number') return (x - y) * state.dir;
+          return String(x == null ? '' : x).localeCompare(String(y == null ? '' : y)) * state.dir;
+        });
+      }
+      const ths = [h('th', { text: 'Name' }), h('th', { text: 'Id' })].concat(cols.map((k) => {
+        const th = h('th', { class: 'sortable' + (state.key === k ? ' sorted' : ''), tabindex: '0', title: 'Sort', text: k + (state.key === k ? (state.dir < 0 ? ' ▼' : ' ▲') : '') });
+        const go = () => { if (state.key === k) state.dir = -state.dir; else { state.key = k; state.dir = -1; } draw(); };
+        th.addEventListener('click', go);
+        th.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+        return th;
+      }));
+      clear(box);
+      box.appendChild(tableWrap(ths, rows.map((p) => h('tr', { class: p.playerId === hl.reporter ? 'hl-a' : (p.playerId === hl.target ? 'hl-b' : '') },
+        h('td', {}, idLink(p.playerId, p.name || p.playerId), p.playerId === hl.reporter ? ' (reporter)' : '', p.playerId === hl.target ? ' (target)' : ''),
         h('td', {}, mid(p.playerId)),
-        colSet.map((k) => h('td', { class: typeof p[k] === 'number' ? 'num' : '', text: fmtVal(p[k]) })));
-    });
-    const meta = {};
-    for (const k of Object.keys(m)) if (k !== 'players') meta[k] = m[k];
-    openDialog('Match ' + matchId, [
-      kvTable(meta),
-      h('h3', { class: 'mt' }, ''),
-      tableWrap(['Name', 'Id', ...colSet], rows, 'No players recorded'),
-    ], [h('button', { onclick: (e) => e.target.closest('dialog').close() }, 'Close')]);
+        cols.map((k) => h('td', { class: typeof p[k] === 'number' ? 'num' : '', text: fmtVal(p[k]) })))), 'No players recorded'));
+    };
+    draw();
+    return box;
   }
 
-  function matchLink(id, hl) {
-    if (!id) return h('span', { class: 'muted' }, '-');
-    const a = h('a', { href: '#', class: 'mono', title: 'Show match record' }, short(id, 14));
-    a.addEventListener('click', (e) => { e.preventDefault(); matchDialog(id, hl); });
-    return a;
+  // Typed confirmation dialog, e.g. RESET.
+  function typedConfirm(title, intro, word, onGo) {
+    const inp = h('input', { type: 'text', autocomplete: 'off', placeholder: 'Type ' + word });
+    const go = h('button', { class: 'danger', disabled: true }, 'Confirm');
+    inp.addEventListener('input', () => { go.disabled = inp.value !== word; });
+    const { close } = openDialog(title, [h('p', {}, intro), h('div', { class: 'field' }, h('label', {}, 'Type ' + word + ' to confirm'), inp)],
+      [h('button', { onclick: () => close() }, 'Cancel'), go], { narrow: true });
+    go.addEventListener('click', async () => {
+      if (inp.value !== word) return;
+      go.disabled = true;
+      const ok = await onGo();
+      if (ok) close(); else go.disabled = inp.value !== word;
+    });
+    inp.focus();
   }
 
   // ---------- header / auth ----------
-  const NAV = [['servers', 'Servers'], ['players', 'Players'], ['reports', 'Reports'], ['bans', 'Bans'], ['audit', 'Audit']];
+  const NAV = [['dashboard', 'Dashboard'], ['servers', 'Servers'], ['players', 'Players'], ['matches', 'Matches'], ['reports', 'Reports'],
+    ['bans', 'Bans'], ['community', 'Community'], ['config', 'Config'], ['admins', 'Admins'], ['audit', 'Audit']];
+  const NAV_ON = { player: 'players', match: 'matches', report: 'reports' };
   function renderNav(route) {
     const nav = $('nav');
     clear(nav);
+    const cur = NAV_ON[route] || route;
     for (const [k, label] of NAV) {
-      nav.appendChild(h('a', { href: '#/' + k, class: route === k || (k === 'players' && route === 'player') || (k === 'reports' && route === 'report') ? 'on' : '' }, label));
+      nav.appendChild(h('a', { href: k === 'dashboard' ? '#/' : '#/' + k, class: cur === k ? 'on' : '' }, label));
     }
   }
   function showSignIn() {
@@ -356,8 +396,10 @@
     try {
       const me = await api('me');
       unauthorized = false;
+      OGA.me = me;
       const who = $('who'); clear(who);
-      add(who, [h('span', {}, h('b', { text: me.name || '(unnamed)' }), ' ', h('span', { class: 'mono', text: me.steamId })),
+      add(who, [h('span', { class: 'badge role-' + (me.role || 'none'), text: me.role || 'no role' }),
+        h('span', {}, h('b', { text: me.name || '(unnamed)' }), ' ', h('span', { class: 'mono', text: me.steamId })),
         h('a', { href: '/admin/logout' }, 'Sign out')]);
       return true;
     } catch (e) {
@@ -373,351 +415,45 @@
     stopRefresh();
     refreshTimer = setInterval(() => { if (!document.hidden && !document.querySelector('dialog[open]')) fn(); }, 10000);
   }
-
-  // ---------- pages ----------
   let renderSeq = 0;
-
-  // Servers
-  async function pageServers() {
-    const seq = ++renderSeq;
-    let first = true;
-    const draw = async () => {
-      let data;
-      try { data = await api('servers'); } catch (e) { if (first && e.status !== 401) { toast(e.message); } return; }
-      if (seq !== renderSeq) return;
-      first = false;
-      const servers = data.servers || [];
-      const on = data.online || {}, q = data.queue || {};
-      const stats = h('div', { class: 'stats' },
-        ['classic', 'main'].map((g) => h('div', { class: 'stat' }, g, ' online', h('b', { text: String(on[g] ?? 0) }), '  queue', h('b', { text: String(q[g] ?? 0) }))),
-        h('div', { class: 'stat' }, 'servers', h('b', { text: String(servers.length) })),
-        h('button', { onclick: draw }, 'Refresh'),
-        h('span', { class: 'muted' }, 'auto-refresh 10 s'));
-      const cards = servers.map((s) => serverCard(s, draw));
-      show(h('h1', {}, 'Servers'), stats,
-        cards.length ? h('div', { class: 'cards' }, cards) : h('div', { class: 'card empty' }, 'No hosted servers right now'));
-    };
-    await draw();
-    startRefresh(draw);
-  }
-
-  function serverCard(s, redraw) {
-    const players = s.players || [];
-    const meta = [
-      s.game ? h('span', {}, 'game: ', h('b', { text: s.game })) : null,
-      s.region ? h('span', { text: 'region: ' + s.region }) : null,
-      s.state ? h('span', { text: 'state: ' + s.state }) : null,
-      s.map ? h('span', { text: 'map: ' + s.map }) : null,
-      s.address ? h('span', {}, 'addr: ', h('span', { class: 'mono', text: s.address })) : null,
-      s.startedAt ? h('span', { title: fmtTime(s.startedAt) }, 'started ' + ago(s.startedAt)) : null,
-      s.community ? h('span', { class: 'badge' }, 'community') : null,
-    ];
-    const list = players.length ? h('ul', { class: 'plist' }, players.map((p) => h('li', {},
-      h('span', { class: 'pname' }, idLink(p.id, p.name || p.id), ' ', p.banned ? h('span', { class: 'badge bad' }, 'banned') : null, p.host ? h('span', { class: 'badge' }, 'host') : null),
-      h('span', { class: 'mono muted', text: p.id }),
-      h('button', { class: 'sm danger', onclick: () => kickDialog(s.id, p.id, p.name, s.game, redraw) }, 'Kick'),
-      h('button', { class: 'sm danger', onclick: () => banDialog(p.id, p.name, redraw) }, 'Ban'))))
-      : h('p', { class: 'muted' }, 'No players');
-    return h('div', { class: 'card' },
-      h('h2', {}, h('span', { class: 'dot' + (s.online ? ' on' : ''), title: s.online ? 'online' : 'offline' }), h('span', { text: s.name || s.id }),
-        h('span', { class: 'badge', text: (s.playerCount ?? players.length) + '/' + (s.maxPlayers ?? '?') })),
-      h('div', { class: 'srv-meta' }, meta),
-      list,
-      (s.watchers || []).length ? h('p', { class: 'muted' }, 'Watching: ', (s.watchers || []).map((w) => h('span', { class: 'badge', text: w.name || w.id }))) : null,
-      h('div', { class: 'row', 'data-x': '' }, h('span', { class: 'mono muted grow', text: s.id }),
-        h('button', { class: 'sm', onclick: () => spectate(s.id, s.game) }, 'Spectate')));
-  }
-
-  // Players list
-  async function pagePlayers() {
-    const seq = ++renderSeq;
-    stopRefresh();
-    const out = h('div', {});
-    const input = h('input', { type: 'text', class: 'search', placeholder: 'Search name or Steam id (empty = most recent)' });
-    const run = async () => {
-      const r = await act(() => api('players?limit=50&q=' + encodeURIComponent(input.value.trim())));
-      if (seq !== renderSeq || !r || r === true) return;
-      const list = Array.isArray(r) ? r : (r.players || []);
-      clear(out);
-      out.appendChild(tableWrap(['Name', 'Steam id', 'Last access', 'Created', 'Status', 'Reports vs', 'Reports by', 'Matches'],
-        list.map((p) => h('tr', {},
-          h('td', {}, idLink(p.id, p.name || p.id)), h('td', {}, mid(p.id)), timeCell(p.lastAccess), timeCell(p.created),
-          h('td', {}, p.banned ? h('span', { class: 'badge bad' }, 'banned') : ''),
-          h('td', { class: 'num', text: String(p.reportsAgainst ?? 0) }), h('td', { class: 'num', text: String(p.reportsBy ?? 0) }), h('td', { class: 'num', text: String(p.matches ?? 0) }))),
-        'No players found'));
-    };
-    const form = h('form', { class: 'row' }, input, h('button', { class: 'primary', type: 'submit' }, 'Search'));
-    form.addEventListener('submit', (e) => { e.preventDefault(); run(); });
-    show(h('h1', {}, 'Players'), form, out);
-    input.focus();
-    run();
-  }
-
-  // Player detail
-  async function pagePlayer(id) {
-    const seq = ++renderSeq;
-    stopRefresh();
-    const d = await act(() => api('players/' + encodeURIComponent(id)));
-    if (seq !== renderSeq) return;
-    if (!d || d === true) { show(h('h1', {}, 'Player'), h('p', { class: 'muted' }, 'Could not load player ', mid(id))); return; }
-    const acc = d.account || { id };
-    const reload = () => { if (seq === renderSeq) pagePlayer(id); };
-    const banInfo = d.ban
-      ? h('div', { class: 'banner bad' }, h('b', {}, 'BANNED'), ' ', d.ban.reason, ' ',
-        h('span', { class: 'muted', text: d.ban.expiresAt ? '(until ' + fmtTime(d.ban.expiresAt) + ')' : '(permanent)' }), ' ',
-        h('button', { class: 'sm', onclick: async () => { if (confirm('Lift ban on ' + (acc.name || id) + '?') && await act(() => api('bans/' + encodeURIComponent(id) + '/lift', {}), 'Ban lifted')) reload(); } }, 'Unban'))
-      : null;
-    const matchRows = (d.matches || []).map((m) => {
-      const me = m.me || {};
-      return me;
-    });
-    const mcols = [];
-    for (const me of matchRows) for (const k of Object.keys(me)) {
-      if (typeof me[k] === 'number' && !mcols.includes(k)) mcols.push(k);
-    }
-    const matches = tableWrap(['Ended', 'Duration', ...mcols, 'Players', 'Match'],
-      (d.matches || []).map((m) => h('tr', {},
-        timeCell(m.endedAt), h('td', { class: 'nowrap', text: dur(m.durationSec) }),
-        mcols.map((k) => h('td', { class: 'num', text: m.me && m.me[k] !== undefined ? String(m.me[k]) : '' })),
-        h('td', { class: 'num', text: String(m.players ?? '') }), h('td', {}, matchLink(m.id, { target: id })))),
-      'No matches');
-    const cur = d.current
-      ? h('p', {}, 'In session ', mid(d.current.sessionId), ' (', d.current.game, ', ', d.current.state || '?', ') ',
-        h('button', { class: 'sm danger', onclick: () => kickDialog(d.current.sessionId, id, acc.name, d.current.game, reload) }, 'Kick'),
-        ' ', h('button', { class: 'sm', onclick: () => spectate(d.current.sessionId, d.current.game) }, 'Spectate'))
-      : h('p', { class: 'muted' }, 'Not in a live session');
-    const history = (d.banHistory || []).length ? tableWrap(['At', 'Reason', 'By', 'Expires', 'Lifted'],
-      d.banHistory.map((b) => h('tr', {}, timeCell(b.at), h('td', { text: b.reason }), h('td', {}, mid(b.by)),
-        h('td', { text: b.expiresAt ? fmtTime(b.expiresAt) : 'permanent' }), h('td', { text: b.lifted ? fmtTime(b.lifted.at) + ' by ' + b.lifted.by : '' })))) : null;
-    show(
-      h('div', { class: 'row' }, h('h1', { class: 'grow', text: acc.name || id }),
-        h('button', { class: 'danger', onclick: () => banDialog(id, acc.name, reload) }, 'Ban'),
-        d.ban ? h('button', { onclick: async () => { if (confirm('Lift ban?') && await act(() => api('bans/' + encodeURIComponent(id) + '/lift', {}), 'Ban lifted')) reload(); } }, 'Unban') : null),
-      banInfo,
-      h('div', { class: 'cols' },
-        h('div', { class: 'card' }, h('h3', {}, 'Account'),
-          kvTable({ id: acc.id, name: acc.name, created: fmtTime(acc.created), lastAccess: fmtTime(acc.lastAccess) }),
-          h('p', {}, h('a', { href: 'https://steamcommunity.com/profiles/' + encodeURIComponent(acc.id || id), rel: 'noopener noreferrer nofollow', target: '_blank' }, 'Steam profile'),
-            ' ', h('span', { class: 'muted' }, '(Steam id is the account id)')),
-          cur),
-        h('div', { class: 'card' }, h('h3', {}, 'Stats summary'), kvTable(d.stats || {}))),
-      h('h2', {}, 'Match history'), matches,
-      h('div', { class: 'cols' },
-        h('div', {}, h('h2', {}, 'Reports against'), reportsTable(d.reportsAgainst || [], 'against')),
-        h('div', {}, h('h2', {}, 'Reports filed'), reportsTable(d.reportsBy || [], 'by'))),
-      history ? [h('h2', {}, 'Ban history'), history] : null);
-  }
-
-  function reportsTable(list, mode) {
-    return tableWrap(['Time', 'Status', mode === 'by' ? 'Target' : 'Reporter', 'Reason', ''],
-      list.map((r) => h('tr', {},
-        timeCell(r.at), h('td', {}, statusBadge(r.status)),
-        h('td', {}, mode === 'by' ? idLink(r.target && r.target.id, r.target && r.target.name) : idLink(r.reporter && r.reporter.id, r.reporter && r.reporter.name)),
-        h('td', { text: r.reason }), h('td', {}, h('a', { href: '#/report/' + encodeURIComponent(r.id) }, 'open')))),
-      'None');
-  }
-
-  // Reports list
-  async function pageReports(tab) {
-    const seq = ++renderSeq;
-    stopRefresh();
-    tab = ['open', 'actioned', 'dismissed', 'all'].includes(tab) ? tab : 'open';
-    const r = await act(() => api('reports?status=' + tab));
-    if (seq !== renderSeq) return;
-    const list = !r || r === true ? [] : (Array.isArray(r) ? r : (r.reports || []));
-    const tabs = h('div', { class: 'tabs' }, ['open', 'actioned', 'dismissed', 'all'].map((t) =>
-      h('a', { href: '#/reports/' + t, class: t === tab ? 'on' : '' }, t)));
-    const rows = list.map((x) => h('tr', {},
-      timeCell(x.at), h('td', {}, statusBadge(x.status)),
-      h('td', {}, idLink(x.reporter && x.reporter.id, x.reporter && x.reporter.name)),
-      h('td', {}, idLink(x.target && x.target.id, x.target && x.target.name)),
-      h('td', { text: x.reason }), h('td', { class: 'excerpt', text: short(x.text, 140) }),
-      h('td', {}, extLink(x.evidenceUrl, 'clip') || h('span', { class: 'muted' }, '-')),
-      h('td', {}, matchLink(x.matchId, { reporter: x.reporter && x.reporter.id, target: x.target && x.target.id })),
-      h('td', {}, h('a', { href: '#/report/' + encodeURIComponent(x.id) }, 'view'))));
-    show(h('h1', {}, 'Reports'), tabs,
-      tableWrap(['Time', 'Status', 'Reporter', 'Target', 'Reason', 'Text', 'Evidence', 'Match', ''], rows, 'No ' + (tab === 'all' ? '' : tab + ' ') + 'reports'));
-  }
-
-  // Report detail
-  async function pageReport(id) {
-    const seq = ++renderSeq;
-    stopRefresh();
-    const d = await act(() => api('reports/' + encodeURIComponent(id)));
-    if (seq !== renderSeq) return;
-    if (!d || d === true) { show(h('h1', {}, 'Report'), h('p', { class: 'muted' }, 'Could not load report ', mid(id))); return; }
-    const r = d.report || {};
-    const reload = () => { if (seq === renderSeq) pageReport(id); };
-    const tId = r.target && r.target.id, rId = r.reporter && r.reporter.id;
-    const hl = { reporter: rId, target: tId };
-    const note = h('textarea', { maxlength: '1000', placeholder: 'Moderator note' });
-    note.value = r.note || '';
-    const setStatus = async (status) => {
-      if (await act(() => api('reports/' + encodeURIComponent(id), { status, note: note.value }), 'Report ' + status)) reload();
-    };
-    const snap = r.snapshot || {};
-    const sess = snap.session || null;
-    const sessId = r.sessionId || (sess && sess.id) || null;
-    const game = sess && sess.game;
-    const body = [];
-    body.push(h('div', { class: 'row' },
-      h('h1', { class: 'grow' }, 'Report ', h('span', { class: 'mono', text: r.id }), ' ', statusBadge(r.status || '?')),
-      h('a', { href: '#/reports' }, '← all reports')));
-    if (!r.evidenceUrl) body.push(h('div', { class: 'banner' }, 'No video: record with Steam/OBS clips; reporters can attach a clip link'));
-    body.push(h('div', { class: 'cols' },
-      h('div', { class: 'card' }, h('h3', {}, 'Report'),
-        kvTable({ time: fmtTime(r.at) + ' (' + ago(r.at) + ')', source: r.source, reason: r.reason, sessionId: r.sessionId, matchId: r.matchId, resolvedBy: r.resolvedBy, resolvedAt: r.resolvedAt ? fmtTime(r.resolvedAt) : null }),
-        h('p', {}, 'Reporter: ', idLink(rId, r.reporter && r.reporter.name), ' ', mid(rId)),
-        h('p', {}, 'Target: ', idLink(tId, r.target && r.target.name), ' ', mid(tId),
-          d.priorReportsAgainstTarget ? h('span', { class: 'badge warn', text: d.priorReportsAgainstTarget + ' prior reports' }) : null,
-          d.ban ? h('span', { class: 'badge bad' }, 'banned') : null),
-        r.evidenceUrl ? h('p', {}, 'Evidence: ', extLink(r.evidenceUrl, short(r.evidenceUrl, 60)) || h('span', { class: 'mono', text: r.evidenceUrl })) : null,
-        h('h3', {}, 'Text'), h('div', { class: 'note', text: r.text || '(none)' })),
-      h('div', { class: 'card' }, h('h3', {}, 'Actions'),
-        h('div', { class: 'field' }, h('label', {}, 'Note'), note),
-        h('div', { class: 'row' },
-          h('button', { class: 'primary', onclick: () => setStatus('actioned') }, 'Mark actioned'),
-          h('button', { onclick: () => setStatus('dismissed') }, 'Dismiss'),
-          h('button', { onclick: () => setStatus('open') }, 'Reopen')),
-        h('div', { class: 'row' },
-          tId ? h('button', { class: 'danger', onclick: () => banDialog(tId, r.target && r.target.name, reload) }, 'Ban target') : null,
-          tId && sessId ? h('button', { class: 'danger', title: 'Only works if the target is still seated in this session', onclick: () => kickDialog(sessId, tId, r.target && r.target.name, game, reload) }, 'Kick target (if in a live session)') : null,
-          sessId ? h('button', { onclick: () => spectate(sessId, game) }, 'Spectate session') : null))));
-    if (d.match || r.matchId) {
-      body.push(h('h2', {}, 'Linked match ', matchLink(r.matchId, hl)), matchPlayersTable(d.match, hl));
-    }
-    const cands = d.candidates || [];
-    body.push(h('h2', {}, 'Candidate matches'),
-      tableWrap(['Match', 'Ended', 'Duration', 'Players', ''],
-        cands.map((m) => h('tr', {}, h('td', {}, matchLink(m.id, hl)), timeCell(m.endedAt), h('td', { text: dur(m.durationSec) }),
-          h('td', { class: 'num', text: String((m.players || []).length) }),
-          h('td', {}, h('button', { class: 'sm', onclick: async () => { if (await act(() => api('reports/' + encodeURIComponent(id), { matchId: m.id }), 'Match linked')) reload(); } }, 'Link this match')))),
-        'No candidate matches'));
-    body.push(h('h2', {}, 'Snapshot at report time'),
-      h('div', { class: 'cols' },
-        h('div', { class: 'card' }, h('h3', {}, 'Reporter ', r.reporter && r.reporter.name || ''), snap.reporter ? kvTable(snap.reporter) : h('p', { class: 'muted' }, 'No snapshot'),
-          d.reporter ? [h('h3', {}, 'Reporter now'), kvTable(d.reporter)] : null),
-        h('div', { class: 'card' }, h('h3', {}, 'Target ', r.target && r.target.name || ''), snap.target ? kvTable(snap.target) : h('p', { class: 'muted' }, 'No snapshot'),
-          d.target ? [h('h3', {}, 'Target now'), kvTable(d.target)] : null)));
-    if (sess) body.push(h('div', { class: 'card' }, h('h3', {}, 'Session at report time'), kvTable(sess)));
-    if (snap.lastMatch) body.push(h('h2', {}, 'Target\'s last match at report time'), matchPlayersTable(snap.lastMatch, hl));
-    show(h('div', { class: 'stack' }, body));
-  }
-
-  function matchPlayersTable(m, hl) {
-    if (!m) return h('p', { class: 'muted' }, 'Match record not found');
-    const players = m.players || [];
-    const cols = [];
-    for (const p of players) for (const k of Object.keys(p)) {
-      if (k === 'playerId' || k === 'name') continue;
-      if (typeof p[k] !== 'object' && !cols.includes(k)) cols.push(k);
-    }
-    return h('div', {},
-      h('p', { class: 'muted' }, 'ended ', fmtTime(m.endedAt), m.durationSec ? ' - ' + dur(m.durationSec) : '', m.reason ? ' - ' + m.reason : ''),
-      tableWrap(['Name', 'Id', ...cols], players.map((p) => h('tr', { class: p.playerId === hl.reporter ? 'hl-a' : (p.playerId === hl.target ? 'hl-b' : '') },
-        h('td', {}, idLink(p.playerId, p.name || p.playerId), p.playerId === hl.reporter ? ' (reporter)' : '', p.playerId === hl.target ? ' (target)' : ''), h('td', {}, mid(p.playerId)),
-        cols.map((k) => h('td', { class: typeof p[k] === 'number' ? 'num' : '', text: fmtVal(p[k]) })))), 'No players'));
-  }
-
-  // Bans
-  async function pageBans(showAll) {
-    const seq = ++renderSeq;
-    stopRefresh();
-    const r = await act(() => api('bans' + (showAll ? '?all=1' : '')));
-    if (seq !== renderSeq) return;
-    const bans = !r || r === true ? [] : (Array.isArray(r.bans) ? r.bans : Object.values(r.bans || {}));
-    const blocks = !r || r === true ? [] : (r.hostBlocks || []);
-    const reload = () => { if (seq === renderSeq) pageBans(showAll); };
-    const lift = (b) => async () => { if (confirm('Lift ban on ' + (b.name || b.steamId) + '?') && await act(() => api('bans/' + encodeURIComponent(b.steamId) + '/lift', {}), 'Ban lifted')) reload(); };
-    const now = Date.now();
-    const banRows = bans.map((b) => {
-      const active = !b.lifted && (!b.expiresAt || new Date(b.expiresAt).getTime() > now);
-      return h('tr', {}, h('td', {}, idLink(b.steamId, b.name || b.steamId)), h('td', {}, mid(b.steamId)), h('td', { text: b.reason }),
-        h('td', {}, mid(b.by)), timeCell(b.at), h('td', { class: 'nowrap', text: b.expiresAt ? fmtTime(b.expiresAt) : 'permanent' }),
-        h('td', {}, b.lifted ? h('span', { class: 'muted', text: 'lifted ' + fmtTime(b.lifted.at) }) : (active ? h('span', { class: 'badge bad' }, 'active') : h('span', { class: 'badge' }, 'expired'))),
-        h('td', {}, active ? h('button', { class: 'sm', onclick: lift(b) }, 'Lift') : null));
-    });
-    const showToggle = h('input', { type: 'checkbox' }); showToggle.checked = !!showAll;
-    showToggle.addEventListener('change', () => { location.hash = '#/bans' + (showToggle.checked ? '/all' : ''); });
-
-    const sid = h('input', { type: 'text', placeholder: '7656119...' });
-    const reason = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason' });
-    const durF = durationField();
-    const codeF = codeField();
-    const banForm = h('form', { class: 'inline-form' },
-      h('div', { class: 'field' }, h('label', {}, 'Steam id'), sid), h('div', { class: 'field' }, h('label', {}, 'Reason'), reason), codeF.node, durF.node,
-      h('button', { class: 'danger', type: 'submit' }, 'New ban'));
-    banForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (!sid.value.trim() || !reason.value.trim()) { toast('Steam id and reason are required'); return; }
-      let hours; try { hours = durF.hours(); } catch (er) { toast(er.message); return; }
-      if (await act(() => api('bans', { steamId: sid.value.trim(), reason: reason.value.trim(), hours, code: codeF.value() }), 'Ban created')) reload();
-    });
-
-    const blockRows = blocks.map((b) => {
-      const active = !b.lifted;
-      return h('tr', {}, h('td', {}, mid(b.value)), h('td', { text: b.kind }), h('td', { text: b.reason }), h('td', {}, mid(b.by)), timeCell(b.at),
-        h('td', {}, b.lifted ? h('span', { class: 'muted', text: 'lifted ' + fmtTime(b.lifted.at) }) : h('span', { class: 'badge bad' }, 'active')),
-        h('td', {}, active ? h('button', { class: 'sm', onclick: async () => { if (confirm('Lift host block ' + b.value + '?') && await act(() => api('host-blocks/' + encodeURIComponent(b.id) + '/lift', {}), 'Block lifted')) reload(); } }, 'Lift') : null));
-    });
-    const bv = h('input', { type: 'text', placeholder: 'IPv4, CIDR or session id' });
-    const br = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason' });
-    const blockForm = h('form', { class: 'inline-form' },
-      h('div', { class: 'field' }, h('label', {}, 'Value'), bv), h('div', { class: 'field' }, h('label', {}, 'Reason'), br),
-      h('button', { class: 'danger', type: 'submit' }, 'Block host'));
-    blockForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (!bv.value.trim() || !br.value.trim()) { toast('Value and reason are required'); return; }
-      if (await act(() => api('host-blocks', { value: bv.value.trim(), reason: br.value.trim() }), 'Host blocked')) reload();
-    });
-
-    show(h('h1', {}, 'Bans'),
-      h('div', { class: 'row' }, h('label', { class: 'check' }, showToggle, 'show lifted / expired')),
-      tableWrap(['Player', 'Steam id', 'Reason', 'By', 'Created', 'Expires', 'Status', ''], banRows, 'No bans'),
-      h('div', { class: 'card' }, h('h3', {}, 'New ban'), banForm),
-      h('h1', { class: 'mt' }, 'Host blocks'),
-      tableWrap(['Value', 'Kind', 'Reason', 'By', 'Created', 'Status', ''], blockRows, 'No host blocks'),
-      h('div', { class: 'card' }, h('h3', {}, 'New host block'), blockForm));
-  }
-
-  // Audit
-  async function pageAudit() {
-    const seq = ++renderSeq;
-    stopRefresh();
-    const r = await act(() => api('audit?limit=200'));
-    if (seq !== renderSeq) return;
-    const list = !r || r === true ? [] : (Array.isArray(r) ? r : (r.audit || r.entries || []));
-    show(h('h1', {}, 'Audit log'), tableWrap(['Time', 'Admin', 'Action', 'Target', 'Detail'],
-      list.map((a) => h('tr', {}, timeCell(a.at), h('td', {}, a.byName || '', ' ', mid(a.by)), h('td', {}, h('span', { class: 'badge', text: a.action })),
-        h('td', {}, mid(a.target)), h('td', { class: 'excerpt mono', text: typeof a.detail === 'string' ? a.detail : fmtVal(a.detail) }))), 'Audit log is empty'));
-  }
 
   // ---------- router ----------
   function parseRoute() {
-    const parts = (location.hash || '#/servers').replace(/^#\/?/, '').split('/').filter(Boolean).map((x) => { try { return decodeURIComponent(x); } catch (_) { return x; } });
-    return { name: parts[0] || 'servers', arg: parts[1] || '' };
+    let raw = (location.hash || '#/').replace(/^#\/?/, '');
+    let query = {};
+    const qi = raw.indexOf('?');
+    if (qi >= 0) {
+      for (const kv of raw.slice(qi + 1).split('&')) {
+        if (!kv) continue;
+        const [k, v] = kv.split('=');
+        try { query[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' ')); } catch (_) { /* skip bad pair */ }
+      }
+      raw = raw.slice(0, qi);
+    }
+    const parts = raw.split('/').filter(Boolean).map((x) => { try { return decodeURIComponent(x); } catch (_) { return x; } });
+    return { name: parts[0] || 'dashboard', arg: parts[1] || '', query };
   }
   async function route() {
     stopRefresh();
+    document.querySelectorAll('dialog').forEach((d) => { try { d.close(); } catch (_) { /* ignore */ } d.remove(); });
     if (unauthorized) { if (!(await loadMe())) return; }
-    const { name, arg } = parseRoute();
+    const { name, arg, query } = parseRoute();
     renderNav(name);
     window.scrollTo(0, 0);
-    switch (name) {
-      case 'servers': return pageServers();
-      case 'players': return pagePlayers();
-      case 'player': return arg ? pagePlayer(arg) : pagePlayers();
-      case 'reports': return pageReports(arg);
-      case 'report': return arg ? pageReport(arg) : pageReports('open');
-      case 'bans': return pageBans(arg === 'all');
-      case 'audit': return pageAudit();
-      default: location.hash = '#/servers';
-    }
+    const fn = OGA.pages[name];
+    if (!fn) { location.hash = '#/'; return; }
+    return fn(arg, query);
   }
-  window.addEventListener('hashchange', route);
-  document.addEventListener('visibilitychange', () => { /* timer checks document.hidden */ });
 
-  (async () => {
+  Object.assign(OGA, {
+    h, add, clear, show, fmtTime, ago, timeCell, dur, short, fmtVal, safeUrl, extLink, idLink, mid, matchLink, num, isOwner, refId, refName,
+    toast, api, act, okData, listOf, qs, openDialog, copyBtn, durationField, codeField, banDialog, kickDialog, spectate,
+    kvTable, tableWrap, statusBadge, statePill, playersTable, typedConfirm, startRefresh, stopRefresh,
+    seq: () => ++renderSeq, cur: () => renderSeq, parseRoute, route,
+  });
+
+  window.addEventListener('hashchange', route);
+  document.addEventListener('DOMContentLoaded', async () => {
     if (await loadMe()) route();
-  })();
+  });
 })();

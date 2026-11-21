@@ -155,7 +155,7 @@ async function hostedScenario() {
   assert(CD >= 800 && CD <= 3000, 'use OGSOS_START_COUNTDOWN_SECONDS=1 or 2');
   const get = async () => JSON.parse((await httpReq('GET', `/api/session/${H.sessionId}`, null, auth)).body);
   const post = (suffix, headers = auth) => httpReq('POST', `/api/session/${H.sessionId}${suffix}`, '{}', headers);
-  const ids = ['76561198000000101', '76561198000000102', '76561198000000103', '76561198000000104', '76561198000000105'];
+  const ids = ['76561190000080101', '76561190000080102', '76561190000080103', '76561190000080104', '76561190000080105'];
   const toks = []; for (const i of ids) toks.push(await login(i));
   const opts = { opts: { language: 'en', map: '', 'game-mode': '', 'auto-group': false, regions: { local: { ping: 1 } }, 'user-data': { set: 's', char: 'c', outfit: 'o', var: 'v' } } };
   const open = async (tok) => { const r = await Ws.connect(tok); assert(r.status === 101, 'ws ' + r.status); await r.ws.take('ready'); return r.ws; };
@@ -290,7 +290,7 @@ if (Array.isArray(HOSTS) && !HOSTS.length) HOSTS = null;
     process.exit(failed ? 1 : 0);
   }
   console.log('SKIP  hosted scenario (OGSOS_HOSTS not set in the test environment)');
-  const idA = '76561198000000001', idB = '76561198000000002';
+  const idA = '76561190000080001', idB = '76561190000080002';
   const tokA = await login(idA), tokB = await login(idB);
   const opts = { opts: { language: 'en', map: '', 'game-mode': 'Deathmatch', 'auto-group': false, regions: { local: { ping: 1 } }, 'user-data': { set: 's', char: 'c', outfit: 'o', var: 'v' } } };
   let a, b;
@@ -357,7 +357,7 @@ if (Array.isArray(HOSTS) && !HOSTS.length) HOSTS = null;
   });
 
   await check('two clients queued at the same time share one session', async () => {
-    const c1 = (await Ws.connect(await login('76561198000000011'))).ws, c2 = (await Ws.connect(await login('76561198000000012'))).ws;
+    const c1 = (await Ws.connect(await login('76561190000080011'))).ws, c2 = (await Ws.connect(await login('76561190000080012'))).ws;
     await c1.next('ready'); await c2.next('ready');
     // Leave the first match so we are not placed in an open session.
     await a.req('leave-session', { 'session-id': a.sessionId }, 'ack'); await b.req('leave-session', { 'session-id': a.sessionId }, 'ack');
@@ -371,7 +371,7 @@ if (Array.isArray(HOSTS) && !HOSTS.length) HOSTS = null;
   });
 
   await check('cancel-find-session -> ack, and no session follows', async () => {
-    const cfg = (await Ws.connect(await login('76561198000000021'))).ws; await cfg.next('ready');
+    const cfg = (await Ws.connect(await login('76561190000080021'))).ws; await cfg.next('ready');
     // Expire open sessions' late-join so the player really queues is not needed: just cancel immediately.
     cfg.send('find-session', opts); cfg.send('cancel-find-session');
     await cfg.next('ack'); await cfg.next('ack');
@@ -381,12 +381,12 @@ if (Array.isArray(HOSTS) && !HOSTS.length) HOSTS = null;
   });
 
   await check('group-find-session -> ack; cancel -> ack; member gets queue-cancel event', async () => {
-    const g1 = (await Ws.connect(await login('76561198000000031'))).ws, g2 = (await Ws.connect(await login('76561198000000032'))).ws;
+    const g1 = (await Ws.connect(await login('76561190000080031'))).ws, g2 = (await Ws.connect(await login('76561190000080032'))).ws;
     await g1.next('ready'); await g2.next('ready');
     const grp = (await g1.req('create-group', { opts: opts.opts, 'group-opts': { 'game-mode': 'Deathmatch' } }, 'group')).data.group;
     const j = await g2.req('join-group', { 'group-id': grp.id, opts: opts.opts }, 'group');
     assert(Object.keys(j.data.group.players).length === 2, 'two players');
-    const ev = await g1.next('group-event'); assert(ev.data.event === 'join' && ev.data['player-id'] === '76561198000000032', JSON.stringify(ev));
+    const ev = await g1.next('group-event'); assert(ev.data.event === 'join' && ev.data['player-id'] === '76561190000080032', JSON.stringify(ev));
     // Fill/expire nothing: cancel quickly, before the batch timer fires.
     g1.send('group-find-session', { opts: {} }); g1.send('cancel-group-find-session');
     await g1.next('ack'); await g1.next('ack');

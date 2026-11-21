@@ -161,7 +161,28 @@ function createFame({ db, saveDb, displayName = (id) => id, log = () => {} }) {
   }
   const isFameBoard = (board) => board === BOARDS.solo || board === BOARDS.duo;
 
-  return { recordMatch, fameForMatch, heroStats, applyToBlob, fameLeaderboard, fameAround, isFameBoard, weights };
+  // Admin edit (server/admin.js adjust / reset-stats). patch: soloFameRating, fameWins, matches and the five sentiment
+  // counters. Only an account that already has hero stats is touched unless { create: true }. Returns { old, new } of the
+  // fields that changed, or null when there is nothing to edit.
+  function adjust(accountId, patch, { create = false } = {}) {
+    let st = stats()[accountId];
+    if (!st) {
+      if (!create) return null;
+      st = stats()[accountId] = { fame: 0, fameWins: 0, matches: 0, soloFameRating: 0, prevSoloFameRating: 0 };
+    }
+    const old = {}, nu = {};
+    for (const k of ['soloFameRating', 'fameWins', 'matches', ...SENTIMENTS]) {
+      if (patch[k] === undefined || !Number.isFinite(Number(patch[k]))) continue;
+      const v = Math.round(Number(patch[k]));
+      if ((st[k] || 0) === v) continue;
+      old[k] = st[k] || 0; nu[k] = v; st[k] = v;
+    }
+    if ('soloFameRating' in nu) st.prevSoloFameRating = nu.soloFameRating;
+    if (Object.keys(nu).length) saveDb();
+    return { old, new: nu };
+  }
+
+  return { recordMatch, fameForMatch, heroStats, applyToBlob, adjust, fameLeaderboard, fameAround, isFameBoard, weights };
 }
 
 module.exports = { createFame, SENTIMENTS, BLOB_HERO };
