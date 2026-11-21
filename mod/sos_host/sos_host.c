@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <wchar.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------------ */
 /* version.dll forwarding                                                    */
@@ -71,7 +72,13 @@ static struct {
     int startup_radius;       /* cm, for ReplicateStartupActors=2 */
     int ack_moves;            /* 1: answer each joiner ServerMove with ClientAckGoodMove */
     int skip_login_check;     /* 1: RestartPlayer treats every player as logged in (test switch) */
-} cfg = { 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 15000, 1, 0 };
+    int tick_char_radius;     /* cm; >0: Characters this near a joiner always tick their pose */
+    int max_fps;              /* >0: cap the host's frame rate (sleep in TickFlush) */
+} cfg = {
+    .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
+    .replicate_actors = 1, .startup_radius = 15000, .ack_moves = 1,
+    .tick_char_radius = 15000,
+};
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_log_path[MAX_PATH];
@@ -125,7 +132,7 @@ static void load_config(HMODULE self)
     cfg.max_client_rate  = GetPrivateProfileIntW(L"Host", L"MaxClientRate", cfg.max_client_rate, ini);
     cfg.replicate_actors = GetPrivateProfileIntW(L"Host", L"ReplicateActors", cfg.replicate_actors, ini);
     cfg.replicate_startup = GetPrivateProfileIntW(L"Host", L"ReplicateStartupActors", cfg.replicate_startup, ini);
-    cfg.startup_radius = GetPrivateProfileIntW(L"Host", L"StartupActorRadius", 15000, ini);
+    cfg.startup_radius = GetPrivateProfileIntW(L"Host", L"StartupActorRadius", cfg.startup_radius, ini);
     {   /* Env override, for launchers that rewrite the ini. */
         char ev[16];
         if (GetEnvironmentVariableA("SOS_HOST_REPLICATE_STARTUP", ev, sizeof ev) > 0)
@@ -133,6 +140,13 @@ static void load_config(HMODULE self)
     }
     cfg.ack_moves        = GetPrivateProfileIntW(L"Host", L"AckMoves", cfg.ack_moves, ini);
     cfg.skip_login_check = GetPrivateProfileIntW(L"Host", L"SkipLoginCheck", cfg.skip_login_check, ini);
+    cfg.tick_char_radius = GetPrivateProfileIntW(L"Host", L"TickCharacterRadius", cfg.tick_char_radius, ini);
+    cfg.max_fps          = GetPrivateProfileIntW(L"Host", L"MaxFPS", cfg.max_fps, ini);
+    {
+        char ev[16];
+        if (GetEnvironmentVariableA("SOS_HOST_MAX_FPS", ev, sizeof ev) > 0)
+            cfg.max_fps = atoi(ev);
+    }
 
     wchar_t log_name[MAX_PATH];
     GetPrivateProfileStringW(L"Host", L"LogFile", L"sos_host.log", log_name, MAX_PATH, ini);
@@ -689,6 +703,50 @@ static int near_loc(uint8_t *actor, const float *loc, float r)
     return dx * dx + dy * dy + dz * dz <= r * r;
 }
 
+/* Class -> "derives from Character" cache. Only Characters get their Mesh
+   field read, so the +0x3E0 read never lands outside a smaller actor. */
+#define CLASS_SUPER       0x30    /* UStruct::SuperStruct */
+#define OBJ_CLASS         0x10
+#define OBJ_NAME          0x18
+static struct { uint8_t *cls; uint8_t is_char; } g_cls_cache[2048];
+static uint64_t g_char_name;
+
+static int is_character(uint8_t *actor)
+{
+    uint8_t *cls = *(uint8_t **)(actor + OBJ_CLASS);
+    if (!cls) return 0;
+    if (!g_char_name) {
+        FName n;
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&n, L"Character", 1 /* FNAME_Add */);
+        memcpy(&g_char_name, &n, sizeof g_char_name);
+    }
+    unsigned h = (unsigned)(((uintptr_t)cls >> 4) * 2654435761u) & 2047;
+    for (unsigned k = 0; k < 2048; k++, h = (h + 1) & 2047) {
+        if (g_cls_cache[h].cls == cls) return g_cls_cache[h].is_char;
+        if (!g_cls_cache[h].cls) {
+            uint8_t r = 0;
+            int depth = 0;
+            for (uint8_t *c = cls; c && depth < 64; c = *(uint8_t **)(c + CLASS_SUPER), depth++)
+                if (*(uint64_t *)(c + OBJ_NAME) == g_char_name) { r = 1; break; }
+            g_cls_cache[h].cls = cls;
+            g_cls_cache[h].is_char = r;
+            return r;
+        }
+    }
+    return 0;   /* cache full */
+}
+
+/* A listen host only ticks a skeletal mesh's pose while it is rendered there
+   (OnlyTickPoseWhenRendered). Off the host's screen, montages on joiner pawns
+   and AI never advance: no AnimNotifies (eating, melee hit windows) and no root
+   motion. A dedicated server ticks every pose; do that for Characters. */
+static void tick_pose_always(uint8_t *ch)
+{
+    uint8_t *mesh = *(uint8_t **)(ch + CHAR_MESH);
+    if (mesh && *(uint8_t **)(mesh + OBJ_OUTER) == ch && mesh[MESH_UPDATEFLAG] == 1)
+        mesh[MESH_UPDATEFLAG] = 0;
+}
+
 static void replicate_actors(uint8_t *drv)
 {
     if (*(void **)(drv + DRV_SERVERCONN)) return;              /* client */
@@ -763,9 +821,7 @@ static void replicate_actors(uint8_t *drv)
            dedicated server ticks every pose; do the same for joiner pawns. */
         {
             uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
-            uint8_t *mesh = p ? *(uint8_t **)(p + CHAR_MESH) : NULL;
-            if (mesh && *(uint8_t **)(mesh + OBJ_OUTER) == p && mesh[MESH_UPDATEFLAG] == 1)
-                mesh[MESH_UPDATEFLAG] = 0;
+            if (p && is_character(p)) tick_pose_always(p);
         }
         /* The joiner's own controller, pawn and player state first. */
         uint8_t *own[3] = { pc, *(uint8_t **)(pc + PC_PAWN), *(uint8_t **)(pc + PC_PLAYERSTATE) };
@@ -773,16 +829,20 @@ static void replicate_actors(uint8_t *drv)
         for (int k = 0; k < 3 && ok; k++)
             if (own[k] && (own[k][ACTOR_FLAGS2] & 4) && !pending_kill(own[k]))
                 ok = replicate_to(drv, conn, own[k], &opens_left, NULL);
-        const float *ploc = NULL;
-        if (cfg.replicate_startup == 2 && own[1]) {
+        const float *ploc_any = NULL;
+        if (own[1]) {
             uint8_t *root = *(uint8_t **)(own[1] + ACTOR_ROOTCOMP);
-            if (root) ploc = (const float *)(root + ACTOR_COMPLOC);
+            if (root) ploc_any = (const float *)(root + ACTOR_COMPLOC);
         }
+        const float *ploc = cfg.replicate_startup == 2 ? ploc_any : NULL;
         float radius = (float)cfg.startup_radius;
         int i = 0;
         for (; ok && i < ndue; i++) {
             uint8_t *a = g_due[i];
             if (a == own[0] || a == own[1] || a == own[2] || !relevant_to(a, pc)) continue;
+            if (cfg.tick_char_radius > 0 && ploc_any && is_character(a) &&
+                near_loc(a, ploc_any, (float)cfg.tick_char_radius))
+                tick_pose_always(a);
             if (cfg.replicate_startup == 2 && (a[ACTOR_FLAGS] & 4)) {
                 /* No pawn yet: hold map actors back. Not yet near: skip; a channel
                    that is already open keeps getting updates. */
@@ -809,10 +869,46 @@ static void replicate_actors(uint8_t *drv)
     }
 }
 
+/* Frame cap. TickFlush runs once per engine frame, so sleeping here until the
+   next frame is due caps the whole host (game tick, rendering, net) at MaxFPS.
+   The client build has no server tick-rate limit of its own. */
+static void cap_frame(void)
+{
+    static LARGE_INTEGER freq, next;
+    static HANDLE timer;
+    static int init;
+    if (!init) {
+        init = 1;
+        QueryPerformanceFrequency(&freq);
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        hlog("MaxFPS=%d (%s timer)", cfg.max_fps, timer ? "waitable" : "Sleep");
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    int64_t period = freq.QuadPart / cfg.max_fps;
+    if (!next.QuadPart || now.QuadPart - next.QuadPart > period * 4) next = now;  /* first frame or long hitch */
+    int64_t wait = next.QuadPart - now.QuadPart;
+    if (wait > 0) {
+        int64_t hns = wait * 10000000 / freq.QuadPart;
+        LARGE_INTEGER due; due.QuadPart = -hns;
+        if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(timer, (DWORD)(hns / 10000 + 50));
+        else
+            Sleep((DWORD)(hns / 10000));
+    }
+    next.QuadPart += period;
+}
+
 static void h_tick_flush(uint8_t *drv, float dt)
 {
     if (cfg.replicate_actors) replicate_actors(drv);
     o_tick_flush(drv, dt);
+    /* Once per frame: only for the world's game driver, and only when hosting. */
+    if (cfg.max_fps > 0 && !*(void **)(drv + DRV_SERVERCONN)) {
+        uint8_t *world = *(uint8_t **)(drv + DRV_WORLD);
+        if (world && *(uint8_t **)(world + UWORLD_NETDRIVER) == drv) cap_frame();
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1144,14 +1240,15 @@ static void install(void)
         o_eliminate = (EliminateFn)hook_entry(&cursor, g_build->eliminate, p_elim, 5,
                                               (void *)h_eliminate, "TeamManager EliminatePlayer");
         hlog("FixJoinState=%d BlockEliminate=%d", cfg.fix_join_state, cfg.block_eliminate);
-        if (cfg.replicate_actors && g_build->tick_flush) {
+        if ((cfg.replicate_actors || cfg.max_fps > 0) && g_build->tick_flush) {
             static const uint8_t p_flush[15] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48,
                                                  0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20 };
             o_tick_flush = (TickFlushFn)hook_entry(&cursor, g_build->tick_flush, p_flush, 15,
                                                    (void *)h_tick_flush, "UNetDriver::TickFlush");
         }
-        hlog("ReplicateActors=%d ReplicateStartupActors=%d", cfg.replicate_actors && o_tick_flush,
-             cfg.replicate_startup);
+        hlog("ReplicateActors=%d ReplicateStartupActors=%d TickCharacterRadius=%d MaxFPS=%d",
+             cfg.replicate_actors && o_tick_flush, cfg.replicate_startup, cfg.tick_char_radius,
+             o_tick_flush ? cfg.max_fps : 0);
         if (cfg.ack_moves && g_build->exec_server_move) {
             /* mov [rsp+18h],rbx; push rbp; push rsi; push rdi; lea rbp,[rsp-47h] */
             static const uint8_t p_exec[13] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57,
