@@ -349,17 +349,26 @@ function handleApi(req, url, body, res) {
       identities: steamId ? [{ provider: 'steam', 'provider-data': steamId }] : [],
     };
     db.accounts[accountId]['last-access'] = new Date().toISOString();
-    // Steam persona as the in-game name (the client joins with ?Name=<display-name>); see server/persona.js.
-    if (steamId) refreshPersona(db.accounts[accountId], steamId, { save: saveDb });
     const appId = String(j['app-id'] || req.headers['app-id'] || 'sos');
     const roles = isClassic(appId) ? classicRoles(accountId, steamId, j.roles) : (j.roles || ['app-user']);
     const jwt = makeJwt(accountId, steamId, roles, appId);
     db.tokens[jwt] = accountId;
     saveDb();
-    const payload = { ...accountView(db.accounts[accountId]), 'user-id': accountId, 'access-token': jwt, token: jwt };
-    if (isClassic(appId)) payload.roles = roles;
-    // Give the fields both at top level and under "data" until we know which the client reads.
-    return send(res, 200, { ...payload, version: 1, data: payload });
+    const reply = () => {
+      const payload = { ...accountView(db.accounts[accountId]), 'user-id': accountId, 'access-token': jwt, token: jwt };
+      if (isClassic(appId)) payload.roles = roles;
+      // Give the fields both at top level and under "data" until we know which the client reads.
+      return send(res, 200, { ...payload, version: 1, data: payload });
+    };
+    // Steam persona as the in-game name (the client joins with ?Name=<display-name>); see server/persona.js.
+    // An account never looked up waits up to 2.5 s, so even the first launch shows the real name.
+    const acc = db.accounts[accountId];
+    if (steamId && !acc['persona-checked']) {
+      refreshPersona(acc, steamId, { save: saveDb, waitMs: 2500 }).then(reply, reply);
+      return { status: 200, out: '<deferred until the Steam persona lookup>' };
+    }
+    if (steamId) refreshPersona(acc, steamId, { save: saveDb });
+    return reply();
   }
   // "Crack" a token: the client can ask the server what a token contains.
   if (req.method === 'GET' && (r = m(/^\/api\/access-token\/([^/]+)$/)) && r[1] !== 'once-code') {
