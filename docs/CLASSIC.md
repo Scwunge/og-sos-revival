@@ -208,10 +208,11 @@ Server (`server/server.js`):
    - `sostest` gets `data/kv-classic/`;
    - everything else gets `data/kv/`.
 
-   `data/kv-classic/runtime-1.json` sets:
+   `data/kv-classic/live-rev.txt` names the current file, `runtime-2.json`. Bump the revision with every change so running clients and hosts refetch. It sets:
    - `UE_CLIENT_TEST_SERVER_ENABLED` and its MOTD;
    - the custom-match keys (map `LaCuna`) and the duo keys, all open to role `user`;
-   - an empty `UE_CLIENT_DIRECTOR_USERS`.
+   - an empty `UE_CLIENT_DIRECTOR_USERS`;
+   - `UE_CLIENT_VOTING_ENABLED: false`. The host's FlareVotingManager reads it. When unset, a flare starts a HERO audience vote that needs the dead Stream service (docs/HERO_TV.md).
 4. **Matchmaking.** Classic connections (JWT `app-id` `sostest`) go to a **second matchmaker instance**. `server/matchmaking.js` is unchanged. The two builds never share a queue or session.
    - Its settings default to the main ones. Any key can be overridden in the `classic` object of `data/config.json`, or with env `OGSOS_CLASSIC_<KEY>`; for example `GAME_SERVER_PORT` for a Classic host.
    - Empty game-mode or map (solo), `duo` groups and custom `create-session`/`start-session` work as-is.
