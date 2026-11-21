@@ -207,6 +207,8 @@ typedef struct {
     uint32_t login_check;       /* JNE (75 xx) after IsLoggedIn in the RestartPlayer override; 0 = not mapped */
     uint32_t gmalloc;           /* FMalloc* GMalloc (vtable: +0x10 Malloc(size, align), +0x20 Free) */
     uint32_t call_prereplication; /* void AActor::CallPreReplication(AActor*, UNetDriver*) */
+    uint32_t stream_status_rpc; /* PC::ClientUpdateLevelStreamingStatus(pc, FName, bLoaded, bVisible, bBlock, int LOD) sender */
+    uint32_t ls_package_name;   /* FName* ULevelStreaming::GetWorldAssetPackageFName(ls, FName* out) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -219,7 +221,7 @@ static const GameBuild k_builds[] = {
         0x01cd360, 0x01c7370, 0x14e9160, 0x14e8d20, 0x01f0600,
         0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0,
+        0, 0, 0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -231,7 +233,7 @@ static const GameBuild k_builds[] = {
         0x11f5460, 0x0ac6ce0, 0x053ecd0, 0x11dba20, 0x1080c10, 0x107dbe0, 0x01672f0,
         0x161e450, 0x161e770, 0x161ebd0, 0x0537810, 0x14824b0, 0x14824f0, 0x2b5a6ec, 0x2b5a7d8,
         0x0185ca0, 0x29e7560,
-        0x0eb1400,
+        0x0eb1400, 0x1483480, 0x118a410,
     },
 };
 
@@ -748,6 +750,68 @@ static void tick_pose_always(uint8_t *ch)
         mesh[MESH_UPDATEFLAG] = 0;
 }
 
+/* Streaming levels. The host loads sublevels (the pregame intro, end-of-match
+   cameras) with BP LoadStreamLevel, which only tells PCs already in the
+   world's list; the join catch-up (PostLogin) never runs for our joiners. So
+   mirror the host's StreamingLevels to each joiner: everything once its pawn
+   exists, then every change. */
+#define WORLD_STREAMINGLEVELS 0x90    /* TArray<ULevelStreaming*> */
+#define LS_FLAGS          0xB0    /* bit5 bShouldBeLoaded, bit6 bShouldBeVisible, bit7 bShouldBlockOnLoad */
+#define LS_LODINDEX       0xB4
+#define MAX_TRACKED_CONNS 32
+#define MAX_TRACKED_LEVELS 128
+typedef void (*StreamStatusFn)(void *pc, uint64_t name, uint8_t loaded, uint8_t visible, uint8_t block, int lod);
+typedef uint64_t *(*LsPackageNameFn)(void *ls, uint64_t *out);
+static struct {
+    uint8_t *conn, *pc;
+    void *level[MAX_TRACKED_LEVELS];
+    uint8_t sent[MAX_TRACKED_LEVELS];   /* 0x80 | loaded | visible<<1 | block<<2 */
+} g_stream[MAX_TRACKED_CONNS];
+
+static void mirror_streaming(uint8_t *world, uint8_t *conn, uint8_t *pc)
+{
+    if (!g_build->stream_status_rpc || !g_build->ls_package_name) return;
+    if (!*(uint8_t **)(pc + PC_PAWN)) return;    /* joiner still loading the map */
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < MAX_TRACKED_CONNS; i++) {
+        if (g_stream[i].conn == conn) { slot = i; break; }
+        if (free_slot < 0 && !g_stream[i].conn) free_slot = i;
+    }
+    if (slot < 0) {
+        if (free_slot < 0) {   /* table full: drop entries of closed connections */
+            free_slot = 0;
+        }
+        slot = free_slot;
+        memset(&g_stream[slot], 0, sizeof g_stream[slot]);
+        g_stream[slot].conn = conn;
+    }
+    if (g_stream[slot].pc != pc) {   /* new controller on this connection: resend all */
+        memset(g_stream[slot].sent, 0, sizeof g_stream[slot].sent);
+        memset(g_stream[slot].level, 0, sizeof g_stream[slot].level);
+        g_stream[slot].pc = pc;
+    }
+    uint8_t **lv = *(uint8_t ***)(world + WORLD_STREAMINGLEVELS);
+    int n = *(int32_t *)(world + WORLD_STREAMINGLEVELS + 8);
+    if (!lv || n <= 0) return;
+    if (n > MAX_TRACKED_LEVELS) n = MAX_TRACKED_LEVELS;
+    for (int i = 0; i < n; i++) {
+        uint8_t *ls = lv[i];
+        if (!ls) continue;
+        uint32_t f = *(uint32_t *)(ls + LS_FLAGS);
+        uint8_t loaded = (f >> 5) & 1, visible = (f >> 6) & 1, block = (f >> 7) & 1;
+        uint8_t st = 0x80 | loaded | visible << 1 | block << 2;
+        if (g_stream[slot].level[i] == ls && g_stream[slot].sent[i] == st) continue;
+        uint64_t name = 0;
+        uint64_t *pn = ((LsPackageNameFn)AT(g_build->ls_package_name))(ls, &name);
+        if (!pn || !*pn) continue;
+        ((StreamStatusFn)AT(g_build->stream_status_rpc))(pc, *pn, loaded, visible, block,
+                                                           *(int32_t *)(ls + LS_LODINDEX));
+        hlog("Streaming level %d -> %p: loaded=%d visible=%d block=%d", i, (void *)pc, loaded, visible, block);
+        g_stream[slot].level[i] = ls;
+        g_stream[slot].sent[i] = st;
+    }
+}
+
 static void replicate_actors(uint8_t *drv)
 {
     if (*(void **)(drv + DRV_SERVERCONN)) return;              /* client */
@@ -816,6 +880,7 @@ static void replicate_actors(uint8_t *drv)
             uint8_t *vt_pawn = *(uint8_t **)(pc + PC_PAWN);
             *(uint8_t **)(conn + CONN_VIEWTARGET) = vt_pawn ? vt_pawn : pc;
         }
+        mirror_streaming(world, conn, pc);
         /* A listen host never renders the joiner's character, so with the
            default OnlyTickPoseWhenRendered its montages don't tick here: no
            AnimNotifies (eat, use, melee hit windows) and no root motion. A
