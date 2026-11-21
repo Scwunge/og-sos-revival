@@ -265,7 +265,7 @@ try {
   $lastBeat = Get-Date; $lastLine = ''; $probeFailSince = $null; $hinted = $false
   while ($true) {
     $Proc = Start-Game
-    $start = Get-Date; $listening = $false; $reason = 'exited'
+    $start = Get-Date; $listening = $false; $reason = 'exited'; $endedAt = $null
     while (-not $Proc.HasExited) {
       Start-Sleep -Seconds 15
       if ($Proc.HasExited) { break }
@@ -298,7 +298,13 @@ try {
         } elseif ($up -gt 300) { $reason = "no 'Listening with' after ${up}s"; break }
         continue
       }
-      if ($st -and "$($st.state)" -eq 'ended') { $reason = 'match ended'; break }
+      if ($st -and "$($st.state)" -eq 'ended') {
+        # Let the post-game show finish: recycle once nobody is connected (last 'Players alive=A connected=C' line), min 20 s, cap 300 s.
+        if (-not $endedAt) { $endedAt = Get-Date }
+        $g = ((Get-Date) - $endedAt).TotalSeconds
+        $last = Get-Content -LiteralPath (Join-Path $Win64 'sos_host.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match 'Players alive=' } | Select-Object -Last 1
+        if ($g -ge 300 -or ($g -ge 20 -and $last -match 'connected=0')) { $reason = 'match ended'; break }
+      }
       if ($up -gt 600) {
         $seen = if ($st) { $st.lastSeenSec } else { $null }
         if ($null -eq $seen -or $seen -gt 300) {

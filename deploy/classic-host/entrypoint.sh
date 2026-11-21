@@ -135,7 +135,7 @@ while :; do
   log "starting game (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
   ( cd "$WIN64" && exec wine "$EXE" "LaCuna?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
       -nullrhi -nosound -unattended -log ${EXTRA_ARGS:-} ) >/dev/null 2>&1 &
-  GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited
+  GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=
 
   while kill -0 "$GAME_PID" 2>/dev/null; do
     sleep 15
@@ -149,7 +149,14 @@ while :; do
       continue
     fi
     # Match over (host event match-end, POST /end, or empty too long): recycle for a fresh map.
-    if [ "$(lobby_state)" = ended ]; then REASON="match ended"; break; fi
+    # The post-game show (results, podium, Exit button) needs the host alive: wait until nobody is connected any more
+    # (last "Players alive=A connected=C" line in sos_host.log), min 20 s, cap POSTGAME_MAX (default 300 s).
+    if [ "$(lobby_state)" = ended ]; then
+      [ -z "$ENDED_AT" ] && ENDED_AT=$(date +%s)
+      G=$(( $(date +%s) - ENDED_AT ))
+      LAST=$(grep 'Players alive=' "$WIN64/sos_host.log" 2>/dev/null | tail -1)
+      if [ $G -ge "${POSTGAME_MAX:-300}" ] || { [ $G -ge 20 ] && echo "$LAST" | grep -q 'connected=0'; }; then REASON="match ended (${G}s after the end)"; break; fi
+    fi
     if [ $UP -gt 600 ]; then
       SEEN=$(last_seen)
       if [ -z "$SEEN" ] || [ "$SEEN" -gt "$POLL_STALE" ]; then
@@ -166,7 +173,7 @@ while :; do
     fi
   done
   log "game stopped: $REASON"
-  mkdir -p "$HOME/logs" && cp -f "$WIN64/sos_host.log" "$HOME/logs/sos_host.last.log" 2>/dev/null
+  mkdir -p "$HOME/logs" && cp -f "$WIN64/sos_host.log" "$HOME/logs/sos_host.last.log" 2>/dev/null; cp -f "$WIN64"/sos_game_*.log "$HOME/logs/" 2>/dev/null
   stop_game
   # Crash loop guard: a game that dies within 90 s of starting backs off (up to 5 min). While it is down the backend
   # sees no polls and lists the lobby as offline, so players are not sent to a dead host.
