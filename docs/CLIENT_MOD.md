@@ -64,6 +64,48 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 - Verified (with it on): the Founder's Pack T-Shirts row is listed and a gold shirt equips and renders on the character: `docs/client-mod-dlc-founders-listed.png`, `docs/client-mod-dlc-founders-equipped.png`.
 - Not checked in the game: the gestures and the name plate.
 
+## Roadmap
+
+Ranked by value for the revival divided by effort and risk. Feasibility is for the UE 4.12.5 shipping client with the mod loaded as `xinput1_3.dll` (what the mod can already do: inline hooks, config overrides, Blueprint `ProcessEvent` calls, a D3D11 overlay, a window subclass, HTTP to the backend). "Status" says what is built.
+
+| # | Idea | Value | Effort | Risk | Feasible in UE 4.12 shipping | Status |
+|---|---|---|---|---|---|---|
+| 1 | Text replacement ("SOSTEST" to the revival name, boot notices, any UI string) | High (branding, honest notices) | Small once a draw hook exists | Low | Yes: one hook where Slate draws a string (`FSlateDrawElement::MakeText`), replacement table in a text file | Building, see below |
+| 2 | Quality of life: FOV, FPS cap, VSync, borderless window, graphics cvars | High | Small to medium | Low | Borderless: yes (plain Win32). FOV: yes (`APlayerController::FOV` exec function through `ProcessEvent`). cvars: yes if cvar set by name works in shipping (checked below) | Building |
+| 3 | Report with a clip link | Medium | Medium | Low | Yes. The native report dialog already works against the moderation backend; the mod only adds the clip link (`POST /api/reports`, then `/evidence`). Needs the target picked from the in-match player list | Design only, needs backend routes and a decision |
+| 4 | Self-update (signed) | Very high (fix and ship without asking players to copy files) | Medium | High if done carelessly | Yes. A loaded DLL can be renamed on Windows, so: tiny stable `xinput1_3.dll` stub plus a replaceable `sos_client_core.dll` | Design only (below), not built |
+| 5 | Join a friend through Steam (rich presence `connect`, overlay invite, join request callback) | High | Medium | Low | Yes: call `steam_api64` flat API from the mod; the callback feeds the existing join-hint plus auto PLAY. Needs a lobby id in the rich presence | Not built |
+| 6 | Crash report upload | High (we can finally see why it crashed) | Medium | Medium (privacy: opt-in, strip user name and paths) | Yes. The game already writes crash contexts to `%LOCALAPPDATA%\SOS\Saved\Crashes\UE4CC-Windows-*`; upload them on the next start. Needs a backend route | Not built |
+| 7 | Content and asset patching (mount an extra `.pak`) | High long term (fix Blueprint text, loading screens) | Large | High (a pak runs Blueprint code: must be signed like the DLL) | Partly. Mounting a pak at startup is stock `FPakPlatformFile`; but we have no 4.12 cook, so only byte-level edits of existing assets (same-size strings) are realistic; pak version and signing of the game's own paks not yet checked | Design only |
+| 8 | Bug fixes for known game bugs | Medium | Varies | Medium | Case by case, see "Known bugs" | Evidence collected |
+| 9 | In-game mod settings panel (overlay) | Medium | Medium | Low | Yes, the overlay and mouse hook exist | Not built |
+| 10 | Console (`~`) | Low to medium | Unknown | Low | Unknown: the exe has `ConsoleClassName=OutpostConsole` but shipping builds often compile the console out; test before promising | Not checked |
+| 11 | Ultrawide / aspect | Medium | Small | Low | Mostly a camera aspect constraint setting; UI scaling depends on the game's UMG | Not checked |
+| 12 | Keybind remapping | Medium | Medium | Medium | Possible through the input settings, needs RE | Not checked |
+
+### Self-update design (not built; needs the lead's sign-off on the manifest and key)
+
+Goal: players install two files once; every later fix arrives by itself, and nothing unsigned ever runs.
+
+1. **Two DLLs.** `xinput1_3.dll` becomes a tiny stable stub (the XInput forwarding, a signature check, a loader). The real mod is `sos_client_core.dll`. The stub is almost never updated, which removes the problem that a running `xinput1_3.dll` cannot be overwritten. (Windows does allow renaming a loaded DLL, so the stub can also be replaced by rename if ever needed.)
+2. **Manifest.** The backend serves `GET /mod/manifest.json` (route to be approved): `{ "version": 12, "core": { "url": "...", "sha256": "...", "size": N }, "minStub": 1, "notes": "..." }` plus a detached Ed25519 signature `manifest.sig` over the exact manifest bytes. Version numbers only go up; the client refuses a lower number (downgrade protection).
+3. **Key.** An Ed25519 public key is compiled into the stub (a second key slot for rotation). The private key never touches the VPS or the game PC; it signs releases from the lead's machine. Verification uses a small public-domain implementation (TweetNaCl or Monocypher) linked into the stub, no system crypto dependency.
+4. **Flow on start.** Stub loads the newest *verified* core in the folder (re-hashes it against its stored, signed manifest). In the background the core asks the manifest URL, verifies the signature, downloads the new core to `sos_client_core.dll.new`, checks size and SHA-256 from the signed manifest, and keeps the previous core as `sos_client_core.dll.prev`. Next start loads the new one; if it fails to load or reports a crash flag, the stub falls back to `.prev`.
+5. **Transport.** The backend speaks plain `http://` today, so transport gives no protection: the signature is the only trust anchor, which is why verification is mandatory and the update path never runs any code that failed it.
+6. **Controls.** `AutoUpdate=0` in the ini to disable; update check logged; no restart prompt (applies on next launch).
+7. **Risks.** Antivirus dislikes self-updating DLLs: the stub should be signed with a normal code-signing certificate if one is ever available. Key loss means players need a manual reinstall (keep a backup of the private key offline).
+
+### Content patching design (not built)
+
+- Delivery reuses the update mechanism: the manifest lists `paks[]` with SHA-256 and the same signature. Unsigned or hash-mismatching paks are never mounted.
+- Mount at startup by calling `FPakPlatformFile::Mount` (RVA to find), or by writing a `*_P.pak` into `SOS\Content\Paks`, if the game's loader picks it up. Both need testing against the game's own pak version.
+- Without a 4.12 editor cook, patches are byte-level edits of existing uassets (localized strings and tables, same or shorter length) repacked into a small pak. Replacing meshes or adding assets is out of reach.
+
+### Known bugs worth fixing (evidence)
+
+- **Post-match matchmaking reconnect fails:** `libwebsocket: Socket fd 34536 too high (30000)` followed by `FOutpostMatchmakingClient received error`, seen at match end (13:05:46) and at quit (12:36:10) in logs, also without the mod. libwebsockets 1.4 sizes its fd table at 30000, but Windows socket handle values here are about 34000, so any new WebSocket after play for a while fails. Possible fix: raise the fd limit before the table is allocated, or reduce the process handle count. Not built; needs RE of the lws context creation.
+- **Post-game prompt takes no input:** `Attempted to get an item from array Keys out of bounds [-1/0]` right after the post-game sequence; handed to the hosting session.
+
 ## Input diagnostics (post-death prompt report)
 
 A player reported that the spectate/leave prompt after dying did not take clicks (on prod, launched from Steam). Code review found no mod path that touches input in a match: the window subclass only consumes mouse messages while the SERVERS panel is open (it is closed when a non-menu map loads) or over the SERVERS button on the main menu; the XInput exports jump straight to the system DLL, so no gamepad is invented; the mod never calls SetCursor, ShowCursor, ClipCursor or SetCapture. It could not be reproduced here (no local death test). To settle it from a player's log the mod now writes:
