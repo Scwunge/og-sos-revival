@@ -17,12 +17,14 @@
  * See docs/HOSTING_DLL.md.
  */
 #define WIN32_LEAN_AND_MEAN
+#define _CRT_RAND_S
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <wchar.h>
 #include <string.h>
+#include <stdlib.h>
 #include <winhttp.h>
 
 /* ------------------------------------------------------------------------ */
@@ -83,6 +85,8 @@ static struct {
     int mirror_streaming;     /* 1: send the host's streaming-level states to joiners (kept joiners on the loading screen) */
     int correct_moves;        /* 1: correct a joiner the host has far from its own position */
     int correct_dist;         /* cm the joiner may be off before it is corrected */
+    int test_match_end;       /* test switch: >0 = fire the match end this many s after the first joiner pawn */
+    wchar_t stat_props[512];  /* PlayerState properties added to each player's match-end entry */
 } cfg = {
     .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
     .replicate_actors = 1, .startup_radius = 15000, .ack_moves = 1,
@@ -181,6 +185,8 @@ static void load_config(HMODULE self)
     if (!cfg.token[0])   cmdline_value(L"-SESSION_TOKEN=", cfg.token, 512);
     cfg.correct_moves    = GetPrivateProfileIntW(L"Host", L"CorrectMoves", cfg.correct_moves, ini);
     cfg.correct_dist     = GetPrivateProfileIntW(L"Host", L"CorrectDistance", cfg.correct_dist, ini);
+    GetPrivateProfileStringW(L"Host", L"StatProps", L"", cfg.stat_props, 512, ini);
+    cfg.test_match_end   = GetPrivateProfileIntW(L"Host", L"TestMatchEndSec", 0, ini);
     cfg.set_pawn_owner   = GetPrivateProfileIntW(L"Host", L"SetPawnOwner", cfg.set_pawn_owner, ini);
     cfg.mirror_streaming = GetPrivateProfileIntW(L"Host", L"MirrorStreamingLevels", cfg.mirror_streaming, ini);
     {
@@ -251,6 +257,9 @@ typedef struct {
     uint32_t stream_status_rpc; /* PC::ClientUpdateLevelStreamingStatus(pc, FName, bLoaded, bVisible, bBlock, int LOD) sender */
     uint32_t ls_package_name;   /* FName* ULevelStreaming::GetWorldAssetPackageFName(ls, FName* out) */
     uint32_t notify_destroyed;  /* void UNetDriver::NotifyActorDestroyed(drv, actor, bool bIsSeamlessTravel); server part stripped */
+    /* Match stats (Classic only; 0 = not mapped) */
+    uint32_t gm_killed;         /* void GameMode::Killed(GM*, AController* Killer, AController* Victim, APawn*, UDamageType*) */
+    uint32_t escaped_call;      /* E8 call to UEventLogLibrary::LogPlayerEscaped(AShooterCharacter*) in its exec thunk */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -264,6 +273,7 @@ static const GameBuild k_builds[] = {
         0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0,
+        0, 0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -276,6 +286,7 @@ static const GameBuild k_builds[] = {
         0x161e450, 0x161e770, 0x161ebd0, 0x0537810, 0x14824b0, 0x14824f0, 0x2b5a6ec, 0x2b5a7d8,
         0x0185ca0, 0x29e7560,
         0x0eb1400, 0x1483480, 0x118a410, 0x11ea410,
+        0x0168bf0, 0x031a990,
     },
 };
 
@@ -489,16 +500,32 @@ void *g_log_tramp;   /* referenced from log_hook */
    right after RopeExtractionComponent.MatchHasEnded. Log one clear line for
    host supervisors and tell the backend so it can recycle the session. */
 static void backend_session_event(const char *json);
+static void build_match_end_json(char *out, size_t cap, float now);
+static void reset_match_stats(void);
 static DWORD g_match_end_tick;
+static float g_world_now;   /* world seconds at the last replication pass */
+static float g_match_first_pawn_pub;   /* copy of g_match_first_pawn for the log hook */
+static float g_first_tracked;          /* world seconds when the first joiner was seen (test switch) */
 
 static void match_end_on_log(const wchar_t *msg)
 {
-    if (!wcsstr(msg, L"ActivateLevel") || !wcsstr(msg, L"_PostGame")) return;
+    if (!wcsstr(msg, L"ActivateLevel") || !wcsstr(msg, L"_PostGame")) {
+        /* Test switch: pretend the match ended N s after the first joiner pawn. */
+        static int fired;
+        if (!cfg.test_match_end || fired || !g_first_tracked ||
+            g_world_now - g_first_tracked < (float)cfg.test_match_end) return;
+        fired = 1;
+        hlog("TestMatchEndSec=%d reached", cfg.test_match_end);
+    }
     DWORD t = GetTickCount();
     if (g_match_end_tick && t - g_match_end_tick < 60000) return;   /* logged twice per end */
     g_match_end_tick = t;
     hlog("[sos_host] MatchEnded reason=postgame");
-    backend_session_event("{\"type\":\"match-end\",\"reason\":\"postgame\"}");
+    static char body[16000];
+    build_match_end_json(body, sizeof body, g_world_now);
+    hlog("[sos_host] MatchResults %s", body);
+    backend_session_event(body);
+    reset_match_stats();
 }
 
 void log_capture(uint64_t *frame)
@@ -776,9 +803,10 @@ static int near_loc(uint8_t *actor, const float *loc, float r)
 #define OBJ_CLASS         0x10
 #define OBJ_NAME          0x18
 static struct { uint8_t *cls; uint8_t flags; } g_cls_cache[2048];
-static uint64_t g_char_name, g_show_name;
+static uint64_t g_char_name, g_show_name, g_sps_name;
 #define CLS_CHARACTER 1
 #define CLS_GAMESHOW  2   /* the pregame/match show the joiner's intro plays from */
+#define CLS_SHOOTERPS 4   /* AShooterPlayerState (native stat counters) */
 
 static uint8_t class_flags(uint8_t *actor)
 {
@@ -790,6 +818,8 @@ static uint8_t class_flags(uint8_t *actor)
         memcpy(&g_char_name, &n, sizeof g_char_name);
         ((FNameCtorFn)AT(g_build->fname_ctor))(&n, L"GameShow_C", 1);
         memcpy(&g_show_name, &n, sizeof g_show_name);
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&n, L"ShooterPlayerState", 1);
+        memcpy(&g_sps_name, &n, sizeof g_sps_name);
     }
     unsigned h = (unsigned)(((uintptr_t)cls >> 4) * 2654435761u) & 2047;
     for (unsigned k = 0; k < 2048; k++, h = (h + 1) & 2047) {
@@ -801,6 +831,7 @@ static uint8_t class_flags(uint8_t *actor)
                 uint64_t nm = *(uint64_t *)(c + OBJ_NAME);
                 if (nm == g_char_name) r |= CLS_CHARACTER;
                 if (nm == g_show_name) r |= CLS_GAMESHOW;
+                if (nm == g_sps_name) r |= CLS_SHOOTERPS;
             }
             g_cls_cache[h].cls = cls;
             g_cls_cache[h].flags = r;
@@ -811,6 +842,351 @@ static uint8_t class_flags(uint8_t *actor)
 }
 
 static int is_character(uint8_t *actor) { return class_flags(actor) & CLS_CHARACTER; }
+
+/* ------------------------------------------------------------------------ */
+/* Per-player match stats (for the backend's XP and leaderboards)            */
+/* ------------------------------------------------------------------------ */
+
+/* Read memory that may not be mapped (game objects we only half know). */
+static int safe_read(const void *src, void *dst, size_t n)
+{
+    SIZE_T got = 0;
+    return src && ReadProcessMemory(GetCurrentProcess(), src, dst, n, &got) && got == n;
+}
+
+#define STRUCT_CHILDREN   0x38    /* UStruct::Children (UField*) */
+#define FIELD_NEXT        0x28    /* UField::Next */
+#define PROP_OFFSET       0x50    /* UProperty::Offset_Internal */
+#define PS_UNIQUEID       0x3d8   /* FUniqueNetId* inside APlayerState::UniqueId */
+
+/* Find a reflected property by name on obj's class chain. Returns its offset
+   and the FName of its property class (IntProperty, FloatProperty, ...), or -1. */
+static int find_prop_f(uint8_t *obj, const wchar_t *name, uint64_t *type, uint8_t **field)
+{
+    FName fn;
+    ((FNameCtorFn)AT(g_build->fname_ctor))(&fn, name, 0 /* FNAME_Find */);
+    if (!fn.v) return -1;
+    uint8_t *cls = *(uint8_t **)(obj + OBJ_CLASS);
+    for (int depth = 0; cls && depth < 64; cls = *(uint8_t **)(cls + CLASS_SUPER), depth++) {
+        int guard = 0;
+        for (uint8_t *f = *(uint8_t **)(cls + STRUCT_CHILDREN); f && guard < 4096; f = *(uint8_t **)(f + FIELD_NEXT), guard++) {
+            if (*(uint64_t *)(f + OBJ_NAME) != fn.v) continue;
+            uint8_t *fcls = *(uint8_t **)(f + OBJ_CLASS);
+            if (type) *type = fcls ? *(uint64_t *)(fcls + OBJ_NAME) : 0;
+            if (field) *field = f;
+            return *(int32_t *)(f + PROP_OFFSET);
+        }
+    }
+    return -1;
+}
+#define find_prop(o, n, t) find_prop_f(o, n, t, NULL)
+
+static void json_escape(char *out, size_t cap, const wchar_t *in, int n)
+{
+    size_t o = 0;
+    for (int i = 0; in && i < n && in[i] && o + 7 < cap; i++) {
+        wchar_t c = in[i];
+        if (c == L'"' || c == L'\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c < 0x20 || c > 0x7e) o += snprintf(out + o, cap - o, "\\u%04x", (unsigned)c);
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+}
+
+/* Steam ID (or backend id string) of a PlayerState, "" if unknown. */
+static void ps_player_id(uint8_t *ps, char *out, size_t cap)
+{
+    out[0] = 0;
+    uint8_t *id = NULL, raw[24];
+    if (!safe_read(ps + PS_UNIQUEID, &id, sizeof id) || !safe_read(id, raw, sizeof raw)) {
+        static int said;
+        if (!said++) hlog("PlayerState %p: no UniqueId object (%p)", (void *)ps, (void *)id);
+        /* No online id (Steam off on that client): fall back to the match-local
+           PlayerId so the player is still listed; the backend can't credit it. */
+        snprintf(out, cap, "player-%d", *(int32_t *)(ps + PS_PLAYERID));
+        return;
+    }
+    {
+        static int said;
+        if (said++ < 4)
+            hlog("PlayerState %p UniqueId %p: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x",
+                 (void *)ps, (void *)id, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                 raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19]);
+    }
+    uint64_t v; memcpy(&v, raw + 8, 8);
+    if ((v >> 32) == 0x01100001ull) { snprintf(out, cap, "%llu", (unsigned long long)v); return; }
+    FString s; memcpy(&s, raw + 8, sizeof s);             /* FUniqueNetIdString */
+    wchar_t buf[64];
+    if (s.num > 1 && s.num < 64 && safe_read(s.data, buf, s.num * sizeof(wchar_t)))
+        json_escape(out, cap, buf, s.num - 1);
+}
+
+static void ps_name(uint8_t *ps, char *out, size_t cap)
+{
+    static int off = -2;
+    out[0] = 0;
+    if (off == -2) off = find_prop(ps, L"PlayerName", NULL);
+    if (off < 0) return;
+    FString s; wchar_t buf[128];
+    if (safe_read(ps + off, &s, sizeof s) && s.num > 1 && s.num < 128 && safe_read(s.data, buf, s.num * sizeof(wchar_t)))
+        json_escape(out, cap, buf, s.num - 1);
+}
+
+#define MAX_TRACKED 64
+static struct {
+    uint8_t *pc, *ps;
+    char id[48], name[96];
+    float first_pawn, last_alive;   /* world seconds; 0 = never */
+    int had_pawn, deaths, connected, escaped;
+    unsigned seen;
+} g_pl[MAX_TRACKED];
+static float g_match_first_pawn;
+static char g_match_id[40], g_started_at[40];   /* set when the first joiner gets a pawn */
+
+static void new_match_id(void)
+{
+    unsigned r[4] = { 0 };
+    for (int i = 0; i < 4; i++) rand_s(&r[i]);
+    r[1] = (r[1] & 0xffff0fffu) | 0x00004000u;               /* version 4 */
+    r[2] = (r[2] & 0x3fffffffu) | 0x80000000u;               /* variant */
+    snprintf(g_match_id, sizeof g_match_id, "%08x-%04x-%04x-%04x-%04x%08x",
+             r[0], r[1] >> 16, r[1] & 0xffff, r[2] >> 16, r[2] & 0xffff, r[3]);
+    SYSTEMTIME st; GetSystemTime(&st);
+    snprintf(g_started_at, sizeof g_started_at, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    hlog("[sos_host] MatchStarted matchId=%s startedAt=%s", g_match_id, g_started_at);
+}
+
+/* Once per replication pass, for each connected joiner. */
+static void track_player(uint8_t *pc, float now, unsigned pass)
+{
+    int slot = -1;
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (g_pl[i].pc == pc) { slot = i; break; }
+    if (slot < 0)
+        for (int i = 0; i < MAX_TRACKED; i++)
+            if (!g_pl[i].pc) { slot = i; g_pl[i].pc = pc; break; }
+    if (slot < 0) return;
+    uint8_t *ps = *(uint8_t **)(pc + PC_PLAYERSTATE);
+    if (ps && (ps != g_pl[slot].ps || !g_pl[slot].id[0])) {
+        g_pl[slot].ps = ps;
+        ps_player_id(ps, g_pl[slot].id, sizeof g_pl[slot].id);
+        ps_name(ps, g_pl[slot].name, sizeof g_pl[slot].name);
+        if (g_pl[slot].id[0]) hlog("Player %s (%s) tracked", g_pl[slot].id, g_pl[slot].name);
+    }
+    uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
+    int alive = p && !((IsPendingKillFn)AT(g_build->is_pending_kill))(p);
+    if (alive) {
+        if (!g_pl[slot].first_pawn) g_pl[slot].first_pawn = now;
+        if (!g_match_first_pawn) { g_match_first_pawn = now; new_match_id(); }
+        g_pl[slot].last_alive = now;
+    } else if (g_pl[slot].had_pawn) {
+        g_pl[slot].deaths++;
+        hlog("Player %s lost its pawn at %.0f s", g_pl[slot].id, now);
+    }
+    if (!g_first_tracked) g_first_tracked = now > 0 ? now : 0.001f;
+    g_pl[slot].had_pawn = alive;
+    g_pl[slot].connected = 1;
+    g_pl[slot].seen = pass;
+}
+
+/* After a pass: joiners not seen in it have left. */
+static void track_disconnects(unsigned pass)
+{
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (g_pl[i].pc && g_pl[i].connected && g_pl[i].seen != pass) {
+            g_pl[i].connected = 0;
+            g_pl[i].had_pawn = 0;   /* leaving is not a death */
+        }
+}
+
+/* Append ,"Name":value for each PlayerState property listed in StatProps. */
+static size_t stat_props_json(uint8_t *ps, char *out, size_t cap)
+{
+    size_t o = 0;
+    if (!ps || !cfg.stat_props[0]) return 0;
+    static FName t_int, t_float, t_byte, t_bool;
+    if (!t_int.v) {
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&t_int, L"IntProperty", 1);
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&t_float, L"FloatProperty", 1);
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&t_byte, L"ByteProperty", 1);
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&t_bool, L"BoolProperty", 1);
+    }
+    wchar_t list[512];
+    wcsncpy(list, cfg.stat_props, 511); list[511] = 0;
+    wchar_t *ctx = NULL;
+    for (wchar_t *nm = wcstok(list, L", ", &ctx); nm; nm = wcstok(NULL, L", ", &ctx)) {
+        uint64_t type = 0;
+        uint8_t *field = NULL;
+        int off = find_prop_f(ps, nm, &type, &field);
+        if (off < 0 || o + 96 > cap) continue;
+        char key[96]; json_escape(key, sizeof key, nm, (int)wcslen(nm));
+        if (type == t_int.v)        o += snprintf(out + o, cap - o, ",\"%s\":%d", key, *(int32_t *)(ps + off));
+        else if (type == t_float.v) o += snprintf(out + o, cap - o, ",\"%s\":%.2f", key, *(float *)(ps + off));
+        else if (type == t_byte.v)  o += snprintf(out + o, cap - o, ",\"%s\":%u", key, ps[off]);
+        else if (type == t_bool.v) {
+            /* UBoolProperty: FieldSize, ByteOffset, ByteMask, FieldMask follow
+               UProperty (0x70 bytes in 4.12). */
+            uint8_t bo = field[0x71], mask = field[0x72];
+            if (!mask) mask = 0xff;
+            o += snprintf(out + o, cap - o, ",\"%s\":%s", key, (ps[off + bo] & mask) ? "true" : "false");
+        }
+    }
+    return o;
+}
+
+static int pl_slot(const uint8_t *pc)
+{
+    for (int i = 0; pc && i < MAX_TRACKED; i++)
+        if (g_pl[i].pc == pc) return i;
+    return -1;
+}
+
+static void post_player_event(const char *event, int who, int other)
+{
+    if (who < 0 || !g_pl[who].id[0]) return;
+    char body[512];
+    int n = snprintf(body, sizeof body, "{\"type\":\"player-event\",\"event\":\"%s\",\"playerId\":\"%s\"",
+                     event, g_pl[who].id);
+    if (other >= 0 && g_pl[other].id[0])
+        n += snprintf(body + n, sizeof body - n, ",\"otherId\":\"%s\"", g_pl[other].id);
+    if (g_match_id[0])
+        n += snprintf(body + n, sizeof body - n, ",\"matchId\":\"%s\"", g_match_id);
+    if (g_match_first_pawn > 0)
+        n += snprintf(body + n, sizeof body - n, ",\"atSec\":%.0f", g_world_now - g_match_first_pawn);
+    snprintf(body + n, sizeof body - n, "}");
+    hlog("[sos_host] PlayerEvent %s", body);
+    backend_session_event(body);
+}
+
+/* GameMode::Killed(GM, KillerController, VictimController, VictimPawn, DamageType):
+   the native kill handler that bumps the PlayerState kill and death counters. */
+typedef void (*KilledFn)(void *gm, uint8_t *killer, uint8_t *victim, void *pawn, void *dmg);
+static KilledFn o_killed;
+static void h_killed(void *gm, uint8_t *killer, uint8_t *victim, void *pawn, void *dmg)
+{
+    o_killed(gm, killer, victim, pawn, dmg);
+    int k = pl_slot(killer), v = pl_slot(victim);
+    if (v >= 0) post_player_event("death", v, k);
+    if (k >= 0 && v >= 0 && k != v) post_player_event("kill", k, v);
+}
+
+/* UEventLogLibrary::LogPlayerEscaped(AShooterCharacter*): the Blueprint escape
+   path (helicopter or rope extraction) calls it once per escaping player. */
+typedef void (*EscapedFn)(uint8_t *ch);
+static EscapedFn o_escaped;
+static void h_escaped(uint8_t *ch)
+{
+    for (int i = 0; ch && i < MAX_TRACKED; i++)
+        if (g_pl[i].pc && *(uint8_t **)(g_pl[i].pc + PC_PAWN) == ch) {
+            g_pl[i].escaped = 1;
+            post_player_event("escape", i, -1);
+            break;
+        }
+    o_escaped(ch);
+}
+
+static void reset_match_stats(void)
+{
+    memset(g_pl, 0, sizeof g_pl);
+    g_match_first_pawn = 0;
+    g_match_id[0] = g_started_at[0] = 0;
+}
+
+/* AShooterPlayerState counters (offsets from the Classic build, V). */
+#define SPS_TEAM            0x688
+#define SPS_PLAYER_KILLS    0x690
+#define SPS_NPC_KILLS       0x694
+#define SPS_DEATHS          0x698
+#define SPS_DMG_TAKEN_PL    0x6a4
+#define SPS_DMG_TAKEN_NPC   0x6a8
+#define SPS_DMG_HEALED      0x6ac
+#define SPS_DMG_DEALT_PL    0x6b0
+#define SPS_DMG_DEALT_NPC   0x6b4
+
+/* PlayerState_Survival_C's Blueprint bool "Escaped" (offset found by name). */
+static int ps_escaped(uint8_t *ps)
+{
+    uint64_t type = 0; uint8_t *field = NULL;
+    int off = find_prop_f(ps, L"Escaped", &type, &field);
+    if (off < 0 || !field) return -1;
+    uint8_t bo = field[0x71], mask = field[0x72];
+    if (!mask) mask = 0xff;
+    return (ps[off + bo] & mask) != 0;
+}
+
+static int ps_int_prop(uint8_t *ps, const wchar_t *name, int *out)
+{
+    static FName t_int;
+    if (!t_int.v) ((FNameCtorFn)AT(g_build->fname_ctor))(&t_int, L"IntProperty", 1);
+    uint64_t type = 0;
+    int off = find_prop(ps, name, &type);
+    if (off < 0 || type != t_int.v) return 0;
+    *out = *(int32_t *)(ps + off);
+    return 1;
+}
+
+/* 1 = escaped; otherwise players still alive at the end, then the latest to die. */
+static int better_than(int a, int b, float now)
+{
+    if (g_pl[a].escaped != g_pl[b].escaped) return g_pl[a].escaped;
+    if (g_pl[a].escaped) return 0;
+    int aa = g_pl[a].had_pawn && g_pl[a].connected, ab = g_pl[b].had_pawn && g_pl[b].connected;
+    if (aa != ab) return aa;
+    if (aa) return 0;
+    (void)now;
+    return g_pl[a].last_alive > g_pl[b].last_alive + 0.5f;
+}
+
+/* JSON body of the match-end event, with one entry per joiner seen this match. */
+static void build_match_end_json(char *out, size_t cap, float now)
+{
+    /* Escaped flags from the PlayerStates (the escape hook may have set them already). */
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (g_pl[i].pc && g_pl[i].connected && g_pl[i].ps && ps_escaped(g_pl[i].ps) == 1)
+            g_pl[i].escaped = 1;
+    size_t o = (size_t)snprintf(out, cap, "{\"type\":\"match-end\",\"reason\":\"postgame\"");
+    if (g_match_id[0])
+        o += snprintf(out + o, cap - o, ",\"matchId\":\"%s\",\"startedAt\":\"%s\"", g_match_id, g_started_at);
+    if (g_match_first_pawn > 0 && now > g_match_first_pawn)
+        o += snprintf(out + o, cap - o, ",\"durationSec\":%.0f", now - g_match_first_pawn);
+    o += snprintf(out + o, cap - o, ",\"players\":[");
+    int n = 0;
+    for (int i = 0; i < MAX_TRACKED && o + 512 < cap; i++) {
+        if (!g_pl[i].pc || !g_pl[i].id[0]) continue;
+        int alive = g_pl[i].had_pawn && g_pl[i].connected;
+        uint8_t *ps = g_pl[i].connected ? g_pl[i].ps : NULL;
+        int native = ps && (class_flags(ps) & CLS_SHOOTERPS);
+        /* The game's own death count; our pawn-loss count also counts an escape. */
+        int deaths = native ? *(int32_t *)(ps + SPS_DEATHS) : g_pl[i].deaths;
+        o += snprintf(out + o, cap - o, "%s{\"playerId\":\"%s\",\"name\":\"%s\",\"connected\":%s,\"aliveAtEnd\":%s,\"deaths\":%d",
+                      n++ ? "," : "", g_pl[i].id, g_pl[i].name, g_pl[i].connected ? "true" : "false",
+                      alive ? "true" : "false", deaths);
+        if (g_pl[i].first_pawn > 0)
+            o += snprintf(out + o, cap - o, ",\"survivalSec\":%.0f",
+                          (alive ? now : g_pl[i].last_alive) - g_pl[i].first_pawn);
+        int place = 1;
+        for (int j = 0; j < MAX_TRACKED; j++)
+            if (j != i && g_pl[j].pc && g_pl[j].id[0] && better_than(j, i, now)) place++;
+        o += snprintf(out + o, cap - o, ",\"escaped\":%s,\"placement\":%d",
+                      g_pl[i].escaped ? "true" : "false", place);
+        if (native) {
+            o += snprintf(out + o, cap - o,
+                          ",\"kills\":%d,\"npcKills\":%d,\"damageDealt\":%d,\"damageDealtNpc\":%d,"
+                          "\"damageTaken\":%d,\"damageTakenNpc\":%d,\"damageHealed\":%d,\"teamId\":%d",
+                          *(int32_t *)(ps + SPS_PLAYER_KILLS), *(int32_t *)(ps + SPS_NPC_KILLS),
+                          *(int32_t *)(ps + SPS_DMG_DEALT_PL),
+                          *(int32_t *)(ps + SPS_DMG_DEALT_NPC), *(int32_t *)(ps + SPS_DMG_TAKEN_PL),
+                          *(int32_t *)(ps + SPS_DMG_TAKEN_NPC), *(int32_t *)(ps + SPS_DMG_HEALED),
+                          *(int32_t *)(ps + SPS_TEAM));
+            int score;
+            if (ps_int_prop(ps, L"TotalScore", &score)) o += snprintf(out + o, cap - o, ",\"score\":%d", score);
+        }
+        if (ps) o += stat_props_json(ps, out + o, cap - o);
+        o += snprintf(out + o, cap - o, "}");
+    }
+    snprintf(out + o, cap - o, "]}");
+}
 
 /* A listen host only ticks a skeletal mesh's pose while it is rendered there
    (OnlyTickPoseWhenRendered). Off the host's screen, montages on joiner pawns
@@ -949,6 +1325,7 @@ static void replicate_actors(uint8_t *drv)
         if (!conn || *(int32_t *)(conn + CONN_STATE) == 1) continue;
         uint8_t *pc = *(uint8_t **)(conn + CONN_OWNINGACTOR);
         if (!pc) continue;
+        track_player(pc, now, g_passes);
         int opens_left = 64;
         /* Stock ServerReplicateActors sets this every frame; the multicast path in
            UIpNetDriver::ProcessRemoteFunction skips connections without one. */
@@ -1029,6 +1406,9 @@ static void replicate_actors(uint8_t *drv)
         }
         nserved_conns++;
     }
+    track_disconnects(g_passes);
+    g_world_now = now;
+    g_match_first_pawn_pub = g_match_first_pawn;
 
     int done_upto = 0;
     for (int i = 0; i < ndue; i++) {
@@ -1169,7 +1549,7 @@ static void h_tick_flush(uint8_t *drv, float dt)
 
 /* Fire-and-forget JSON POSTs to the revival backend, on a worker thread so the
    game thread never waits on the network. */
-typedef struct BackendReq { struct BackendReq *next; wchar_t path[256]; char body[512]; } BackendReq;
+typedef struct BackendReq { struct BackendReq *next; wchar_t path[256]; char body[16384]; int retries; } BackendReq;
 static BackendReq *g_req_head, *g_req_tail;
 static CRITICAL_SECTION g_req_lock;
 static HANDLE g_req_event;
@@ -1185,6 +1565,8 @@ static DWORD WINAPI backend_worker(LPVOID unused)
             if (r) { g_req_head = r->next; if (!g_req_head) g_req_tail = NULL; }
             LeaveCriticalSection(&g_req_lock);
             if (!r) break;
+            static const DWORD backoff_ms[] = { 2000, 5000, 10000, 10000, 10000 };
+            for (int attempt = 0; ; attempt++) {
             URL_COMPONENTS u;
             wchar_t hostname[128];
             memset(&u, 0, sizeof u);
@@ -1226,6 +1608,10 @@ static DWORD WINAPI backend_worker(LPVOID unused)
             hlog("Backend POST %.*ls%ls %s (token %s) -> %lu",
                  (int)(u.lpszUrlPath ? u.dwUrlPathLength : 0), u.lpszUrlPath ? u.lpszUrlPath : L"",
                  r->path, r->body, cfg.token[0] ? "sent" : "none", status);
+            if ((status >= 200 && status < 300) || attempt >= r->retries || attempt >= 5) break;
+            hlog("Backend POST retry %d in %lu ms", attempt + 1, backoff_ms[attempt]);
+            Sleep(backoff_ms[attempt]);
+            }
             free(r);
         }
     }
@@ -1233,7 +1619,7 @@ static DWORD WINAPI backend_worker(LPVOID unused)
 }
 
 /* path relative to the backend root, e.g. L"/session/<id>/events". */
-static void backend_post(const wchar_t *path, const char *json)
+static void backend_post_retry(const wchar_t *path, const char *json, int retries)
 {
     if (!cfg.backend[0]) return;
     static int started;
@@ -1246,7 +1632,8 @@ static void backend_post(const wchar_t *path, const char *json)
     BackendReq *r = (BackendReq *)calloc(1, sizeof *r);
     if (!r) return;
     wcsncpy(r->path, path, 255);
-    strncpy(r->body, json, 511);
+    strncpy(r->body, json, sizeof r->body - 1);
+    r->retries = retries;
     EnterCriticalSection(&g_req_lock);
     if (g_req_tail) g_req_tail->next = r; else g_req_head = r;
     g_req_tail = r;
@@ -1254,13 +1641,15 @@ static void backend_post(const wchar_t *path, const char *json)
     SetEvent(g_req_event);
 }
 
+
 static void backend_session_event(const char *json)
 {
     if (!cfg.session[0]) return;
     wchar_t path[256];
     _snwprintf(path, 255, L"/session/%ls/events", cfg.session);
     path[255] = 0;
-    backend_post(path, json);
+    /* The match end is the backend's only source of match results: retry it. */
+    backend_post_retry(path, json, strstr(json, "\"match-end\"") ? 3 : 0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1320,6 +1709,7 @@ static int peek_param(uint8_t *stack, int n, void *out, size_t size)
 #define COMP_SCALE        0x130   /* ComponentToWorld scale */
 #define ADJUST_INTERVAL   0.25f   /* s between corrections of one joiner */
 #define FALL_DIST         1000.0f /* cm; while falling only a gap this big is corrected */
+#define BASE_DIST         2000.0f /* cm; same while the joiner stands on a base */
 #define MOVE_FALLING      3
 
 /* World position of a point given relative to a movement base component. */
@@ -1377,6 +1767,10 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
         /* While falling the host's simulation runs ahead of the joiner's, and a
            correction (sent with zero velocity) costs the joiner its momentum. */
         float lim = cmc[CMC_MOVEMODE] == MOVE_FALLING ? FALL_DIST : (float)cfg.correct_dist;
+        /* On a base (the drop vehicle, the pregame line-up) the base itself is
+           often somewhere else on the host than on the joiner, since the intro
+           sequence moves it client-side. Only a teleport-sized gap is corrected. */
+        if (base && lim < BASE_DIST) lim = BASE_DIST;
         if (d2 > lim * lim) {
             int slot = -1, free_slot = -1;
             for (int i = 0; i < 32; i++) {
@@ -1644,6 +2038,31 @@ static void install(void)
             static const uint8_t p_destroyed[9] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0xD9 };
             o_notify_destroyed = (NotifyDestroyedFn)hook_entry(&cursor, g_build->notify_destroyed, p_destroyed, 9,
                                                                (void *)h_notify_destroyed, "UNetDriver::NotifyActorDestroyed");
+        }
+        if (o_tick_flush && cfg.replicate_actors && g_build->gm_killed) {
+            /* mov [rsp+8],rbx; mov [rsp+10h],rbp */
+            static const uint8_t p_killed[10] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10 };
+            o_killed = (KilledFn)hook_entry(&cursor, g_build->gm_killed, p_killed, 10,
+                                            (void *)h_killed, "GameMode::Killed");
+        }
+        if (o_tick_flush && cfg.replicate_actors && g_build->escaped_call) {
+            /* Redirect the thunk's call to LogPlayerEscaped (E8 rel32) through a stub. */
+            uint8_t *call = g_base + g_build->escaped_call;
+            if (call[0] == 0xE8 && cursor) {
+                int32_t rel; memcpy(&rel, call + 1, 4);
+                o_escaped = (EscapedFn)(call + 5 + rel);
+                uint8_t *stub = cursor;
+                uint64_t to = (uint64_t)(uintptr_t)h_escaped;
+                stub[0] = 0x48; stub[1] = 0xB8; memcpy(stub + 2, &to, 8); stub[10] = 0xFF; stub[11] = 0xE0;
+                FlushInstructionCache(GetCurrentProcess(), stub, 16);
+                cursor += 16;
+                int64_t nrel = (int64_t)(stub - (call + 5));
+                int32_t nrel32 = (int32_t)nrel;
+                uint8_t patch[5] = { 0xE8 };
+                memcpy(patch + 1, &nrel32, 4);
+                if (nrel == nrel32 && write_code(call, patch, 5)) hlog("LogPlayerEscaped call redirected at +%07x", g_build->escaped_call);
+                else { o_escaped = NULL; hlog("LogPlayerEscaped: patch failed"); }
+            } else hlog("LogPlayerEscaped: no call at +%07x; not hooked", g_build->escaped_call);
         }
         hlog("ReplicateActors=%d ReplicateStartupActors=%d TickCharacterRadius=%d MaxFPS=%d",
              cfg.replicate_actors && o_tick_flush, cfg.replicate_startup, cfg.tick_char_radius,
