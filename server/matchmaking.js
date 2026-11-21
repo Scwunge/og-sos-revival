@@ -160,7 +160,12 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   const emptyEndMs = Math.max(0, numCfg('EMPTY_END_SECONDS')) * 1000;
   const lateJoinMs = numCfg('LATE_JOIN_SECONDS') * 1000;   // hosted: 0 = never after the start, < 0 = always
   const publicHost = net.isIPv4(String(config.PUBLIC_HOST || '')) ? String(config.PUBLIC_HOST) : '';
-  const hostFor = (s) => publicHost || s.host;   // what clients are told to connect to
+  // What clients are told to connect to. A community host is always reached at its own address
+  // (PUBLIC_HOST is the official pool's address).
+  const hostFor = (s) => (s.hosted && s.hosted.community ? s.host : publicHost || s.host);
+  // Per-host player cap (community hosts choose their own) and the matching start minimum.
+  const maxFor = (s) => (s.hosted && s.hosted.maxPlayers) || config.MAX_PLAYERS;
+  const minFor = (s) => Math.min(startMin, Math.max(1, maxFor(s)));
   const beaconUrl = () => config.BEACON_URL || publicHost || config.GAME_SERVER_HOST;
 
   const uname = (id) => getUname(id) || id;
@@ -192,7 +197,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       host: withHost ? (forHost ? s.host : hostFor(s)) : '', port: withHost ? s.port : 0,
       opts: {
         'game-mode': s.opts.gameMode, 'game-mode-params': s.opts.gameModeParams,
-        'min-players': s.hosted ? startMin : config.MIN_PLAYERS, 'max-players': config.MAX_PLAYERS,
+        'min-players': s.hosted ? minFor(s) : config.MIN_PLAYERS, 'max-players': maxFor(s),
         map: s.opts.map, language: s.opts.language, 'has-auth': !!s.pass,
       },
       'player-map': playerMap, groups: grp, owner: s.owner,
@@ -253,7 +258,11 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     return s;
   }
 
-  for (const entry of hostEntries) {
+  // Public server list data (GET /servers): label overrides from /announce and the time of the host's last poll.
+  // lastPollAny is never cleared by a reset (lastPoll is): the community registry uses it to expire silent hosts.
+  const hostedMeta = new Map();
+  // One persistent hosted session per entry (static pool entry or registered community host).
+  function addHostedEntry(entry) {
     const s = newSession({
       id: entry.sessionId, name: 'Match', host: entry.host, port: entry.port, owner: 'system',
       matchmade: true, started: false, hosted: entry, token: entry.sessionToken,
@@ -261,9 +270,10 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     s.countdownTimer = null; s.countdownEndsAt = null; s.countdownVote = false; s.countdownHeld = false; s.emptyTimer = null;
     s.state = 'waiting'; s.startedAt = null; s.endedAt = null; s.votes = new Set();
     hostedById.set(entry.sessionId, { s, entry });
+    hostedMeta.set(entry.sessionId, { name: entry.name || DEFAULT_SERVER_NAME, region: entry.region || '', lastPoll: null, lastPollAny: null });
+    return s;
   }
-  // Public server list data (GET /servers): label overrides from /announce and the time of the host's last poll.
-  const hostedMeta = new Map(hostEntries.map((e) => [e.sessionId, { name: e.name || DEFAULT_SERVER_NAME, region: e.region || '', lastPoll: null }]));
+  for (const entry of hostEntries) addHostedEntry(entry);
   const hostedSession = () => (hostEntries.length ? hostedById.get(hostEntries[0].sessionId).s : null);
 
   // For the host's own GET /api/session/<id>: the live session plus the host's configured player ids
@@ -286,7 +296,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     const m = hostedMeta.get(String(id));
     if (!m) return false;
     const wasOnline = hostOnline(id);
-    m.lastPoll = Date.now();
+    m.lastPoll = m.lastPollAny = Date.now();
     if (!wasOnline) {
       // Offline -> online: finish a countdown that was held while the host was away, then seat waiting players.
       const s = hostedById.get(String(id)).s;
@@ -315,14 +325,71 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
         online: hostOnline(entry.sessionId, now),
         lastSeenSec: last === null ? null : Math.floor((now - last) / 1000),
         players: [...s.players.keys()].filter((pid) => !entry.hostIds.includes(pid)).length,
-        minPlayers: startMin, maxPlayers: config.MAX_PLAYERS,
+        minPlayers: minFor(s), maxPlayers: maxFor(s),
         state: s.state, countdownEndsAt: s.countdownTimer ? s.countdownEndsAt : null,
         votes: s.votes.size, lateJoinOpen: hostedOpen(s),
         startedAt: s.startedAt, endedAt: s.endedAt,
         map: s.opts.map || '',
-        publicHost,
+        publicHost: entry.community ? '' : publicHost,
+        community: !!entry.community, verified: !!entry.verified,
       };
     });
+  }
+
+  // ---------- community hosts (registered at runtime, see server/community.js) ----------
+  const isCommunityHost = (id) => { const h = hostedById.get(String(id)); return h && h.entry.community ? h.entry : null; };
+  const lastPollOf = (id) => { const m = hostedMeta.get(String(id)); return m ? m.lastPollAny : null; };
+
+  function addCommunityHost({ host, port, sessionId, sessionToken, hostIds, name, region, maxPlayers, verified }) {
+    if (hostedById.has(String(sessionId)) || sessions.has(String(sessionId))) throw new Error('session id exists');
+    const entry = {
+      host, port, sessionId, sessionToken, hostIds: Array.isArray(hostIds) ? hostIds.map(String) : [],
+      name: cleanLabel(name, 48) || DEFAULT_SERVER_NAME, region: cleanLabel(region, 16),
+      community: true, verified: !!verified, maxPlayers: clampMax(maxPlayers),
+    };
+    addHostedEntry(entry);
+    log(`community host ${sessionId} added (${host}:${port})`);
+    return sessionId;
+  }
+  const clampMax = (v) => {
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) ? Math.min(config.MAX_PLAYERS, Math.max(2, n)) : config.MAX_PLAYERS;
+  };
+  // Re-registration: new address / labels / limits, session state and seated players are kept.
+  function updateCommunityHost(id, { host, port, name, region, maxPlayers, verified, hostIds } = {}) {
+    const h = hostedById.get(String(id));
+    if (!h || !h.entry.community) return false;
+    const e = h.entry, m = hostedMeta.get(e.sessionId);
+    if (host !== undefined) { e.host = host; h.s.host = host; }
+    if (port !== undefined) { e.port = port; h.s.port = port; }
+    if (name !== undefined) { e.name = m.name = cleanLabel(name, 48) || DEFAULT_SERVER_NAME; }
+    if (region !== undefined) { e.region = m.region = cleanLabel(region, 16); }
+    if (maxPlayers !== undefined) e.maxPlayers = clampMax(maxPlayers);
+    if (verified !== undefined) e.verified = !!verified;
+    if (Array.isArray(hostIds)) e.hostIds = hostIds.map(String);
+    return true;
+  }
+  // Remove a community host: seated players get session-closed (as in endSession), timers and join hints go too.
+  function removeCommunityHost(id, why = 'removed') {
+    const h = hostedById.get(String(id));
+    if (!h || !h.entry.community) return null;
+    const s = h.s;
+    cancelCountdown(s);
+    if (s.emptyTimer) { clearTimeout(s.emptyTimer); s.emptyTimer = null; }
+    const ids = [...s.players.keys()];
+    for (const pid of ids) {
+      const p = s.players.get(pid);
+      if (p.graceTimer) clearTimeout(p.graceTimer);
+      const c = clients.get(pid);
+      if (c && c.sessionId === s.id) { c.sessionId = null; c.sendMsg('session-closed', { id: s.id }); }
+    }
+    s.players.clear(); s.groups = {}; s.votes.clear();
+    s.started = false; s.state = 'ended'; s.endedAt = Date.now();
+    for (const [pid, hint] of joinHints) if (hint.id === s.id) joinHints.delete(pid);
+    hostedById.delete(s.id); hostedMeta.delete(s.id); sessions.delete(s.id);
+    const msg = `mm community host ${s.id} removed (${why}, ${ids.length} player(s) released)`;
+    console.log(msg); log(msg);
+    return ids.length;
   }
 
   function addPlayerToSession(s, c, groupId, notifyIds = s.players.keys()) {
@@ -454,14 +521,14 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     updateEmptyTimer(s);
     if (s.started) return;
     const n = s.players.size;
-    const auto = n >= startMin;
+    const auto = n >= minFor(s);
     const vote = voteOk(s);
     if (vote) { s.countdownVote = true; setCountdown(s, voteCountdownMs, 'vote'); }
     if (s.state === 'ended' || s.started) return;
     if (auto) {
       setCountdown(s, countdownMs, 'minimum players reached');
       if (s.started) return;
-      if (n >= config.MAX_PLAYERS && s.countdownTimer) setCountdown(s, fullCountdownMs, 'session full');
+      if (n >= maxFor(s) && s.countdownTimer) setCountdown(s, fullCountdownMs, 'session full');
     } else if (!vote && !(s.countdownVote && n >= voteMin)) cancelCountdown(s);
     if (s.started) return;
     if (!s.countdownTimer && !s.countdownHeld) s.state = 'waiting';
@@ -581,10 +648,15 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   // A matchmade session that is still young and has room takes newly queued players straight away.
   function findOpenSession(count, entry) {
+    // A join hint (client mod server list) works with or without a static pool, and is the only way into a community lobby.
+    const hinted = hintTarget(count, entry);
+    if (hinted) { dropHints(entry); return hinted; }
+    const want = hintFor(entry);
+    if (want) { const w = hostedById.get(want); if (!w || w.entry.community) dropHints(entry); }   // full/closed community lobby: normal behaviour
     if (hostEntries.length) return pickHosted(count, entry);
     const now = Date.now();
     for (const s of sessions.values()) {
-      if (s.matchmade && now - s.createdAt < config.LATE_JOIN_SECONDS * 1000 && s.players.size + count <= config.MAX_PLAYERS) return s;
+      if (!s.hosted && s.matchmade && now - s.createdAt < config.LATE_JOIN_SECONDS * 1000 && s.players.size + count <= config.MAX_PLAYERS) return s;
     }
     return null;
   }
@@ -610,7 +682,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (!hostedOpen(s)) return { error: 'closed', state: s.state };
     joinHints.set(String(playerId), { id: s.id, until: Date.now() + JOIN_HINT_MS });
     log(`${playerId} picked hosted session ${s.id}`);
-    return { id: s.id, state: s.state, players: s.players.size, maxPlayers: config.MAX_PLAYERS };
+    return { id: s.id, state: s.state, players: s.players.size, maxPlayers: maxFor(s) };
   }
   function hintFor(e) {
     if (!e) return null;
@@ -623,18 +695,21 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     return null;
   }
 
-  function pickHosted(count, entry) {
+  // The hinted hosted session when it is online, open and has room for `count` more, else null.
+  function hintTarget(count, entry) {
     const want = hintFor(entry);
-    if (want) {
-      const h = hostedById.get(want);
-      if (h && hostOnline(h.s.id) && hostedOpen(h.s) && h.s.players.size + count <= config.MAX_PLAYERS) {
-        for (const c of entryClients(entry)) joinHints.delete(String(c.id));
-        return h.s;
-      }
-    }
+    const h = want && hostedById.get(want);
+    return h && hostOnline(h.s.id) && hostedOpen(h.s) && h.s.players.size + count <= maxFor(h.s) ? h.s : null;
+  }
+  const dropHints = (entry) => { for (const c of entryClients(entry)) joinHints.delete(String(c.id)); };
+
+  function pickHosted(count, entry) {
+    const hinted = hintTarget(count, entry);
+    if (hinted) { dropHints(entry); return hinted; }
     let best = null, bestRank = -1;
-    for (const { s } of hostedById.values()) {
-      if (!hostOnline(s.id) || !hostedOpen(s) || s.players.size + count > config.MAX_PLAYERS) continue;
+    for (const { s, entry: he } of hostedById.values()) {
+      if (he.community) continue;   // community lobbies are never auto-seated, only reached through a join hint
+      if (!hostOnline(s.id) || !hostedOpen(s) || s.players.size + count > maxFor(s)) continue;
       const rank = s.state === 'started' ? 1 + s.players.size / 1000
         : s.players.size > 0 ? 10 + s.players.size : 5;
       if (rank > bestRank) { best = s; bestRank = rank; }
@@ -843,7 +918,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       if (!s) return nak(c, 'not-found');
       if (s.pass && s.pass !== str(d.pass)) return nak(c, 'unauthorized');
       if (c.sessionId !== s.id) {
-        if (s.players.size >= config.MAX_PLAYERS || (s.hosted && !hostedOpen(s))) return nak(c, 'other');
+        if (s.players.size >= maxFor(s) || (s.hosted && !hostedOpen(s))) return nak(c, 'other');
         unqueueClient(c);
         leaveSession(c);
         addPlayerToSession(s, c, null);
@@ -913,7 +988,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
 module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };

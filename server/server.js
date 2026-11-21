@@ -14,6 +14,7 @@ const net = require('net');
 const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, readSessionJwt, DEFAULTS } = require('./matchmaking');
 const { refreshPersona } = require('./persona');
 const { createProgression } = require('./progression');
+const { createCommunityRegistry, loadCommunityConfig } = require('./community');
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -204,15 +205,19 @@ function localServers() {
   const out = [];
   for (const [game, m, cfg] of [['classic', mmClassic, CLASSIC_CONFIG], ['main', mm, CONFIG]]) {
     for (const h of m.listHosted()) {
+      if (h.community && !(game === 'classic' && community.isListed(h.id))) continue;   // unlisted community hosts stay hidden
       out.push({
         id: h.id, game, name: h.name, region: h.region, online: h.online, players: h.players,
         minPlayers: h.minPlayers, maxPlayers: h.maxPlayers, state: h.state, map: h.map,
         countdownEndsAt: h.countdownEndsAt, votes: h.votes, lateJoinOpen: h.lateJoinOpen,
         address: `${h.publicHost || h.host}:${h.port}`, backend: ourBackend(cfg.PUBLIC_HOST), lastSeenSec: h.lastSeenSec,
+        community: !!h.community, verified: !!h.verified,
       });
     }
   }
-  return out;
+  // official first, then verified community, then other community (stable inside each group)
+  const grp = (x) => (!x.community ? 0 : x.verified ? 1 : 2);
+  return out.map((x, i) => [x, i]).sort((a, b) => grp(a[0]) - grp(b[0]) || a[1] - b[1]).map((e) => e[0]);
 }
 // Peer lists: cached 15 s (failures too), 2 s timeout, always asked with ?local=1 so lists never recurse.
 const peerCache = new Map();   // "ip:port" -> { at, promise }
@@ -248,6 +253,7 @@ function cleanPeerServer(x) {
     votes: n(o.votes), lateJoinOpen: o.lateJoinOpen === true,
     address: cleanLabel(o.address, 64), backend: isIpPort(o.backend) ? String(o.backend) : null,
     lastSeenSec: o.lastSeenSec === null || o.lastSeenSec === undefined ? null : n(o.lastSeenSec),
+    community: o.community === true, verified: o.verified === true,
   };
 }
 async function allServers(localOnly) {
@@ -273,6 +279,22 @@ function handleApi(req, url, body, res) {
   const p = url.pathname;
   const m = (re) => p.match(re);
   let r;
+
+  // Community host registry (server/community.js). Open registration with limits; JSON bodies up to 4 KB.
+  if (p.startsWith('/api/community/')) {
+    const ip = String(req.socket.remoteAddress || '').replace(/^::ffff:/i, '');
+    let j; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+    let out = null;
+    if (req.method === 'POST' && p === '/api/community/register') {
+      out = j && typeof j === 'object' && !Array.isArray(j) ? community.register(ip, j, authToken(req)) : { status: 400, body: { error: 'bad-json' } };
+    } else if (req.method === 'POST' && p === '/api/community/unregister') {
+      out = j && typeof j.sessionId === 'string' ? community.unregister(j.sessionId, authToken(req)) : { status: 400, body: { error: 'bad-json' } };
+    } else if (req.method === 'GET' && (r = m(/^\/api\/community\/status\/([^/]+)$/))) {
+      const st = community.status(decodeURIComponent(r[1]));
+      out = st ? { status: 200, body: st } : { status: 404, body: { error: 'not-found' } };
+    }
+    if (out) return send(res, out.status, out.body);
+  }
 
   // Vote to start: authorised by the PLAYER's bearer token (the per-player session access token from the
   // backend, or the account JWT), not the host's. The player must be seated in the session.
@@ -300,6 +322,8 @@ function handleApi(req, url, body, res) {
     const id = decodeURIComponent(r[1]);
     const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
     if (!owner.getHostedSession(id)) return send(res, 404, { error: 'not-found' });
+    const cinfo = community.communityInfo(id);
+    if (cinfo && !cinfo.listed) return send(res, 409, { error: 'unlisted' });
     const tok = String(req.headers['authorization'] || '').replace(/^(Bearer|Token)\s+/i, '').trim();
     const claims = tok && readJwt(tok);
     const pid = claims && !(claims.exp && claims.exp < Date.now() / 1000) ? String(claims['account-id'] || claims.id || '') : '';
@@ -349,9 +373,13 @@ function handleApi(req, url, body, res) {
       console.log(`host event for session ${id}: ${j.type}`);
       if (j.type === 'match-end') {
         // Per-player stats from the sos_host DLL (before endHosted releases the seats). Only real accounts count.
-        const players = (Array.isArray(j.players) ? j.players : []).filter((pl) => pl && db.accounts[String(pl.playerId)]);
-        const rec = progression.recordMatchEnd(id, { ...j, players }, null);
-        console.log(`match-end stats for session ${id}: ${rec.duplicate ? 'duplicate' : `${rec.accepted} player(s)`} (${rec.matchId})`);
+        // Unverified community hosts never feed progression.
+        const cinfo = community.communityInfo(id);
+        if (!cinfo || cinfo.verified) {
+          const players = (Array.isArray(j.players) ? j.players : []).filter((pl) => pl && db.accounts[String(pl.playerId)]);
+          const rec = progression.recordMatchEnd(id, { ...j, players }, null);
+          console.log(`match-end stats for session ${id}: ${rec.duplicate ? 'duplicate' : `${rec.accepted} player(s)`} (${rec.matchId})`);
+        } else console.log(`match-end stats for session ${id} ignored (unverified community host)`);
       }
       if (j.type === 'match-end' || j.type === 'session-end') owner.endHosted(id);
       if (j.type === 'match-start') console.log(`host reported match-start for session ${id}`);
@@ -487,8 +515,11 @@ function serveEmbedBlank(res) {
 
 const server = http.createServer((req, res) => {
   const chunks = [];
-  req.on('data', (c) => chunks.push(c));
+  let size = 0, tooBig = false;
+  const limited = req.url.startsWith('/api/community/');
+  req.on('data', (c) => { size += c.length; if (limited && size > 4096) { tooBig = true; chunks.length = 0; } else if (!tooBig) chunks.push(c); });
   req.on('end', () => {
+    if (tooBig) { const out = send(res, 413, { error: 'too-large' }); log('http.jsonl', { method: req.method, path: req.url, status: 413, out: out.out, handled: true }); return; }
     const body = Buffer.concat(chunks).toString('utf8');
     const url = new URL(req.url, 'http://x');
     let result;
@@ -550,6 +581,13 @@ const mmClassic = createMatchmaker({
   log: (m) => { log('ws.jsonl', { event: 'mm-classic', text: m }); console.log(`mm[classic] ${m}`); },
 });
 
+// Third-party Classic hosts register here (docs/COMMUNITY_HOSTS.md); only the Classic matchmaker takes them.
+const community = createCommunityRegistry({
+  mm: mmClassic, config: loadCommunityConfig(process.env),
+  log: (m) => { log('ws.jsonl', { event: 'community', text: m }); console.log(`community ${m}`); },
+});
+setInterval(() => { try { community.sweep(); } catch (e) { console.warn(`community sweep: ${e}`); } }, 15000).unref();
+
 // ---------- progression (docs/PROGRESSION.md, server/progression.js) ----------
 // The Classic game host computes XP, level, stats and ratings itself and saves them in the player blob; this only
 // stores blobs and leaderboards and records our host DLL's match-end stats. Host calls carry `Token <SESSION_TOKEN>`
@@ -562,6 +600,7 @@ function isHostToken(tok) {
   const given = Buffer.from(String(tok));
   for (const owner of [mmClassic, mm]) {
     for (const h of owner.listHosted()) {
+      if (h.community && !h.verified) continue;   // unverified community hosts have no progression writes
       const want = Buffer.from(owner.getHostedSession(h.id)?.token || '');
       if (want.length && given.length === want.length && crypto.timingSafeEqual(given, want)) return h.id;   // truthy: the lobby's session id
     }
@@ -578,6 +617,7 @@ function jwtAccount(tok) {
 let fameHooks = null;
 const progression = createProgression({
   db, saveDb, isHostToken, jwtAccount,
+  canReadToken: (tok) => !!community.communityIdForToken(tok),
   displayName: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
   fame: {
     applyToBlob: (id, d) => (fameHooks?.applyToBlob ? fameHooks.applyToBlob(id, d) : d),

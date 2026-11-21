@@ -7,6 +7,8 @@
 #   - daily restart at RESTART_HOUR (UTC) once the game has been up for at least 2 h
 # Env (host.env): OGSOS_BACKEND=ip:port  SESSION_ID  SESSION_TOKEN  [HOST_ID=0]  [RESTART_HOUR=9]
 #   [LISTEN_TIMEOUT=300]  [POLL_STALE=300]  [EXTRA_ARGS]
+#   [LOBBY_STATUS=community]  read the lobby from GET /api/community/status/<id> (community-registered hosts)
+#                             instead of /servers?local=1 (default)
 set -uo pipefail
 
 : "${OGSOS_BACKEND:?}" "${SESSION_ID:?}" "${SESSION_TOKEN:?}"
@@ -82,7 +84,14 @@ EOF
   mv -f "$tmp" "$INI"
 }
 
-lobby_json() { curl -s -m 5 "$BASE/servers?local=1" | tr '{' '\n' | grep "\"id\":\"$SESSION_ID\""; }
+lobby_json() {
+  if [ "${LOBBY_STATUS:-}" = community ]; then
+    # Flat object {"id":...}: after tr it is a single line that still contains "id":"<SESSION_ID>".
+    curl -s -m 5 "$BASE/api/community/status/$SESSION_ID" | tr '{' '\n' | grep "\"id\":\"$SESSION_ID\""
+  else
+    curl -s -m 5 "$BASE/servers?local=1" | tr '{' '\n' | grep "\"id\":\"$SESSION_ID\""
+  fi
+}
 # Seconds since the backend last saw this session's host poll (empty if unknown).
 last_seen() { lobby_json | grep -o '"lastSeenSec":[0-9]*' | cut -d: -f2; }
 # Lobby state: waiting | countdown | started | ended (empty if unknown).

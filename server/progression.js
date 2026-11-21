@@ -25,6 +25,7 @@ function createProgression(opts = {}) {
   const displayName = opts.displayName || ((id) => String(id));
   const isHostToken = opts.isHostToken || (() => false);
   const jwtAccount = opts.jwtAccount || (() => null);
+  const canReadToken = opts.canReadToken || (() => false);   // extra tokens allowed to READ blobs (unverified community hosts)
   const leaderboardOpen = opts.leaderboardOpen ?? process.env.OGSOS_LEADERBOARD_OPEN === '1';
   const allowOwnerWrite = !!opts.allowOwnerWrite;
   const rankBase = opts.rankBase ?? 1;
@@ -56,7 +57,7 @@ function createProgression(opts = {}) {
     const stored = cur && isObj(cur.data) ? cur.data : {};
 
     if (method === 'GET') {
-      if (!isHost && !acct) return unauthorized;
+      if (!isHost && !acct && !canReadToken(token)) return unauthorized;
       return reply(200, { version, data: applyFame(accountId, stored) });
     }
     if (method !== 'POST') return reply(405, { error: 'method not allowed' });

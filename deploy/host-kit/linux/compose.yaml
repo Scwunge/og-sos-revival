@@ -1,0 +1,30 @@
+# SOS: Classic community host. Put your own copy of the "SOS Test Server" folder in ./game.
+# Usage: cp server.env.example server.env ; edit it ; docker compose up -d --build
+services:
+  sos-host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sos-classic-community-host
+    container_name: sos-host
+    env_file: server.env
+    ports:
+      - "${PUBLIC_PORT:-7777}:7777/udp"
+    volumes:
+      - ./game:/game
+      - ./prefix:/home/ubuntu/prefix
+      - ./logs:/home/ubuntu/logs
+      - ./state:/state
+    mem_limit: 4g
+    cpus: 2.0
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
