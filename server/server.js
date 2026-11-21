@@ -388,6 +388,13 @@ function serveServers(req, url, res) {
     console.log(`   GET ${req.url} -> 200 (${servers.length})`);
   });
 }
+// HERO streaming panel: the client's in-game browser loads [OutpostStreams] EmbedEndpoint + /embed/account/<id>/performer.
+// hero.tv is a parked domain now, so the launcher points EmbedEndpoint here and this serves an empty page.
+function serveEmbedBlank(res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end('<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0;background:transparent"></body></html>');
+}
+
 const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
@@ -399,6 +406,7 @@ const server = http.createServer((req, res) => {
     try {
       if (url.pathname.startsWith('/kv/')) result = handleKv(url.pathname.slice(4), res, req);
       else if (url.pathname === '/servers' && req.method === 'GET') return serveServers(req, url, res);
+      else if (url.pathname.startsWith('/embed/') && req.method === 'GET') return serveEmbedBlank(res);
       else result = handleApi(req, url, body, res);
       if (!result) {
         handled = false;
