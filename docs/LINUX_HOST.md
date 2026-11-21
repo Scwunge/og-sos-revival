@@ -17,7 +17,15 @@ The Windows render PC the Windows test PC ran the game headless with these flags
   - `bUseFixedFrameRate=True` / `FixedFrameRate=30` in Engine.ini. This setting fixes the frame delta; it doesn't throttle.
 - A real cap probably has to come from sos_host, for example by setting the `t.MaxFPS` cvar or hooking the engine's max-tick-rate function. Until then, budget 1.5 cores per host.
 
-So the game does not need a GPU or a window to host. What is left to prove on Linux:
+So the game does not need a GPU or a window to host.
+
+**The host does not need Steam at all to boot and listen.** A second run on the render PC was started from an SSH session (session 0), where the game cannot reach the Steam client.
+- Steam init failed: `SteamUser() failed!` and `Client API initialized 0`.
+- The game still loaded LaCuna and logged `Listening with IpNetDriver on port 7777` after 18 s.
+- RAM and CPU were the same as the Steam runs.
+- Joiners log in to our backend, not to the host's Steam. Networking is plain IP (SteamSockets=0).
+
+So the plan below drops the Steam client: **no Steam account goes on the VPS.** The one thing still to prove is a full join to a Steam-less host. The section on the Steam login is kept only as a fallback. What is left to prove on Linux:
 1. Does Wine/Proton run it the same way?
 2. Can the game reach a logged-in Steam client in a headless box?
 
