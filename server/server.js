@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
-const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, DEFAULTS } = require('./matchmaking');
+const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, readSessionJwt, DEFAULTS } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -200,6 +200,7 @@ function localServers() {
       out.push({
         id: h.id, game, name: h.name, region: h.region, online: h.online, players: h.players,
         minPlayers: h.minPlayers, maxPlayers: h.maxPlayers, state: h.state, map: h.map,
+        countdownEndsAt: h.countdownEndsAt, votes: h.votes, lateJoinOpen: h.lateJoinOpen,
         address: `${h.publicHost || h.host}:${h.port}`, backend: ourBackend(cfg.PUBLIC_HOST), lastSeenSec: h.lastSeenSec,
       });
     }
@@ -235,7 +236,9 @@ function cleanPeerServer(x) {
     id: String(o.id ?? '').slice(0, 64), game: o.game === 'main' ? 'main' : 'classic',
     name: cleanLabel(o.name, 48), region: cleanLabel(o.region, 16), online: o.online === true,
     players: n(o.players), minPlayers: n(o.minPlayers), maxPlayers: n(o.maxPlayers),
-    state: ['waiting', 'countdown', 'started'].includes(o.state) ? o.state : 'waiting', map: cleanLabel(o.map, 64),
+    state: ['waiting', 'countdown', 'started', 'ended'].includes(o.state) ? o.state : 'waiting', map: cleanLabel(o.map, 64),
+    countdownEndsAt: o.countdownEndsAt === null || o.countdownEndsAt === undefined ? null : n(o.countdownEndsAt),
+    votes: n(o.votes), lateJoinOpen: o.lateJoinOpen === true,
     address: cleanLabel(o.address, 64), backend: isIpPort(o.backend) ? String(o.backend) : null,
     lastSeenSec: o.lastSeenSec === null || o.lastSeenSec === undefined ? null : n(o.lastSeenSec),
   };
@@ -264,9 +267,29 @@ function handleApi(req, url, body, res) {
   const m = (re) => p.match(re);
   let r;
 
+  // Vote to start: authorised by the PLAYER's bearer token (the per-player session access token from the
+  // backend, or the account JWT), not the host's. The player must be seated in the session.
+  if (req.method === 'POST' && (r = m(/^\/api\/session\/([^/]+)\/vote-start$/))) {
+    const id = decodeURIComponent(r[1]);
+    const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
+    const found = owner.getHostedSession(id);
+    if (!found) return send(res, 404, { error: 'not-found' });
+    const tok = String(req.headers['authorization'] || '').replace(/^(Bearer|Token)\s+/i, '').trim();
+    let pid = null;
+    const claims = tok && readJwt(tok);
+    if (claims && !(claims.exp && claims.exp < Date.now() / 1000)) pid = String(claims['account-id'] || claims.id || '') || null;
+    if (!pid && tok) pid = readSessionJwt({ sessionId: id, sessionToken: found.token }, tok);
+    if (!pid) return send(res, 401, { error: 'unauthorized' });
+    const v = owner.voteStartHosted(id, pid);
+    if (v.error === 'not-seated') return send(res, 403, { error: 'not-seated' });
+    if (v.error === 'closed') return send(res, 409, { error: 'closed', state: v.state });
+    if (v.error) return send(res, 404, { error: v.error });
+    return send(res, 200, { result: true, ...v });
+  }
+
   // Routes the game host (a listen server) calls on its MMS, authorised by `Token <SESSION_TOKEN>`.
   // POST .../start and .../reset are for whoever runs the server (same token; or type `start` in the console).
-  if ((r = m(/^\/api\/session\/([^/]+?)(\/events|\/start|\/reset|\/announce)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
+  if ((r = m(/^\/api\/session\/([^/]+?)(\/events|\/start|\/reset|\/end|\/announce)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
     const id = decodeURIComponent(r[1]);
     const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
     const found = owner.getHostedSession(id);
@@ -292,9 +315,15 @@ function handleApi(req, url, body, res) {
       console.log(`reset hosted session ${id} via HTTP (${cleared} player(s) cleared)`);
       return send(res, 200, { result: true, cleared });
     }
+    if (r[2] === '/end') {
+      const released = owner.endHosted(id);
+      console.log(`end of hosted session ${id} via HTTP (${released} player(s) released)`);
+      return send(res, 200, { result: true, released });
+    }
     if (r[2]) {
       let j = {}; try { j = JSON.parse(body || '{}'); } catch {}
       console.log(`host event for session ${id}: ${j.type}`);
+      if (j.type === 'match-end' || j.type === 'session-end') owner.endHosted(id);
       if (j.type === 'match-start') console.log(`host reported match-start for session ${id}`);
       log('ws.jsonl', { event: 'host-event', session: id, type: j.type, body });
       return send(res, 200, { result: true });

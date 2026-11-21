@@ -20,10 +20,14 @@ const DEFAULTS = {
   MAX_PLAYERS: 16,             // players per session
   QUEUE_TIMEOUT: 20,           // seconds; after this a match starts with whoever is queued (>= 1 player)
   MATCH_BATCH_MS: 300,         // wait this long after the queue becomes matchable so near-simultaneous players share a session
-  LATE_JOIN_SECONDS: 60,       // a matchmade session accepts newly queued players for this long
+  LATE_JOIN_SECONDS: 300,      // seconds after a session started during which new players are still seated (hosted: 0 = never, -1 = always)
   GROUP_MAX_SIZE: 8,           // players per group
   START_MIN_PLAYERS: 1,        // hosted sessions only: seated players needed before the start countdown begins
   START_COUNTDOWN_SECONDS: 10, // hosted sessions only: countdown before session-started is sent (0 = start at once)
+  START_FULL_COUNTDOWN_SECONDS: 10, // hosted sessions only: a running countdown is cut to at most this once the session is full
+  VOTE_START_MIN_PLAYERS: 2,   // hosted sessions only: seated players needed before a vote-start can count
+  VOTE_START_COUNTDOWN_SECONDS: 10, // hosted sessions only: countdown once a majority voted to start
+  EMPTY_END_SECONDS: 120,      // hosted sessions only: a started session with no seated players this long is ended (0 = off)
   TRAVEL_GRACE_SECONDS: 300,   // hosted sessions only: a seated player whose WS closed keeps their seat this long
   HOSTS: [],                   // fixed game hosts: [{host, port, sessionId, sessionToken, hostIds, name?, region?}], see docs/CLASSIC.md
 };
@@ -71,6 +75,24 @@ function makeSessionJwt(entry, playerId) {
   }));
   const sig = crypto.createHmac('sha512', entry.sessionToken).update(`${head}.${claims}`).digest('base64url');
   return `${head}.${claims}.${sig}`;
+}
+
+// Verify a per-player access token made by makeSessionJwt (HS512 keyed with the session token, sub = session id).
+// Returns the player id or null.
+function readSessionJwt(entry, tok) {
+  const parts = String(tok).split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const head = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+    if (!head || head.alg !== 'HS512') return null;
+    const want = Buffer.from(crypto.createHmac('sha512', entry.sessionToken).update(`${parts[0]}.${parts[1]}`).digest('base64url'));
+    const got = Buffer.from(parts[2]);
+    if (want.length !== got.length || !crypto.timingSafeEqual(want, got)) return null;
+    const c = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    if (!c || c.sub !== entry.sessionId || (c.exp && c.exp < Date.now() / 1000)) return null;
+    const id = String(c['account-id'] || c.id || '');
+    return id || null;
+  } catch { return null; }
 }
 
 // First valid IPv4 literal of [{src, v}] candidates (highest precedence first); invalid ones are warned about.
@@ -130,6 +152,11 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   const startMin = Math.min(Math.max(1, Math.floor(numCfg('START_MIN_PLAYERS'))), Math.max(1, config.MAX_PLAYERS));
   const countdownMs = Math.max(0, numCfg('START_COUNTDOWN_SECONDS')) * 1000;
   const graceMs = Math.max(0, numCfg('TRAVEL_GRACE_SECONDS')) * 1000;
+  const fullCountdownMs = Math.max(0, numCfg('START_FULL_COUNTDOWN_SECONDS')) * 1000;
+  const voteMin = Math.max(1, Math.floor(numCfg('VOTE_START_MIN_PLAYERS')));
+  const voteCountdownMs = Math.max(0, numCfg('VOTE_START_COUNTDOWN_SECONDS')) * 1000;
+  const emptyEndMs = Math.max(0, numCfg('EMPTY_END_SECONDS')) * 1000;
+  const lateJoinMs = numCfg('LATE_JOIN_SECONDS') * 1000;   // hosted: 0 = never after the start, < 0 = always
   const publicHost = net.isIPv4(String(config.PUBLIC_HOST || '')) ? String(config.PUBLIC_HOST) : '';
   const hostFor = (s) => publicHost || s.host;   // what clients are told to connect to
   const beaconUrl = () => config.BEACON_URL || publicHost || config.GAME_SERVER_HOST;
@@ -229,7 +256,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       id: entry.sessionId, name: 'Match', host: entry.host, port: entry.port, owner: 'system',
       matchmade: true, started: false, hosted: entry, token: entry.sessionToken,
     });
-    s.countdownTimer = null;
+    s.countdownTimer = null; s.countdownEndsAt = null; s.countdownVote = false; s.emptyTimer = null;
+    s.state = 'waiting'; s.startedAt = null; s.endedAt = null; s.votes = new Set();
     hostedById.set(entry.sessionId, { s, entry });
   }
   // Public server list data (GET /servers): label overrides from /announce and the time of the host's last poll.
@@ -273,7 +301,9 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
         lastSeenSec: last === null ? null : Math.floor((now - last) / 1000),
         players: [...s.players.keys()].filter((pid) => !entry.hostIds.includes(pid)).length,
         minPlayers: startMin, maxPlayers: config.MAX_PLAYERS,
-        state: s.started ? 'started' : s.countdownTimer ? 'countdown' : 'waiting',
+        state: s.state, countdownEndsAt: s.countdownTimer ? s.countdownEndsAt : null,
+        votes: s.votes.size, lateJoinOpen: hostedOpen(s),
+        startedAt: s.startedAt, endedAt: s.endedAt,
         map: s.opts.map || '',
         publicHost,
       };
@@ -302,6 +332,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       if (!s.groups[gid].length) delete s.groups[gid];
     }
     if (s.hosted) {
+      s.votes.delete(pid);
       for (const o of s.players.keys()) clients.get(o)?.sendMsg('player-leave', { id: s.id, 'player-id': pid });
       afterSeatChange(s);   // may cancel the countdown; the fixed session outlives its players
       return true;
@@ -328,32 +359,104 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   }
 
   function cancelCountdown(s) {
+    s.countdownVote = false; s.countdownEndsAt = null;
     if (s.countdownTimer) { clearTimeout(s.countdownTimer); s.countdownTimer = null; log(`session ${s.id}: start countdown cancelled`); }
   }
 
+  // Start (or shorten) the start countdown; a running countdown is never lengthened.
+  function setCountdown(s, ms, why) {
+    if (ms <= 0) { startSession(s, why); return; }
+    const end = Date.now() + ms;
+    if (s.countdownTimer && s.countdownEndsAt <= end) return;
+    if (s.countdownTimer) clearTimeout(s.countdownTimer);
+    s.countdownEndsAt = end;
+    s.state = 'countdown';
+    s.countdownTimer = setTimeout(() => { s.countdownTimer = null; startSession(s, 'countdown ended'); }, ms);
+    s.countdownTimer.unref();
+    const msg = `mm hosted session ${s.id}: ${s.players.size}/${startMin} players, starting in ${ms / 1000}s (${why})`;
+    console.log(msg); log(msg);
+  }
+
+  // A started session with nobody seated for EMPTY_END_SECONDS is over.
+  function updateEmptyTimer(s) {
+    const need = s.state === 'started' && !s.players.size && emptyEndMs > 0;
+    if (!need) { if (s.emptyTimer) { clearTimeout(s.emptyTimer); s.emptyTimer = null; } return; }
+    if (s.emptyTimer) return;
+    s.emptyTimer = setTimeout(() => {
+      s.emptyTimer = null;
+      if (s.state === 'started' && !s.players.size) endSession(s, 'empty');
+    }, emptyEndMs);
+    s.emptyTimer.unref();
+  }
+
   function startSession(s, why) {
+    if (s.state === 'ended') return 0;
     cancelCountdown(s);
     if (s.started) return s.players.size;
-    s.started = true;
+    s.started = true; s.state = 'started'; s.startedAt = Date.now(); s.votes.clear();
     for (const pid of s.players.keys()) { const c = clients.get(pid); if (c) sendStarted(c, s); }
+    updateEmptyTimer(s);
     const msg = `mm hosted session ${s.id} started (${why}) with ${s.players.size} player(s) -> ${hostFor(s)}:${s.port}`;
     console.log(msg); log(msg);
     return s.players.size;
   }
 
+  // Match over: tell the seated players (session-closed, as a reset does) and refuse new seats until reset.
+  function endSession(s, why) {
+    if (s.state === 'ended') return 0;
+    cancelCountdown(s);
+    if (s.emptyTimer) { clearTimeout(s.emptyTimer); s.emptyTimer = null; }
+    const ids = [...s.players.keys()];
+    for (const pid of ids) {
+      const p = s.players.get(pid);
+      if (p.graceTimer) clearTimeout(p.graceTimer);
+      const c = clients.get(pid);
+      if (c && c.sessionId === s.id) { c.sessionId = null; c.sendMsg('session-closed', { id: s.id }); }
+    }
+    s.players.clear(); s.groups = {}; s.votes.clear();
+    s.started = false; s.state = 'ended'; s.endedAt = Date.now();
+    const msg = `mm hosted session ${s.id} ended (${why}, ${ids.length} player(s) released)`;
+    console.log(msg); log(msg);
+    return ids.length;
+  }
+
+  // Majority of seated players voted to start (needs VOTE_START_MIN_PLAYERS seated).
+  const voteNeeded = (s) => Math.floor(s.players.size / 2) + 1;
+  const voteOk = (s) => s.players.size >= voteMin && s.votes.size >= voteNeeded(s);
+
   function afterSeatChange(s) {
-    if (!s.hosted || s.started) return;
-    if (s.players.size >= startMin) {
-      if (countdownMs <= 0) { startSession(s, 'minimum players reached'); return; }
-      if (!s.countdownTimer) {
-        s.countdownTimer = setTimeout(() => { s.countdownTimer = null; startSession(s, 'countdown ended'); }, countdownMs);
-        s.countdownTimer.unref();
-        const msg = `mm hosted session ${s.id}: ${s.players.size}/${startMin} players, starting in ${countdownMs / 1000}s`;
-        console.log(msg); log(msg);
-      }
-    } else cancelCountdown(s);
+    if (!s.hosted) return;
+    if (s.state === 'ended') return;
+    updateEmptyTimer(s);
+    if (s.started) return;
+    const n = s.players.size;
+    const auto = n >= startMin;
+    const vote = voteOk(s);
+    if (vote) { s.countdownVote = true; setCountdown(s, voteCountdownMs, 'vote'); }
+    if (s.state === 'ended' || s.started) return;
+    if (auto) {
+      setCountdown(s, countdownMs, 'minimum players reached');
+      if (s.started) return;
+      if (n >= config.MAX_PLAYERS && s.countdownTimer) setCountdown(s, fullCountdownMs, 'session full');
+    } else if (!vote && !(s.countdownVote && n >= voteMin)) cancelCountdown(s);
+    if (s.started) return;
+    if (!s.countdownTimer) s.state = 'waiting';
     sendWaitingSummary(s);
   }
+
+  // Vote to start the match. Returns { error } (not-found | not-seated | closed) or { votes, needed, players, state }.
+  function voteStartHosted(id, playerId) {
+    const h = hostedById.get(String(id));
+    if (!h) return { error: 'not-found' };
+    const s = h.s, pid = String(playerId);
+    if (!s.players.has(pid)) return { error: 'not-seated' };
+    if (s.state !== 'waiting' && s.state !== 'countdown') return { error: 'closed', state: s.state };
+    s.votes.add(pid);
+    log(`${pid} voted to start ${s.id} (${s.votes.size}/${voteNeeded(s)})`);
+    afterSeatChange(s);
+    return { votes: s.votes.size, needed: voteNeeded(s), players: s.players.size, state: s.state };
+  }
+
 
   // Seat of a hosted session whose WS closed: keep it for the grace period (see onClose).
   function holdSeat(s, c) {
@@ -384,6 +487,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (!h) return null;
     const s = h.s;
     cancelCountdown(s);
+    if (s.emptyTimer) { clearTimeout(s.emptyTimer); s.emptyTimer = null; }
     const ids = [...s.players.keys()];
     for (const pid of ids) {
       const p = s.players.get(pid);
@@ -391,10 +495,14 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       const c = clients.get(pid);
       if (c && c.sessionId === s.id) { c.sessionId = null; c.sendMsg('session-closed', { id: s.id }); }
     }
-    s.players.clear(); s.groups = {}; s.started = false;
+    s.players.clear(); s.groups = {}; s.started = false; s.votes.clear();
+    s.state = 'waiting'; s.startedAt = null; s.endedAt = null;
     log(`hosted session ${s.id} reset (${ids.length} player(s) cleared)`);
+    // Players who were kept waiting (late joiners) go into the fresh lobby.
+    if (pumpHosted()) sendSummary();
     return ids.length;
   }
+  const endHosted = (id) => { const h = hostedById.get(String(id)); return h ? endSession(h.s, 'host') : null; };
   const forceStartHosted = (id) => { const h = hostedById.get(String(id)); return h ? startSession(h.s, 'forced') : null; };
   const forceStartAll = () => [...hostedById.values()].map(({ s }) => ({ id: s.id, players: startSession(s, 'forced') }));
 
@@ -428,9 +536,9 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (s.hosted) afterSeatChange(s);
   }
 
-  function createMatch(batch) {
+  function createMatch(batch, target) {
     const first = obj(batch[0].opts);
-    const live = hostedSession();
+    const live = target || (hostEntries.length ? pickHosted(batch.reduce((n, e) => n + entryCount(e), 0)) : null);
     if (live) {
       if (!live.players.size) live.opts = { gameMode: str(first['game-mode']), gameModeParams: '', map: str(first.map), language: str(first.language) };
       seat(live, batch);
@@ -448,8 +556,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   // A matchmade session that is still young and has room takes newly queued players straight away.
   function findOpenSession(count) {
-    const live = hostedSession();
-    if (live) return live.players.size + count <= config.MAX_PLAYERS ? live : null;
+    if (hostEntries.length) return pickHosted(count);
     const now = Date.now();
     for (const s of sessions.values()) {
       if (s.matchmade && now - s.createdAt < config.LATE_JOIN_SECONDS * 1000 && s.players.size + count <= config.MAX_PLAYERS) return s;
@@ -457,7 +564,41 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     return null;
   }
 
+  // Can new players be seated into this hosted session right now? (not ended; after the start only inside LATE_JOIN_SECONDS)
+  function hostedOpen(s) {
+    if (s.state === 'ended') return false;
+    if (s.state !== 'started') return true;
+    return lateJoinMs < 0 || (lateJoinMs > 0 && Date.now() - s.startedAt < lateJoinMs);
+  }
+
+  // Pool choice: the fullest open lobby (waiting/countdown) that has room, else an idle waiting one,
+  // else a started session still inside its late-join window (fullest first).
+  function pickHosted(count) {
+    let best = null, bestRank = -1;
+    for (const { s } of hostedById.values()) {
+      if (!hostedOpen(s) || s.players.size + count > config.MAX_PLAYERS) continue;
+      const rank = s.state === 'started' ? 1 + s.players.size / 1000
+        : s.players.size > 0 ? 10 + s.players.size : 5;
+      if (rank > bestRank) { best = s; bestRank = rank; }
+    }
+    return best;
+  }
+
+  // Seat queued players into whichever hosted sessions are open. Returns true if anyone was seated.
+  function pumpHosted() {
+    let matched = false;
+    for (const e of [...queue]) {
+      const target = pickHosted(entryCount(e));
+      if (!target) continue;
+      queue = queue.filter((x) => x !== e);
+      createMatch([e], target);
+      matched = true;
+    }
+    return matched;
+  }
+
   function pumpQueue() {
+    if (hostEntries.length) { if (pumpHosted()) sendSummary(); return; }   // the host's own start gate is the lobby
     let matched = false;
     while (queue.length) {
       const oldest = Date.now() - queue[0].since;
@@ -485,7 +626,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function enqueue(entry, count) {
     const open = findOpenSession(count);
-    if (open) { if (open.hosted && !open.players.size) createMatch([entry]); else seat(open, [entry]); return; }
+    if (open) { if (open.hosted) createMatch([entry], open); else seat(open, [entry]); return; }
     queue.push(entry);
     sendSummary();
     if (queuePlayers() >= config.MIN_PLAYERS) scheduleMatch();
@@ -644,7 +785,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       if (!s) return nak(c, 'not-found');
       if (s.pass && s.pass !== str(d.pass)) return nak(c, 'unauthorized');
       if (c.sessionId !== s.id) {
-        if (s.players.size >= config.MAX_PLAYERS) return nak(c, 'other');
+        if (s.players.size >= config.MAX_PLAYERS || (s.hosted && !hostedOpen(s))) return nak(c, 'other');
         unqueueClient(c);
         leaveSession(c);
         addPlayerToSession(s, c, null);
@@ -652,6 +793,15 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       c.sendMsg('ack');
       sendSession(c, s, false);
       if (s.started) sendStarted(c, s);
+    },
+
+    // Vote to start the match (hosted sessions); same rule as POST /api/session/<id>/vote-start.
+    'vote-start': (c) => {
+      const s = sessions.get(c.sessionId);
+      if (!s || !s.hosted) return nak(c, 'not-found');
+      const r = voteStartHosted(s.id, c.id);
+      if (r.error) return nak(c, r.error === 'not-seated' ? 'unauthorized' : 'other');
+      c.sendMsg('ack');
     },
 
     'leave-session': (c, d) => {
@@ -702,10 +852,10 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function shutdown() {
     clearInterval(tick); clearTimeout(batchTimer);
-    for (const { s } of hostedById.values()) { cancelCountdown(s); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
+    for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
-module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, loadConfig, createMatchmaker, DEFAULTS };
+module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };
