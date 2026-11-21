@@ -180,13 +180,27 @@
     };
   }
 
+  // "Code shown to the player": the game words only 24 h and 7 d bans precisely; anything else reads "permanently banned".
+  function codeField() {
+    const sel = h('select', {}, [['cheating', 'Cheating'], ['harassment', 'Harassment'], ['spam', 'Spam'], ['bad-username', 'Bad username'],
+      ['toxicity', 'Toxicity'], ['stream-sniping', 'Stream sniping'], ['ban-evasion', 'Ban evasion'], ['other', 'Other']].map(([v, t]) => h('option', { value: v }, t)));
+    sel.value = 'other';
+    return {
+      node: h('div', { class: 'field' }, h('label', {}, 'Code shown to the player'), sel,
+        h('p', { class: 'muted', text: 'The game only words 24 hour and 7 day bans precisely; any other length reads as "permanently banned" to the player.' })),
+      value: () => sel.value,
+    };
+  }
+
   function banDialog(steamId, name, done) {
     const reason = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason (required)' });
     const dur_ = durationField();
+    const code_ = codeField();
     const go = h('button', { class: 'danger' }, 'Ban');
     const { close } = openDialog('Ban ' + (name || steamId), [
       h('p', { class: 'muted mono', text: steamId }),
       h('div', { class: 'field' }, h('label', {}, 'Reason'), reason),
+      code_.node,
       dur_.node,
     ], [h('button', { onclick: () => close() }, 'Cancel'), go], { narrow: true });
     go.addEventListener('click', async () => {
@@ -195,7 +209,7 @@
       let hours;
       try { hours = dur_.hours(); } catch (e) { toast(e.message); return; }
       go.disabled = true;
-      const ok = await act(() => api('bans', { steamId, reason: r, hours }), 'Banned ' + (name || steamId));
+      const ok = await act(() => api('bans', { steamId, reason: r, hours, code: code_.value() }), 'Banned ' + (name || steamId));
       go.disabled = false;
       if (ok) { close(); if (done) done(); }
     });
@@ -220,29 +234,42 @@
     reason.focus();
   }
 
-  async function spectate(sessionId, game) {
-    const body = { sessionId };
-    if (game) body.game = game;
-    const r = await act(() => api('spectate', body));
-    if (!r || r === true) return;
-    const parts = [];
-    const shown = new Set();
-    const line = (label, key, isCopy) => {
-      if (r[key] === undefined || r[key] === null || r[key] === '') return;
-      shown.add(key);
-      parts.push(h('h3', { text: label }),
-        h('div', { class: 'copyrow' }, h('code', { text: String(r[key]) }), isCopy ? copyBtn(String(r[key])) : null));
-    };
-    line('Address', 'address', true);
-    line('Join URL', 'joinUrl', true);
-    line('Command', 'command', true);
-    for (const k of ['instructions', 'note']) {
-      if (r[k]) { shown.add(k); parts.push(h('h3', { text: k === 'note' ? 'Note' : 'Instructions' }), h('div', { class: 'note', text: String(r[k]) })); }
-    }
-    const rest = {};
-    for (const k of Object.keys(r)) if (!shown.has(k)) rest[k] = r[k];
-    if (Object.keys(rest).length) parts.push(h('h3', { text: 'Details' }), kvTable(rest));
-    const { close } = openDialog('Spectate session', parts, [h('button', { onclick: () => close() }, 'Close')], { narrow: true });
+  // Spectate / director: choose a mode, then show the join URL, command and expiry; "Stop watching" removes the allow-listing.
+  function spectate(sessionId, game) {
+    const mode = h('select', {}, h('option', { value: 'spectator' }, 'Spectator'), h('option', { value: 'director' }, 'Director (director camera)'));
+    const result = h('div', {});
+    const go = h('button', {}, 'Start watching');
+    const stop = h('button', { class: 'danger' }, 'Stop watching');
+    const base = () => { const b = { sessionId, mode: mode.value }; if (game) b.game = game; return b; };
+    const { close } = openDialog('Spectate session', [
+      h('p', { class: 'muted mono', text: sessionId }),
+      h('div', { class: 'field' }, h('label', {}, 'Mode'), mode),
+      result,
+    ], [h('button', { onclick: () => close() }, 'Close'), stop, go], { narrow: true });
+    go.addEventListener('click', async () => {
+      go.disabled = true;
+      const r = await act(() => api('spectate', base()));
+      go.disabled = false;
+      if (!r || r === true) return;
+      const parts = [];
+      const line = (label, key) => {
+        if (r[key] === undefined || r[key] === null || r[key] === '') return;
+        parts.push(h('h3', { text: label }), h('div', { class: 'copyrow' }, h('code', { text: String(r[key]) }), copyBtn(String(r[key]))));
+      };
+      line('Address', 'address');
+      line('Join URL', 'joinUrl');
+      line('Command', 'command');
+      if (r.expiresAt) parts.push(h('p', { class: 'muted', text: 'Expires ' + fmtTime(r.expiresAt) }));
+      if (r.instructions) parts.push(h('h3', { text: 'Instructions' }), h('div', { class: 'note', text: String(r.instructions) }));
+      result.replaceChildren(...parts);
+    });
+    stop.addEventListener('click', async () => {
+      stop.disabled = true;
+      const b = { sessionId }; if (game) b.game = game;
+      const r = await act(() => api('spectate/stop', b), 'Stopped watching');
+      stop.disabled = false;
+      if (r) result.replaceChildren();
+    });
   }
 
   // ---------- generic renderers ----------
@@ -396,6 +423,7 @@
         h('span', { class: 'badge', text: (s.playerCount ?? players.length) + '/' + (s.maxPlayers ?? '?') })),
       h('div', { class: 'srv-meta' }, meta),
       list,
+      (s.watchers || []).length ? h('p', { class: 'muted' }, 'Watching: ', (s.watchers || []).map((w) => h('span', { class: 'badge', text: w.name || w.id }))) : null,
       h('div', { class: 'row', 'data-x': '' }, h('span', { class: 'mono muted grow', text: s.id }),
         h('button', { class: 'sm', onclick: () => spectate(s.id, s.game) }, 'Spectate')));
   }
@@ -615,14 +643,15 @@
     const sid = h('input', { type: 'text', placeholder: '7656119...' });
     const reason = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason' });
     const durF = durationField();
+    const codeF = codeField();
     const banForm = h('form', { class: 'inline-form' },
-      h('div', { class: 'field' }, h('label', {}, 'Steam id'), sid), h('div', { class: 'field' }, h('label', {}, 'Reason'), reason), durF.node,
+      h('div', { class: 'field' }, h('label', {}, 'Steam id'), sid), h('div', { class: 'field' }, h('label', {}, 'Reason'), reason), codeF.node, durF.node,
       h('button', { class: 'danger', type: 'submit' }, 'New ban'));
     banForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       if (!sid.value.trim() || !reason.value.trim()) { toast('Steam id and reason are required'); return; }
       let hours; try { hours = durF.hours(); } catch (er) { toast(er.message); return; }
-      if (await act(() => api('bans', { steamId: sid.value.trim(), reason: reason.value.trim(), hours }), 'Ban created')) reload();
+      if (await act(() => api('bans', { steamId: sid.value.trim(), reason: reason.value.trim(), hours, code: codeF.value() }), 'Ban created')) reload();
     });
 
     const blockRows = blocks.map((b) => {

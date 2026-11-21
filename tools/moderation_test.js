@@ -383,6 +383,123 @@ test('openid: valid + admin -> cookie; invalid/non-admin/wrong endpoint/return_t
   } finally { fake.srv.close(); }
 });
 
+// ---- native report route, evidence, ban body, spectate ----
+test('native app-meta report: path id is the target, reply shape, gameGuid stored (not sessionId)', async () => {
+  const e = makeEnv();
+  const c1 = e.mk(P1), c2 = e.mk(P2); e.seat(c1); e.seat(c2);
+  const body = { reason: 'cheating', 'game-session-id': 'GAMEGUID-0001', notes: 'aimbot', 'evidence-video-format': 'mp4' };
+  const r = e.mod.handleReport({}, P2, JSON.stringify(body), 'tok-p1');
+  assert(r.status === 200, JSON.stringify(r));
+  const rep = e.db.moderation.reports[0];
+  eq(rep.target.id, P2); eq(rep.reporter.id, P1); eq(rep.text, 'aimbot'); eq(rep.gameGuid, 'GAMEGUID-0001'); eq(rep.evidenceVideoFormat, 'mp4');
+  eq(rep.sessionId, SID, 'sessionId comes from the seat, not the GameGuid');
+  eq(r.body.report, { created: rep.at, 'game-session-d': 'GAMEGUID-0001', 'game-session-id': 'GAMEGUID-0001', reason: 'cheating', notes: 'aimbot', 'reporter-id': P1, 'evidence-url': '' });
+  // no seat, GameGuid only: sessionId stays null
+  const e2 = makeEnv();
+  e2.mod.handleReport({}, P2, JSON.stringify({ reason: 'spam', 'game-session-id': 'GG-2' }), 'tok-p1');
+  eq(e2.db.moderation.reports[0].sessionId, null); eq(e2.db.moderation.reports[0].gameGuid, 'GG-2');
+  eq(e2.mod.handleReport({}, P1, '{}', 'tok-p1').status, 400, 'self still refused');
+  eq(e2.mod.handleReport({}, P2, '{}', null).status, 401);
+});
+
+test('evidence attach: reporter ok, other player 403, bad url 400, unknown 404', async () => {
+  const e = makeEnv();
+  e.mod.handleReport({}, P2, JSON.stringify({ reason: 'cheating' }), 'tok-p1');
+  const id = e.db.moderation.reports[0].id;
+  eq(e.mod.handleEvidence({}, id, JSON.stringify({ evidenceUrl: 'https://youtu.be/abc' }), null).status, 401);
+  eq(e.mod.handleEvidence({}, id, JSON.stringify({ evidenceUrl: 'https://youtu.be/abc' }), 'tok-p2').status, 403);
+  eq(e.mod.handleEvidence({}, id, JSON.stringify({ evidenceUrl: 'javascript:alert(1)' }), 'tok-p1').status, 400);
+  eq(e.mod.handleEvidence({}, id, JSON.stringify({ evidenceUrl: 'https://e.com/' + 'a'.repeat(600) }), 'tok-p1').status, 400);
+  eq(e.mod.handleEvidence({}, 'r999', JSON.stringify({ evidenceUrl: 'https://e.com/a' }), 'tok-p1').status, 404);
+  eq(e.db.moderation.reports[0].evidenceUrl, null);
+  const ok = e.mod.handleEvidence({}, id, JSON.stringify({ evidenceUrl: 'https://youtu.be/abc' }), 'tok-p1');
+  eq(ok.status, 200); eq(e.db.moderation.reports[0].evidenceUrl, 'https://youtu.be/abc');
+});
+
+test('ban code + banBody: the shape the client parses', async () => {
+  const e = makeEnv();
+  const ck = await login(e);
+  let r = await api(e, ck, 'POST', '/admin/api/bans', { steamId: P1, reason: 'internal note', hours: 24, code: 'harassment' });
+  eq(r.json.ban.code, 'harassment');
+  const b = e.mod.banBody(e.mod.isBanned(P1));
+  eq(b.error, 'forbidden'); eq(b.metadata.cause, 'app-banned');
+  eq(b.metadata.ban.reason, 'harassment'); eq(b.metadata.ban.duration, 86400); eq(b.metadata.ban.type, 'app');
+  eq(b.metadata.ban.created, e.db.moderation.bans[P1].at); eq(b.metadata.ban.exp, e.db.moderation.bans[P1].expiresAt);
+  eq(b.data.metadata.cause, 'app-banned'); eq(b.version, 1);
+  r = await api(e, ck, 'POST', '/admin/api/bans', { steamId: P2, reason: 'x', hours: null, code: 'nonsense' });
+  eq(r.json.ban.code, 'other');
+  const p = e.mod.banBody(e.mod.isBanned(P2));
+  eq(p.metadata.ban.reason, 'other'); eq(p.metadata.ban.exp, null); eq(p.metadata.ban.duration, 315360000);
+  r = await api(e, ck, 'POST', '/admin/api/bans', { steamId: P3, reason: 'x', hours: 168, code: 'toxicity' });
+  eq(e.mod.banBody(e.mod.isBanned(P3)).metadata.ban.duration, 604800);
+});
+
+function b64j(x) { return JSON.parse(Buffer.from(x, 'base64url').toString()); }
+test('spectate: watcher allow-listed in the host GET but never seated; token verifies; stop removes; non-admin refused', async () => {
+  const e = makeEnv();
+  const c1 = e.mk(P1), c2 = e.mk(P2); e.seat(c1); e.seat(c2);
+  const ck = await login(e);
+  const before = e.mm.listHosted()[0];
+  let r = await api(e, ck, 'POST', '/admin/api/spectate', { sessionId: SID, mode: 'director' });
+  assert(r.status === 200, r.text);
+  const j = r.json;
+  eq(j.mode, 'director'); eq(j.address, '127.0.0.1:7777'); eq(j.sessionId, SID);
+  assert(j.joinUrl === `127.0.0.1:7777?SpectatorOnly=1&DirectorOnly=1&AuthToken=${j.authToken}` && j.command === `open ${j.joinUrl}` && j.instructions, j.joinUrl);
+  assert(Math.abs(Date.parse(j.expiresAt) - (e.T.now ? Date.now() : 0) - 3 * 3600 * 1000) < 60000, 'expires in about 3 h');
+  // JWT: HS512 keyed with the session token, sub = session id, roles user+session, id = the admin
+  const [h64, c64, sig] = j.authToken.split('.');
+  eq(b64j(h64).alg, 'HS512');
+  eq(sig, require('crypto').createHmac('sha512', SECRET_TOKEN).update(`${h64}.${c64}`).digest('base64url'));
+  const claims = b64j(c64);
+  eq(claims.sub, SID); assert(claims.roles.includes('user+session'), 'roles'); eq(claims['account-id'], ADMIN);
+  // host GET: in player-map and ogsos-watchers; not seated anywhere else
+  const g = e.mm.getHostedSession(SID).session;
+  assert(g['player-map'][ADMIN] && g['player-map'][P1] && g['player-map'][P2], 'player-map has watcher and players');
+  eq(g['ogsos-watchers'], [ADMIN]);
+  eq(e.mm.listHosted()[0].players, before.players);
+  const s = (await api(e, ck, 'GET', '/admin/api/servers')).json.servers[0];
+  assert(!s.players.some((p) => p.id === ADMIN), 'watcher not in the players list');
+  eq(s.playerCount, 2); eq(s.watchers, [{ id: ADMIN, name: `Name${ADMIN.slice(-3)}` }]);
+  // spectator mode, no director flag
+  r = await api(e, ck, 'POST', '/admin/api/spectate', { sessionId: SID, mode: 'spectator' });
+  assert(r.json.joinUrl.startsWith('127.0.0.1:7777?SpectatorOnly=1&AuthToken='), r.json.joinUrl);
+  // kick / ban never touch a watcher
+  eq(e.mm.kickHosted(SID, ADMIN), { error: 'not-seated' });
+  eq((await api(e, ck, 'POST', '/admin/api/kick', { sessionId: SID, playerId: ADMIN })).status, 404);
+  // admin list and token are never in logs / audit
+  const au = (await api(e, ck, 'GET', '/admin/api/audit')).json;
+  assert(au.some((x) => x.action === 'spectate'), 'audited');
+  assert(!JSON.stringify(au).includes(j.authToken) && !JSON.stringify(e.logs).includes(j.authToken), 'token not logged');
+  // validation
+  eq((await api(e, ck, 'POST', '/admin/api/spectate', { sessionId: SID, steamId: P1 })).status, 403, 'non-admin steamId refused');
+  eq((await api(e, ck, 'POST', '/admin/api/spectate', { sessionId: SID, mode: 'fly' })).status, 400);
+  eq((await api(e, ck, 'POST', '/admin/api/spectate', { sessionId: 'nope' })).status, 404);
+  assert(e.mm.watchToken(SID, P1) === null, 'no token for a non-watcher');
+  // second admin as steamId
+  r = await api(e, ck, 'POST', '/admin/api/spectate', { sessionId: SID, steamId: ADMIN2 });
+  eq(r.status, 200); eq(e.mm.getHostedSession(SID).session['ogsos-watchers'].sort(), [ADMIN, ADMIN2].sort());
+  // stop
+  r = await api(e, ck, 'POST', '/admin/api/spectate/stop', { sessionId: SID });
+  eq(r.status, 200); eq(e.mm.getHostedSession(SID).session['ogsos-watchers'], [ADMIN2]);
+  assert(!e.mm.getHostedSession(SID).session['player-map'][ADMIN], 'removed from player-map');
+  eq((await api(e, ck, 'POST', '/admin/api/spectate/stop', { sessionId: SID, steamId: P1 })).status, 403);
+  assert((await api(e, ck, 'GET', '/admin/api/audit')).json.some((x) => x.action === 'spectate-stop'), 'stop audited');
+});
+
+test('watchers expire and survive a match end', async () => {
+  const { mm } = makeMm();
+  assert(mm.addWatcher(SID, 'w1', 50), 'added');
+  assert(mm.addWatcher(SID, 'w2'), 'default ttl');
+  mm.endHosted(SID);
+  eq(mm.listWatchers(SID).sort(), ['w1', 'w2'], 'kept across match end');
+  await new Promise((r) => setTimeout(r, 80));
+  eq(mm.listWatchers(SID), ['w2'], 'expired one pruned');
+  assert(mm.watchToken(SID, 'w1') === null && mm.watchToken(SID, 'w2'), 'token only for active');
+  assert(mm.removeWatcher(SID, 'w2') && !mm.removeWatcher(SID, 'w2'));
+  eq(mm.addWatcher('nope', 'w'), null);
+  mm.shutdown();
+});
+
 // ---- run ----
 (async () => {
   for (const [name, fn] of tests) {

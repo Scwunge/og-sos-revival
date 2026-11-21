@@ -99,7 +99,7 @@ async function check(name, fn) {
   const admin = (method, p, body) => req(method, `/admin/api/${p}`, body, { Cookie: cookie, 'X-OGSOS-Admin': '1' });
   const suffix = String(Date.now()).slice(-6);
   const P1 = `7656119800${suffix}1`, P2 = `7656119800${suffix}2`;
-  let w1, w2, tok1, tok2, reportId;
+  let w1, w2, tok1, tok2, reportId, nativeId;
 
   await check('two players log in and are seated in the hosted Classic session', async () => {
     assert(cookie.startsWith('ogsos_admin='), 'dev-login cookie (is OGSOS_ADMIN_DEV_LOGIN=1 set?)');
@@ -128,6 +128,66 @@ async function check(name, fn) {
     assert(d.report.snapshot.session.game === 'classic', 'snapshot session game');
   });
 
+  await check('native app-meta report route: target in the path, client reply shape, gameGuid stored', async () => {
+    const r = await req('POST', `/api/account/${P2}/app-meta/sostest/report`,
+      { reason: 'harassment', 'game-session-id': 'GUID-e2e-1', notes: 'native e2e', 'evidence-video-format': 'mp4' }, { Authorization: `Token ${tok1}`, 'app-id': 'sostest' });
+    assert(r.status === 200, `native report ${r.status} ${r.body}`);
+    const rp = r.json.report;
+    assert(rp && rp['game-session-d'] === 'GUID-e2e-1' && rp['game-session-id'] === 'GUID-e2e-1' && rp.reason === 'harassment' && rp.notes === 'native e2e' && rp['reporter-id'] === P1 && rp['evidence-url'] === '' && rp.created, r.body);
+    const list = (await admin('GET', 'reports?status=all&target=' + P2)).json;
+    const mine = list.find((x) => x.gameGuid === 'GUID-e2e-1');
+    assert(mine && mine.target.id === P2 && mine.reporter.id === P1 && mine.sessionId === SID && mine.evidenceVideoFormat === 'mp4', JSON.stringify(mine));
+    nativeId = mine.id;
+  });
+
+  await check('evidence attach: reporter ok, other player 403, bad url 400', async () => {
+    const post = (tok, url) => req('POST', `/api/reports/${nativeId}/evidence`, { evidenceUrl: url }, { Authorization: `Bearer ${tok}`, 'app-id': 'sostest' });
+    assert((await post(tok2, 'https://youtu.be/x')).status === 403, 'other player');
+    assert((await post(tok1, 'ftp://x/y')).status === 400, 'bad url');
+    const ok = await post(tok1, 'https://youtu.be/clip123');
+    assert(ok.status === 200, `evidence ${ok.status} ${ok.body}`);
+    const d = (await admin('GET', `reports/${nativeId}`)).json;
+    assert(d.report.evidenceUrl === 'https://youtu.be/clip123', 'stored');
+  });
+
+  await check('admin login gets the dev role in the Classic token response; players do not', async () => {
+    const a = await login(ADMIN);
+    assert(a.status === 200 && Array.isArray(a.json.roles) && a.json.roles.includes('dev'), `admin roles ${JSON.stringify(a.json && a.json.roles)}`);
+    assert(!(await login(P1)).json.roles.includes('dev'), 'player has no dev role');
+  });
+
+  await check('spectate: watcher in the host player-map and ogsos-watchers, not seated; token verifies; stop removes; non-admin refused', async () => {
+    const r = await admin('POST', 'spectate', { sessionId: SID, mode: 'spectator' });
+    assert(r.status === 200, `spectate ${r.status} ${r.body}`);
+    const [h64, c64, sig] = r.json.authToken.split('.');
+    assert(JSON.parse(Buffer.from(h64, 'base64url')).alg === 'HS512', 'HS512');
+    assert(sig === crypto.createHmac('sha512', HOST_TOKEN).update(`${h64}.${c64}`).digest('base64url'), 'signature verifies with the session token');
+    const c = JSON.parse(Buffer.from(c64, 'base64url'));
+    assert(c.sub === SID && c.roles.includes('user+session'), JSON.stringify(c));
+    assert(r.json.joinUrl.includes('SpectatorOnly=1') && !r.json.joinUrl.includes('DirectorOnly'), r.json.joinUrl);
+    const g = (await hostGet()).json;
+    assert(g['player-map'][ADMIN] && g['ogsos-watchers'].includes(ADMIN), 'watcher allow-listed');
+    const s = (await admin('GET', 'servers')).json.servers.find((x) => x.id === SID);
+    assert(!s.players.some((p) => p.id === ADMIN) && s.watchers.some((w) => w.id === ADMIN), 'not a seated player, listed as watcher');
+    assert((await admin('POST', 'spectate', { sessionId: SID, steamId: P1 })).status === 403, 'non-admin refused');
+    assert((await admin('POST', 'spectate/stop', { sessionId: SID })).status === 200, 'stop');
+    const g2 = (await hostGet()).json;
+    assert(!g2['player-map'][ADMIN] && !g2['ogsos-watchers'].includes(ADMIN), 'removed');
+  });
+
+  await check('client-mod watch route (OGSOS_ADMIN_GAME_WATCH=1 only): admin game JWT gets a director link, a player gets 403, stop removes', async () => {
+    const adminTok = (await login(ADMIN)).json['access-token'];
+    const w = await req('POST', `/api/servers/${SID}/watch`, { mode: 'director' }, { Authorization: `Bearer ${adminTok}` });
+    if (w.status === 404 && w.json && w.json.error === 'disabled') { console.log('      (route disabled on this backend: 404 as expected without OGSOS_ADMIN_GAME_WATCH=1)'); return; }
+    assert(w.status === 200 && w.json.joinUrl.includes('SpectatorOnly=1&DirectorOnly=1&AuthToken='), `watch ${w.status} ${w.body}`);
+    assert((await hostGet()).json['ogsos-watchers'].includes(ADMIN), 'allow-listed');
+    const no = await req('POST', `/api/servers/${SID}/watch`, { mode: 'spectator' }, { Authorization: `Bearer ${tok1}` });
+    assert(no.status === 403, `player ${no.status}`);
+    assert((await req('POST', `/api/servers/${SID}/watch`, { mode: 'spectator' })).status === 401, 'no token 401');
+    const st = await req('POST', `/api/servers/${SID}/watch`, { stop: true }, { Authorization: `Bearer ${adminTok}` });
+    assert(st.status === 200 && !(await hostGet()).json['ogsos-watchers'].includes(ADMIN), 'stopped');
+  });
+
   await check('admin kick drops the player from the host player-map', async () => {
     const k = await admin('POST', 'kick', { sessionId: SID, playerId: P2, reason: 'e2e kick' });
     assert(k.status === 200, `kick ${k.status} ${k.body}`);
@@ -148,13 +208,16 @@ async function check(name, fn) {
   await check('ban closes the socket, refuses /ws and login; lift restores login', async () => {
     w2.close();
     ({ ws: w2 } = await Ws.connect(tok2)); await w2.take('ready');
-    const b = await admin('POST', 'bans', { steamId: P2, reason: 'e2e ban', hours: 1 });
+    const b = await admin('POST', 'bans', { steamId: P2, reason: 'e2e ban', hours: 24, code: 'cheating' });
     assert(b.status === 200, `ban ${b.status} ${b.body}`);
     await sleep(300);
     assert(w2.closed, 'matchmaking socket closed by the ban');
     const { status } = await Ws.connect(tok2);
     assert(status === 403, `ws after ban ${status}`);
-    assert((await login(P2)).status === 403, 'login refused');
+    const lg = await login(P2);
+    assert(lg.status === 403, 'login refused');
+    const ban = lg.json.metadata && lg.json.metadata.ban;
+    assert(lg.json.error === 'forbidden' && lg.json.metadata.cause === 'app-banned' && ban && ban.reason === 'cheating' && ban.duration === 86400 && ban.type === 'app' && ban.created && ban.exp, `ban body ${lg.body}`);
     assert((await admin('POST', `bans/${P2}/lift`, {})).status === 200, 'lift');
     assert((await login(P2)).status === 200, 'login after lift');
   });

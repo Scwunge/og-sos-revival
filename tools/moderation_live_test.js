@@ -95,7 +95,7 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
     const b = await A('POST', '/admin/api/bans', { steamId: TARGET, reason: 'live test', hours: 1 });
     assert(b.status === 200 && b.body.ban.steamId === TARGET, b.text);
     const l = await loginPlayer(TARGET);
-    assert(l.status === 403 && l.body.error === 'banned' && l.body.reason === 'live test', 'login while banned: ' + l.status + l.text);
+    assert(l.status === 403 && l.body.error === 'forbidden' && l.body.metadata.cause === 'app-banned' && l.body.metadata.ban.reason === 'other' && l.body.metadata.ban.duration === 3600, 'login while banned: ' + l.status + l.text);
     const list = await A('GET', '/admin/api/bans'); assert(list.body.bans.some((x) => x.steamId === TARGET), 'listed');
     assert((await A('POST', '/admin/api/bans', { steamId: ADMIN, reason: 'x' })).status === 403, 'admin not bannable');
     const lift = await A('POST', `/admin/api/bans/${TARGET}/lift`, {}); assert(lift.status === 200, lift.text);

@@ -99,6 +99,9 @@ const CLASSIC_COSMETIC_ROLES = ['alpha-beta'];
 function classicRoles(accountId, steamId, asked) {
   const roles = new Set([...(Array.isArray(asked) ? asked.map(String) : []), 'app-user', 'user', 'testserver', ...CLASSIC_COSMETIC_ROLES, ...CLASSIC.extraRoles]);
   if (CLASSIC.devAccounts.includes(accountId) || (steamId && CLASSIC.devAccounts.includes(steamId))) roles.add('dev');
+  // moderation: admins get the dev role (Director button and server browser in Classic); env read each time
+  const admins = String(process.env.OGSOS_ADMINS || '').split(/[\s,]+/).filter(Boolean);
+  if (admins.includes(accountId) || (steamId && admins.includes(steamId))) roles.add('dev');
   return [...roles];
 }
 
@@ -275,6 +278,12 @@ function handleApi(req, url, body, res) {
   const m = (re) => p.match(re);
   let r;
 
+  // moderation: an admin's spectate/director join link from the client mod (game JWT; OGSOS_ADMINS only), docs/ADMIN.md
+  if (req.method === 'POST' && (r = m(/^\/api\/servers\/([^/]+)\/watch$/))) {
+    const out = moderation.handleWatchApi(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
+
   // Vote to start: authorised by the PLAYER's bearer token (the per-player session access token from the
   // backend, or the account JWT), not the host's. The player must be seated in the session.
   if (req.method === 'POST' && (r = m(/^\/api\/session\/([^/]+)\/vote-start$/))) {
@@ -377,7 +386,7 @@ function handleApi(req, url, body, res) {
     const ban = moderation.isBanned(accountId);
     if (ban) {
       log('http.jsonl', { event: 'login-refused-banned', account: accountId });
-      return send(res, 403, { error: 'banned', reason: ban.reason, 'expires-at': ban.expiresAt, version: 1, data: { error: 'banned', reason: ban.reason, 'expires-at': ban.expiresAt } });
+      return send(res, 403, moderation.banBody(ban));   // the shape the client's login error handler parses (app-banned)
     }
     db.accounts[accountId] ??= {
       id: accountId, 'account-id': accountId, alias: `player-${accountId.slice(-4)}`,
@@ -436,6 +445,10 @@ function handleApi(req, url, body, res) {
     return send(res, 200, { ...acct, version: 1, data: acct });
   }
   // moderation: native client report (POST /api/account/<id>/report) and the mod/API report route
+  if (req.method === 'POST' && (r = m(/^\/api\/account\/([^/]+)\/app-meta\/([^/]+)\/report$/))) {   // the id is the TARGET, Token auth is the reporter
+    const out = moderation.handleReport(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
   if (req.method === 'POST' && (r = m(/^\/api\/account\/([^/]+)\/report$/))) {
     const out = moderation.handleReport(req, decodeURIComponent(r[1]), body, authToken(req));
     return send(res, out.status, out.body);
@@ -444,7 +457,12 @@ function handleApi(req, url, body, res) {
     const out = moderation.handleReportApi(req, body, authToken(req));
     return send(res, out.status, out.body);
   }
-  if (p.startsWith('/api/account/')) return send(res, 200, wrap({}));   // tos, language, report, identity, accept-ban
+  if (req.method === 'POST' && (r = m(/^\/api\/reports\/([^/]+)\/evidence$/))) {   // moderation: attach a clip link afterwards
+    const out = moderation.handleEvidence(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
+  // tos, language, identity, and app-meta/<app>/accept-ban (the client's ban acknowledgement; nothing to record): 200 empty
+  if (p.startsWith('/api/account/')) return send(res, 200, wrap({}));
 
   // Inventory: everyone owns every cosmetic (ids from data/cosmetics.json, see docs/INVENTORY_FORMAT.md).
   if (m(/^\/api\/app\/[^/]+\/inventory\//) || m(/^\/api\/app\/[^/]+\/reconcile\//)) {

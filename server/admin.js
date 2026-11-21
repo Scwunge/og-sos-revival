@@ -21,6 +21,9 @@ const STEAM_CLAIMED_RE = /^https?:\/\/steamcommunity\.com\/openid\/id\/(7656\d{1
 const STATIC_RE = /^[a-z0-9_-]+\.(html|css|js|svg|png)$/;
 const TYPES = { html: 'text/html; charset=utf-8', css: 'text/css; charset=utf-8', js: 'text/javascript; charset=utf-8', svg: 'image/svg+xml', png: 'image/png' };
 const HOUR = 3600 * 1000;
+const BAN_CODES = ['cheating', 'harassment', 'spam', 'bad-username', 'toxicity', 'stream-sniping', 'ban-evasion', 'other'];
+const PERMANENT_SECONDS = 315360000;   // the client words only 86400 (1 day) and 604800 (7 days); anything else reads as "permanently"
+const WATCH_TTL_MS = 3 * HOUR;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const b64u = (b) => Buffer.from(b).toString('base64url');
@@ -108,6 +111,14 @@ function createModeration(opts = {}) {
     const b = store().bans[String(steamId)];
     return banActive(b) ? b : null;
   }
+  // The body the real client parses on a refused login (HTTP 403): error forbidden, metadata.cause app-banned.
+  function banBody(b) {
+    const created = b.at || nowIso();
+    const duration = b.expiresAt ? Math.max(1, Math.round((Date.parse(b.expiresAt) - Date.parse(created)) / 1000)) : PERMANENT_SECONDS;
+    const ban = { created, exp: b.expiresAt || null, reason: BAN_CODES.includes(b.code) ? b.code : 'other', duration, type: 'app' };
+    const body = { error: 'forbidden', metadata: { cause: 'app-banned', ban } };
+    return { ...body, version: 1, data: body };
+  }
   function filterPlayerMap(session) {
     const m = store();
     if (!session || !isObj(session['player-map']) || !Object.keys(m.bans).length) return session;
@@ -131,7 +142,8 @@ function createModeration(opts = {}) {
       if (!mmx || typeof mmx.listHosted !== 'function') continue;
       for (const h of mmx.listHosted()) {
         const g = mmx.getHostedSession(h.id);
-        out.push({ game, mm: mmx, h, ids: g ? Object.keys(g.session['player-map'] || {}) : [] });
+        const w = new Set(g && Array.isArray(g.session['ogsos-watchers']) ? g.session['ogsos-watchers'] : []);   // watchers are never seated
+        out.push({ game, mm: mmx, h, ids: g ? Object.keys(g.session['player-map'] || {}).filter((id) => !w.has(id)) : [], watchers: [...w] });
       }
     }
     return out;
@@ -195,6 +207,8 @@ function createModeration(opts = {}) {
       reporter: { id: reporterId, name: displayName(reporterId) },
       target: { id: target, name: displayName(target) },
       reason: clip(f.reason, 64), text: clip(f.text, 1000),
+      gameGuid: f.gameGuid ? clip(f.gameGuid, 64) : null,
+      evidenceVideoFormat: f.evidenceVideoFormat ? clip(f.evidenceVideoFormat, 32) : null,
       sessionId: sessionIn || snap.sid,
       matchId: f.matchId && ID_RE.test(f.matchId) ? f.matchId : null,
       evidenceUrl: /^https?:\/\/\S+$/i.test(f.evidenceUrl || '') ? String(f.evidenceUrl).slice(0, 500) : null,
@@ -207,21 +221,46 @@ function createModeration(opts = {}) {
     }
     save();
     try { log('admin.jsonl', { event: 'report', id: report.id, source, reporter: reporterId, target, reason: report.reason }); } catch { /* ignore */ }
-    return { status: 200, body: { version: 1, result: true, data: { result: true, id: report.id } } };
+    return { status: 200, body: { version: 1, result: true, data: { result: true, id: report.id } }, report };
   }
   function handleReport(req, pathId, bodyText, token) {
     const reporter = jwtAccount(token);
     if (!reporter) return { status: 401, body: { error: 'unauthorized' } };
     const b = parseBody(bodyText);
+    // The native client posts /api/account/<TARGET id>/app-meta/<app>/report (or the older /api/account/<id>/report):
+    // the path id is the target unless the body names one.
     let target = firstOf(b, ['target', 'target-id', 'account-id', 'reported-id', 'player-id', 'reportee', 'user-id']);
     if (!target && pathId && pathId !== reporter) target = String(pathId);
-    return addReport('game', reporter, {
+    const gameGuid = clip(firstOf(b, ['game-session-id']), 64);   // the GameState GameGuid, NOT our MMS session id
+    const out = addReport('game', reporter, {
       target,
       reason: firstOf(b, ['reason', 'type', 'category', 'report-type']),
-      text: firstOf(b, ['text', 'comment', 'message', 'description', 'details']),
+      text: firstOf(b, ['notes', 'text', 'comment', 'message', 'description', 'details']),
       sessionId: firstOf(b, ['session-id', 'sessionId', 'session', 'match-id']),
       evidenceUrl: firstOf(b, ['evidence', 'evidenceUrl', 'url', 'clip']),
+      gameGuid, evidenceVideoFormat: firstOf(b, ['evidence-video-format']),
     }, b);
+    if (out.status === 200 && out.report) {
+      const rp = out.report;
+      // The reply the client parses (its typo key "game-session-d" is real; "game-session-id" is added too). The
+      // version/result/data keys are kept for older callers.
+      out.body.report = { created: rp.at, 'game-session-d': rp.gameGuid || '', 'game-session-id': rp.gameGuid || '', reason: rp.reason, notes: rp.text, 'reporter-id': rp.reporter.id, 'evidence-url': rp.evidenceUrl || '' };
+    }
+    return out;
+  }
+  // POST /api/reports/<reportId>/evidence: the reporter attaches a clip link afterwards.
+  function handleEvidence(req, reportId, bodyText, token) {
+    const who = jwtAccount(token);
+    if (!who) return { status: 401, body: { error: 'unauthorized' } };
+    const rp = store().reports.find((x) => x.id === String(reportId));
+    if (!rp) return { status: 404, body: { error: 'not-found' } };
+    if (rp.reporter.id !== who) return { status: 403, body: { error: 'forbidden' } };
+    const url = firstOf(parseBody(bodyText), ['evidenceUrl']);
+    if (!/^https?:\/\/\S+$/i.test(url) || url.length > 500) return { status: 400, body: { error: 'bad-evidence-url' } };
+    rp.evidenceUrl = url;
+    save();
+    try { log('admin.jsonl', { event: 'report-evidence', id: rp.id, reporter: who }); } catch { /* ignore */ }
+    return { status: 200, body: { version: 1, result: true, data: { result: true, id: rp.id } } };
   }
   function handleReportApi(req, bodyText, token) {
     const reporter = jwtAccount(token);
@@ -410,7 +449,7 @@ function createModeration(opts = {}) {
         servers.push({
           game: x.game, id: x.h.id, name: x.h.name, region: x.h.region, online: x.h.online, state: x.h.state, map: x.h.map,
           address: `${x.h.publicHost || x.h.host}:${x.h.port}`, players, playerCount: x.h.players, maxPlayers: x.h.maxPlayers,
-          startedAt: x.h.startedAt,
+          startedAt: x.h.startedAt, watchers: x.watchers.map((id) => ({ id, name: nameOf(id) })),
         });
       }
       const cnt = (k) => (matchmakers[k] && matchmakers[k]._state && matchmakers[k]._state.clients ? matchmakers[k]._state.clients.size : 0);
@@ -524,12 +563,13 @@ function createModeration(opts = {}) {
       let hours = b.hours === null || b.hours === undefined || b.hours === '' ? 0 : Number(b.hours);
       if (!Number.isFinite(hours) || hours < 0 || hours > 87600) return json(res, 400, { error: 'bad-hours' });
       const ban = {
-        steamId: id, name: nameOf(id), reason: clip(b.reason, 200), by: admin.steamId, at: nowIso(),
+        steamId: id, name: nameOf(id), reason: clip(b.reason, 200), code: BAN_CODES.includes(b.code) ? b.code : 'other',
+        by: admin.steamId, at: nowIso(),
         expiresAt: hours > 0 ? new Date(now() + hours * HOUR).toISOString() : null, lifted: false,
       };
       m.bans[id] = ban;
       const kicked = kickEverywhere(id);
-      audit(admin.steamId, admin.name, 'ban', id, `${hours > 0 ? `${hours}h` : 'permanent'}: ${ban.reason}`);
+      audit(admin.steamId, admin.name, 'ban', id, `${hours > 0 ? `${hours}h` : 'permanent'} [${ban.code}]: ${ban.reason}`);
       save();
       return json(res, 200, { ok: true, ban, kicked });
     }
@@ -576,15 +616,49 @@ function createModeration(opts = {}) {
       save();
       return json(res, 200, { ok: true });
     }
-    if (sub === 'spectate') {
-      const sessionId = String(b.sessionId || '');
-      const x = hostedAll().find((y) => y.h.id === sessionId);
-      if (!x) return json(res, 404, { error: 'not-found' });
-      audit(admin.steamId, admin.name, 'spectate', sessionId, '');
-      save();
-      return json(res, 200, { address: `${x.h.publicHost || x.h.host}:${x.h.port}`, sessionId, note: 'Spectating is not implemented yet; this is the host address of the session.' });
+    if (sub === 'spectate' || sub === 'spectate/stop') {
+      const out = watch(admin, String(b.sessionId || ''), b.game, b.mode, b.steamId, sub === 'spectate/stop');
+      return json(res, out.status, out.body);
     }
     return json(res, 404, { error: 'not-found' });
+  }
+
+  // Spectate / director join for an admin (panel and the client mod's JWT route). Returns {status, body}.
+  function watch(admin, sessionId, game, modeIn, steamIdIn, stop) {
+    const x = hostedAll().find((y) => y.h.id === sessionId && (!game || y.game === game));
+    if (!x) return { status: 404, body: { error: 'not-found' } };
+    const steamId = steamIdIn === undefined || steamIdIn === null || steamIdIn === '' ? admin.steamId : scalar(steamIdIn);
+    if (!ID_RE.test(steamId) || !admins().has(steamId)) return { status: 403, body: { error: 'not-an-admin' } };
+    if (stop) {
+      const removed = x.mm.removeWatcher(sessionId, steamId);
+      audit(admin.steamId, admin.name, 'spectate-stop', sessionId, steamId);
+      save();
+      return { status: 200, body: { ok: true, removed } };
+    }
+    const mode = modeIn === 'director' ? 'director' : (modeIn === 'spectator' || modeIn === undefined) ? 'spectator' : null;
+    if (!mode) return { status: 400, body: { error: 'bad-mode' } };
+    const w = x.mm.addWatcher(sessionId, steamId, WATCH_TTL_MS);
+    const authToken = w && x.mm.watchToken(sessionId, steamId);
+    if (!authToken) return { status: 500, body: { error: 'watch-failed' } };
+    const address = `${x.h.publicHost || x.h.host}:${x.h.port}`;
+    const joinUrl = `${address}?SpectatorOnly=1${mode === 'director' ? '&DirectorOnly=1' : ''}&AuthToken=${authToken}`;
+    audit(admin.steamId, admin.name, 'spectate', sessionId, `${mode} as ${steamId}`);   // never the token
+    save();
+    return { status: 200, body: {
+      address, sessionId, mode, expiresAt: new Date(w.expiresAt).toISOString(), authToken, joinUrl, command: `open ${joinUrl}`,
+      instructions: "Join with the in-game console (`open` + the join URL) if your build has it, or the client mod's Spectate button. A spectator has no body in the world, but may still show in player lists (untested). The link works for 3 hours; Stop watching removes it sooner.",
+    } };
+  }
+  // POST /api/servers/<id>/watch from the client mod: game JWT whose account is in OGSOS_ADMINS. Body {mode, stop?}.
+  function handleWatchApi(req, sessionId, bodyText, token) {
+    // Off unless OGSOS_ADMIN_GAME_WATCH=1: game logins are not Steam-verified yet, so anyone can claim an admin's
+    // Steam id and get a game JWT. Turn it on only once logins verify the Steam ticket (docs/ADMIN.md section 7).
+    if (env.OGSOS_ADMIN_GAME_WATCH !== '1') return { status: 404, body: { error: 'disabled' } };
+    const id = jwtAccount(token);
+    if (!id) return { status: 401, body: { error: 'unauthorized' } };
+    if (!admins().has(id)) return { status: 403, body: { error: 'not-an-admin' } };
+    const b = parseBody(bodyText);
+    return watch({ steamId: id, name: displayName(id) || id }, String(sessionId), b.game, b.mode, id, b.stop === true || b.stop === 'true');
   }
 
   function handleApi(req, url, bodyText, res) {
@@ -625,7 +699,7 @@ function createModeration(opts = {}) {
     return true;
   }
 
-  return { isBanned, filterPlayerMap, handleReport, handleReportApi, onMatchEnd, handleHttp, isHostBlocked, kickEverywhere };
+  return { isBanned, banBody, filterPlayerMap, handleReport, handleReportApi, handleEvidence, handleWatchApi, onMatchEnd, handleHttp, isHostBlocked, kickEverywhere };
 }
 
 module.exports = { createModeration };
