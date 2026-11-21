@@ -527,6 +527,23 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (pumpHosted()) sendSummary();
     return ids.length;
   }
+  // Moderation kick: take a player's seat in a hosted session. The host's next session poll no longer lists them,
+  // so the game removes them ("Not In Session"). Returns { result: true } or { error: 'not-found' | 'not-seated' }.
+  function kickHosted(id, playerId) {
+    const h = hostedById.get(String(id));
+    if (!h) return { error: 'not-found' };
+    const s = h.s, pid = String(playerId);
+    if (!s.players.has(pid)) return { error: 'not-seated' };
+    removeSeat(s, pid);
+    const c = clients.get(pid);
+    if (c && c.sessionId === s.id) {
+      c.sessionId = null;
+      c.sendMsg('player-leave', { id: s.id, 'player-id': pid });
+    }
+    sendSummary();
+    log(`kicked ${pid} from hosted session ${s.id}`);
+    return { result: true };
+  }
   const endHosted = (id) => { const h = hostedById.get(String(id)); return h ? endSession(h.s, 'host') : null; };
   const forceStartHosted = (id) => { const h = hostedById.get(String(id)); return h ? startSession(h.s, 'forced') : null; };
   const forceStartAll = () => [...hostedById.values()].map(({ s }) => ({ id: s.id, players: startSession(s, 'forced') }));
@@ -913,7 +930,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, kickHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
 module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };
