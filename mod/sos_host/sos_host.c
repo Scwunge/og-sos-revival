@@ -1325,6 +1325,14 @@ static void replicate_actors(uint8_t *drv)
            event) and keep the world clock moving for it. */
         track_disconnects(~0u);
         g_world_now = *(float *)(world + WORLD_TIMESECONDS);
+        /* The host supervisor reads this line to see that everyone has left
+           (it waits for the post-game show to finish before recycling the game). */
+        static DWORD last_idle_log;
+        DWORD t = GetTickCount();
+        if (t - last_idle_log >= 10000) {
+            last_idle_log = t;
+            hlog("[sos_host] Players alive=0 connected=0");
+        }
         return;
     }
 
