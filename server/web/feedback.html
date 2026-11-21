@@ -1,0 +1,169 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>SOS feedback</title>
+<!-- Spectator feedback panel: /embed/{account|none}/<performer id>/feedback?viewer=1  (HERO_TV.md 4.2).
+     In game, SpectatorWebFeedback drives the meters with the mouseDownEvent / mouseUpEvent globals below.
+     &site=1 (spectator website) also shows the performer name and the running audience vote.
+     Plain ES5: the game's CEF is UE 4.12's old Chromium. -->
+<style>
+html, body { margin: 0; background: transparent; font-family: Arial, Helvetica, sans-serif; color: #fff; overflow: hidden; }
+#meters { position: absolute; left: 0; right: 0; top: 0; bottom: 0; }
+#meters iframe { position: absolute; top: 0; bottom: 0; height: 100%; width: 20%; border: 0; background: transparent; }
+body.site #meters { position: relative; height: 120px; }
+#info { display: none; padding: 6px 2px; font-size: 14px; }
+body.site #info { display: block; }
+#vote { display: none; margin-top: 10px; padding: 8px; background: rgba(0,0,0,0.6); border: 1px solid #c90; border-radius: 6px; }
+#vote button { margin: 4px 4px 0 0; padding: 6px 10px; background: #333; color: #fff; border: 1px solid #c90; border-radius: 4px; cursor: pointer; }
+#vote button.mine { background: #c90; color: #000; }
+.dim { opacity: 0.7; font-size: 12px; }
+</style>
+<script>
+var CFG = /*CFG*/null;
+// Meter N -> sentiment. The game maps spectate events 2,3,5 to meters '2','0','3' (INFERENCE from
+// ESpectateEvent None,Anger,Applause,Laughter,Love,Shock: applause=2, laughter=0, shock=3). 1 and 4 are guesses.
+var METERS = [
+  { s: 'laughter', label: 'LAUGH', color: '#f2c200' },
+  { s: 'anger', label: 'ANGER', color: '#e0412f' },
+  { s: 'applause', label: 'CLAP', color: '#2fa8e0' },
+  { s: 'shock', label: 'SHOCK', color: '#9b59d0' },
+  { s: 'love', label: 'LOVE', color: '#e0559b' }
+];
+function makeMouseEvent(type) {
+  var e = document.createEvent('MouseEvents');
+  e.initMouseEvent(type, true, true, window, 1, 0, 0, 0, 0, false, false, false, false, 0, null);
+  return e;
+}
+var mouseDownEvent = makeMouseEvent('mousedown');
+var mouseUpEvent = makeMouseEvent('mouseup');
+
+var HeroFeedback = (function () {
+  var held = [false, false, false, false, false];
+  var level = [0, 0, 0, 0, 0];
+  var flash = [0, 0, 0, 0, 0];
+  var pending = {};
+  var pendingAny = false;
+  function add(n) { var s = METERS[n].s; pending[s] = (pending[s] || 0) + 1; pendingAny = true; }
+  function doc(n) { var f = document.getElementById('meter-' + n); try { return f && f.contentDocument; } catch (e) { return null; } }
+  function paint(n) {
+    var d = doc(n); if (!d) return;
+    var fill = d.getElementById('fill'), btn = d.getElementById('button');
+    if (!fill || !btn) return;
+    fill.style.height = Math.round(Math.max(level[n], flash[n]) * 100) + '%';
+    btn.style.borderColor = held[n] ? '#fff' : METERS[n].color;
+  }
+  return {
+    start: function (n) { n = n | 0; if (!METERS[n] || held[n]) return; held[n] = true; add(n); paint(n); },
+    stop: function (n) { n = n | 0; if (!METERS[n]) return; held[n] = false; paint(n); },
+    meterReady: function (n) {
+      var d = doc(n); if (!d) return;
+      d.getElementById('label').textContent = METERS[n].label;
+      d.getElementById('fill').style.background = METERS[n].color;
+      d.getElementById('key').textContent = CFG.site ? String(n + 1) : '';
+      paint(n);
+    },
+    // Crowd feedback from everyone watching: brief flash on that meter.
+    crowd: function (counts) {
+      for (var i = 0; i < METERS.length; i++) if (counts[METERS[i].s]) flash[i] = Math.min(1, 0.3 + counts[METERS[i].s] * 0.1);
+    },
+    tick: function () {
+      for (var i = 0; i < METERS.length; i++) {
+        if (held[i]) level[i] = Math.min(1, level[i] + 0.06); else level[i] = Math.max(0, level[i] - 0.04);
+        flash[i] = Math.max(0, flash[i] - 0.05);
+        paint(i);
+      }
+    },
+    heldTick: function () { for (var i = 0; i < METERS.length; i++) if (held[i]) add(i); },
+    take: function () { if (!pendingAny) return null; var p = pending; pending = {}; pendingAny = false; return p; }
+  };
+})();
+</script>
+</head>
+<body>
+<div id="info"><b id="who"></b> <span class="dim" id="viewers"></span>
+  <div class="dim">Hold a meter (or press 1-5) to send feedback.</div></div>
+<div id="meters">
+  <iframe id="meter-0" src="/embed/_/meter?n=0" style="left:0%"></iframe>
+  <iframe id="meter-1" src="/embed/_/meter?n=1" style="left:20%"></iframe>
+  <iframe id="meter-2" src="/embed/_/meter?n=2" style="left:40%"></iframe>
+  <iframe id="meter-3" src="/embed/_/meter?n=3" style="left:60%"></iframe>
+  <iframe id="meter-4" src="/embed/_/meter?n=4" style="left:80%"></iframe>
+</div>
+<div id="vote"><b id="vote-title"></b> <span class="dim" id="vote-ttl"></span>
+  <div class="dim" id="vote-desc"></div><div id="vote-options"></div></div>
+<script>
+(function () {
+  if (CFG.site) document.body.className = 'site';
+  document.getElementById('who').textContent = CFG.name || CFG.target;
+  var ws = null, myVote = {}, currentVote = null;
+
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+  function connect() {
+    var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/stream?client=web&role=feedback' +
+      '&target=' + encodeURIComponent(CFG.target) + (CFG.token ? '&token=' + encodeURIComponent(CFG.token) : '');
+    try { ws = new WebSocket(url); } catch (e) { setTimeout(connect, 5000); return; }
+    ws.onopen = function () { send({ type: 'sub', data: { target: CFG.target, topics: ['viewers', 'feedback-batch'] } }); };
+    ws.onmessage = function (ev) {
+      var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      var d = m.data || {};
+      if (m.type === 'message' && d.topic === 'viewers') document.getElementById('viewers').textContent = d.message.count + ' watching';
+      else if (m.type === 'message' && d.topic === 'feedback-batch') HeroFeedback.crowd(d.message.counts || {});
+      else if (m.type === 'vote') showVote(d);
+      else if (m.type === 'vote-status') voteStatus(d);
+    };
+    ws.onclose = function () { ws = null; setTimeout(connect, 3000); };
+  }
+
+  function showVote(v) {
+    if (!CFG.site) return;   // in game the native FlareVotingButton UI is used
+    currentVote = v;
+    document.getElementById('vote-title').textContent = v.title || 'Audience vote';
+    document.getElementById('vote-desc').textContent = v.description || '';
+    var box = document.getElementById('vote-options');
+    box.innerHTML = '';
+    for (var i = 0; i < v.options.length; i++) {
+      var b = document.createElement('button');
+      b.textContent = v.options[i].label || ('Option ' + v.options[i].id);
+      b.setAttribute('data-id', v.options[i].id);
+      b.onclick = (function (id) { return function () {
+        myVote[v['vote-id']] = id;
+        send({ type: 'cast-vote', data: { 'vote-id': v['vote-id'], 'option-id': id } });
+        markMine();
+      }; })(v.options[i].id);
+      box.appendChild(b);
+    }
+    document.getElementById('vote').style.display = 'block';
+    markMine();
+  }
+  function markMine() {
+    if (!currentVote) return;
+    var bs = document.getElementById('vote-options').getElementsByTagName('button');
+    for (var i = 0; i < bs.length; i++) bs[i].className = bs[i].getAttribute('data-id') === myVote[currentVote['vote-id']] ? 'mine' : '';
+  }
+  function voteStatus(s) {
+    if (!CFG.site || !currentVote || s['vote-id'] !== currentVote['vote-id']) return;
+    var t = s.tally || {}, bs = document.getElementById('vote-options').getElementsByTagName('button');
+    for (var i = 0; i < bs.length; i++) {
+      var id = bs[i].getAttribute('data-id'), opt = null;
+      for (var j = 0; j < currentVote.options.length; j++) if (currentVote.options[j].id === id) opt = currentVote.options[j];
+      bs[i].textContent = (opt && opt.label || ('Option ' + id)) + (t[id] !== undefined ? ' (' + t[id] + ')' : '');
+      bs[i].disabled = !!s.final;
+    }
+    document.getElementById('vote-ttl').textContent = s.final ? (s.winner !== null ? 'Vote closed' : 'Vote closed, no votes') : s.ttl + 's left';
+    if (s.final) setTimeout(function () { if (currentVote && currentVote['vote-id'] === s['vote-id']) document.getElementById('vote').style.display = 'none'; }, 8000);
+  }
+
+  // Keyboard 1-5 on the website.
+  var keyHeld = {};
+  document.addEventListener('keydown', function (e) { var n = e.keyCode - 49; if (n >= 0 && n < 5 && !keyHeld[n]) { keyHeld[n] = true; HeroFeedback.start(n); } }, false);
+  document.addEventListener('keyup', function (e) { var n = e.keyCode - 49; if (n >= 0 && n < 5) { keyHeld[n] = false; HeroFeedback.stop(n); } }, false);
+
+  setInterval(HeroFeedback.tick, 50);
+  setInterval(function () {
+    HeroFeedback.heldTick();
+    var p = HeroFeedback.take();
+    if (p) send({ type: 'feedback', data: { target: CFG.target, counts: p } });
+  }, 400);
+  connect();
+})();
+</script>
+</body></html>

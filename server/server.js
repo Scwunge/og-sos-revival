@@ -15,6 +15,8 @@ const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, re
 const { refreshPersona } = require('./persona');
 const { createProgression } = require('./progression');
 const { createCommunityRegistry, loadCommunityConfig } = require('./community');
+const { createStream } = require('./stream');   // hero-tv
+const { createFame } = require('./fame');       // hero-tv
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -513,6 +515,51 @@ function serveEmbedBlank(res) {
   res.end('<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0;background:transparent"></body></html>');
 }
 
+// hero-tv: real panels live in server/web/ (plain ES5 pages: the game's CEF is UE 4.12's old Chromium). Each page gets
+// its settings as `var CFG = {...}` in place of the /*CFG*/null marker. URL formats: HERO_TV.md section 2.
+//   /embed/{account|none}/<id>/performer?token=&skip-brand=&hide-view-count=1   performer's own panel
+//   /embed/{account|none}/<id>/feedback?viewer=1[&site=1]                       spectator meters (meter-0..4)
+//   /embed/{account|none}/<id>/connect/twitch?token=                            not built yet
+//   /embed/_/meter?n=<0-4>                                                      one meter iframe (#button)
+// Anything else under /embed/ stays blank so no parked-domain page can show up in a match.
+const WEB_DIR = path.join(__dirname, 'web');
+function servePage(res, file, cfg) {
+  let html;
+  try { html = fs.readFileSync(path.join(WEB_DIR, file), 'utf8'); } catch { return serveEmbedBlank(res); }
+  const json = JSON.stringify(cfg).replace(/</g, '\\u003c').replace(/\u2028|\u2029/g, '');
+  html = html.replace('/*CFG*/null', json);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(html);
+}
+function serveEmbed(url, res) {
+  const parts = url.pathname.split('/').filter(Boolean).map((x) => { try { return decodeURIComponent(x); } catch { return ''; } });
+  const q = (k) => url.searchParams.get(k) || '';
+  if (parts[1] === '_' && parts[2] === 'meter') return servePage(res, 'meter.html', { n: Number(q('n')) || 0 });
+  const kind = parts[1], id = parts[2] || '', page = parts.slice(3).join('/');
+  if ((kind === 'account' || kind === 'none') && id) {
+    const base = { target: id, token: kind === 'account' ? q('token') : '' };
+    if (page === 'performer') return servePage(res, 'performer.html', { ...base, skipBrand: q('skip-brand') === '1', hideViewCount: q('hide-view-count') === '1' });
+    if (page === 'feedback') return servePage(res, 'feedback.html', { ...base, viewer: q('viewer') === '1', site: q('site') === '1', name: displayName(id) });
+    if (page === 'connect/twitch') return servePage(res, 'twitch.html', base);
+  }
+  return serveEmbedBlank(res);
+}
+const displayName = (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id;
+const fame = createFame({ db, saveDb, displayName, log: (e) => log('ws.jsonl', { stream: true, ...e }) });
+// Read-only JSON for the spectator site.
+function handleStreamApi(url, res) {
+  if (url.pathname === '/api/stream/sessions') {
+    const snap = stream.snapshot();
+    for (const s of snap.sessions) for (const p of s.players) { p.name = displayName(p.id); p.fame = fame.heroStats(p.id)?.soloFameRating || 0; }
+    return send(res, 200, snap);
+  }
+  if (url.pathname === '/api/stream/fame') {
+    // The same rows the game's FameLeaderboard gets (one source of truth).
+    return send(res, 200, { fame: fame.fameLeaderboard('solo', { limit: 100 }) });
+  }
+  return null;
+}
+
 const server = http.createServer((req, res) => {
   const chunks = [];
   let size = 0, tooBig = false;
@@ -527,7 +574,9 @@ const server = http.createServer((req, res) => {
     try {
       if (url.pathname.startsWith('/kv/')) result = handleKv(url.pathname.slice(4), res, req);
       else if (url.pathname === '/servers' && req.method === 'GET') return serveServers(req, url, res);
-      else if (url.pathname.startsWith('/embed/') && req.method === 'GET') return serveEmbedBlank(res);
+      else if (url.pathname.startsWith('/embed/') && req.method === 'GET') return serveEmbed(url, res);   // hero-tv
+      else if ((url.pathname === '/' || url.pathname === '/watch') && req.method === 'GET') return servePage(res, 'watch.html', {});   // hero-tv
+      else if (url.pathname.startsWith('/api/stream/') && req.method === 'GET') result = handleStreamApi(url, res);   // hero-tv
       else result = handleApi(req, url, body, res);
       if (!result) {
         handled = false;
@@ -615,6 +664,7 @@ function jwtAccount(tok) {
 // Fame (hero-tv, server/fame.js) plugs in by setting fameHooks to its instance; until then fame boards use the
 // scores the game host posts, and blobs pass through untouched.
 let fameHooks = null;
+fameHooks = fame;   // hero-tv: server/fame.js plugs in here (docs/PROGRESSION.md section 7)
 const progression = createProgression({
   db, saveDb, isHostToken, jwtAccount,
   canReadToken: (tok) => !!community.communityIdForToken(tok),
@@ -628,8 +678,16 @@ const progression = createProgression({
   },
 });
 
-function wsAccount(req) {
-  const tok = String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim();
+// hero-tv: HERO Stream service (server/stream.js). When a stream session ends, its feedback becomes Fame (server/fame.js).
+const stream = createStream({
+  log: (e) => { log('ws.jsonl', { stream: true, ...e }); if (e.event !== 'stream-feedback') console.log(`stream ${e.event} ${e.type || e.session || e.vote || ''}`); },
+  createReply: process.env.OGSOS_STREAM_CREATE_REPLY || 'typed',
+  adoptUnknown: process.env.OGSOS_STREAM_ADOPT_UNKNOWN === '1',
+  onSessionEnd: (match) => fame.recordMatch(match),
+});
+
+function wsAccount(req, token) {   // hero-tv: optional token (stream sockets from our embed pages)
+  const tok = token || String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim();
   const claims = tok && readJwt(tok);
   if (!claims || (claims.exp && claims.exp < Date.now() / 1000)) return null;
   const id = String(claims['account-id'] || claims.id || '');
@@ -643,7 +701,10 @@ server.on('upgrade', (req, socket) => {
   const wsPath = new URL(req.url, 'http://x').pathname;
   const isMm = wsPath === '/ws';
   const isStream = wsPath === '/ws/stream';   // HERO "Stream" service ([OutpostStreamClient], see docs/HERO_TV.md)
-  const who = isMm ? wsAccount(req) : null;
+  const wsQuery = new URL(req.url, 'http://x').searchParams;
+  // hero-tv: stream sockets are never rejected: the game's auth for them is unknown, so the account is a best guess
+  // (Authorization header, or ?token= from our embed pages).
+  const who = isMm ? wsAccount(req) : isStream ? wsAccount(req, wsQuery.get('token') || '') : null;
   const accountId = who ? who.id : null;
   const mmFor = who && isClassic(who.appId) ? mmClassic : mm;
   if (isMm && !accountId) {
@@ -684,14 +745,21 @@ server.on('upgrade', (req, socket) => {
     };
     mmFor.onConnect(client);
   }
-  // Stream stub: ready on connect, pong to ping, ack everything else. Every message is logged to ws.jsonl
-  // so the real HERO shapes can be captured before anything more is built.
-  const streamSend = (obj) => {
-    const text = JSON.stringify(obj);
-    sendFrame(0x1, Buffer.from(text));
-    log('ws.jsonl', { id, event: 'sent', stream: true, text });
-  };
-  if (isStream) streamSend({ type: 'ready' });
+  // hero-tv: Stream service, `ready` on connect like matchmaking, then server/stream.js. Every frame both ways is
+  // logged to ws.jsonl with stream:true so the real HERO shapes can be read off the live logs.
+  let streamConn = null;
+  if (isStream) {
+    const web = wsQuery.get('client') === 'web' ? { role: String(wsQuery.get('role') || ''), target: String(wsQuery.get('target') || '') } : null;
+    streamConn = stream.connect({
+      id, account: accountId || '', web,
+      send(obj) {
+        const text = JSON.stringify(obj);
+        sendFrame(0x1, Buffer.from(text));
+        if (!web || obj.type !== 'message') log('ws.jsonl', { id, event: 'sent', stream: true, text });   // skip web topic spam
+      },
+    });
+    streamConn.send({ type: 'ready' });
+  }
 
   let buf = Buffer.alloc(0);
   socket.on('data', (d) => {
@@ -715,18 +783,10 @@ server.on('upgrade', (req, socket) => {
       if (opcode === 0x9) { sendFrame(0xA, payload); continue; }
       if (opcode === 0xA) continue;
       const text = payload.toString('utf8');
-      log('ws.jsonl', { id, event: 'msg', opcode, text });
-      console.log(`ws ${id} <- ${text.slice(0, 200)}`);
+      if (!(streamConn && streamConn.web)) log('ws.jsonl', isStream ? { id, event: 'msg', stream: true, opcode, text } : { id, event: 'msg', opcode, text });
+      if (!isStream) console.log(`ws ${id} <- ${text.slice(0, 200)}`);
       if (client) mmFor.onMessage(client, text);
-      else if (isStream) {
-        let m = null;
-        try { m = JSON.parse(text); } catch {}
-        const nonce = m ? (m.nonce ?? (m.data ? m.data.nonce : undefined)) : undefined;
-        const reply = { type: m && m.type === 'ping' ? 'pong' : 'ack' };
-        if (nonce !== undefined) reply.nonce = nonce;
-        if (reply.type === 'ack') reply.data = nonce !== undefined ? { nonce } : {};
-        streamSend(reply);
-      }
+      else if (streamConn) stream.message(streamConn, text);   // hero-tv
     }
   });
   // The http server leaves upgraded sockets half-open, so a client that just drops the TCP connection
@@ -734,6 +794,7 @@ server.on('upgrade', (req, socket) => {
   socket.on('end', () => socket.end());
   socket.on('close', () => {
     if (client) mmFor.onClose(client);
+    if (streamConn) stream.disconnect(streamConn);   // hero-tv
     log('ws.jsonl', { id, event: 'close' });
     console.log(`ws ${id} closed`);
   });

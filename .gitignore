@@ -11,3 +11,4 @@ deploy/classic-backend/pool/*.env
 deploy/classic-backend/.env.prog
 
 deploy/host-kit/dist/
+deploy/classic-backend/.env.hero

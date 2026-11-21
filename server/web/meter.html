@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<!-- One feedback meter. The game runs, from the parent feedback page:
+       document.getElementById('meter-<N>').contentDocument.getElementById('button').dispatchEvent(mouseDownEvent)
+     so this page must be same-origin and have #button. Looks are set by the parent (feedback.html). -->
+<style>
+html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; font-family: Arial, Helvetica, sans-serif; }
+#button { position: absolute; left: 2px; top: 2px; right: 2px; bottom: 2px; border-radius: 8px; cursor: pointer;
+  background: rgba(0,0,0,0.55); border: 2px solid #888; overflow: hidden; -webkit-user-select: none; user-select: none; }
+#fill { position: absolute; left: 0; right: 0; bottom: 0; height: 0; background: #888; opacity: 0.85; }
+#label { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center; color: #fff; font-size: 12px; font-weight: bold;
+  letter-spacing: 1px; text-shadow: 0 1px 2px #000; }
+#key { position: absolute; left: 0; right: 0; top: 4px; text-align: center; color: #fff; font-size: 10px; opacity: 0.6; }
+</style></head>
+<body><div id="button"><div id="fill"></div><div id="key"></div><div id="label"></div></div>
+<script>
+var CFG = /*CFG*/null;
+(function () {
+  var b = document.getElementById('button');
+  function hub() { try { return window.parent && window.parent.HeroFeedback; } catch (e) { return null; } }
+  function down(e) { if (e && e.preventDefault) e.preventDefault(); var h = hub(); if (h) h.start(CFG.n); }
+  function up() { var h = hub(); if (h) h.stop(CFG.n); }
+  b.addEventListener('mousedown', down, false);
+  b.addEventListener('mouseup', up, false);
+  b.addEventListener('mouseleave', up, false);
+  b.addEventListener('touchstart', down, false);
+  b.addEventListener('touchend', up, false);
+  var h = hub();
+  if (h) h.meterReady(CFG.n);
+})();
+</script>
+</body></html>

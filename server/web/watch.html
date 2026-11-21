@@ -1,0 +1,93 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOS: Classic - Live</title>
+<!-- Spectator website (sos.joltora.com/). Lists live stream sessions from /api/stream/sessions; picking a
+     player opens their feedback panel (/embed/none/<id>/feedback?viewer=1&site=1) with the audience vote. -->
+<style>
+body { margin: 0; background: #141414; color: #ddd; font-family: Arial, Helvetica, sans-serif; }
+header { padding: 14px 20px; background: #000; border-bottom: 2px solid #e0412f; }
+header b { color: #fff; font-size: 20px; letter-spacing: 1px; } header span { color: #888; margin-left: 10px; }
+main { display: flex; flex-wrap: wrap; padding: 12px; }
+section { flex: 1 1 320px; margin: 8px; padding: 12px; background: #1d1d1d; border-radius: 6px; }
+h2 { margin: 0 0 10px; font-size: 15px; color: #fff; text-transform: uppercase; letter-spacing: 1px; }
+.match { margin-bottom: 12px; } .match .dim { margin-bottom: 4px; }
+.player { display: block; width: 100%; text-align: left; padding: 7px 10px; margin: 3px 0; background: #2a2a2a; color: #eee;
+  border: 1px solid #333; border-radius: 4px; cursor: pointer; font-size: 14px; }
+.player:hover, .player.on { border-color: #e0412f; }
+.player small { float: right; color: #999; }
+.dim { color: #888; font-size: 12px; }
+#panel iframe { width: 100%; height: 330px; border: 0; background: transparent; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; } td { padding: 4px; border-bottom: 1px solid #2a2a2a; }
+td.n { text-align: right; color: #aaa; }
+</style></head>
+<body>
+<header><b>SOS: CLASSIC</b><span>live audience</span></header>
+<main>
+  <section><h2>Live matches</h2><div id="matches" class="dim">Loading...</div></section>
+  <section id="panel"><h2>Watch</h2><div id="pick" class="dim">Pick a player to send them feedback.</div><div id="frame"></div></section>
+  <section><h2>Fame</h2><div id="fame" class="dim">Loading...</div></section>
+</main>
+<script>
+var CFG = /*CFG*/null;
+(function () {
+  var current = null;
+  function get(url, cb) {
+    var x = new XMLHttpRequest();
+    x.open('GET', url, true);
+    x.onreadystatechange = function () { if (x.readyState === 4) { var j = null; try { j = JSON.parse(x.responseText); } catch (e) {} cb(x.status === 200 ? j : null); } };
+    x.send();
+  }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+
+  function pick(p) {
+    current = p.id;
+    document.getElementById('pick').textContent = 'Watching ' + p.name + '. Hold a meter or press 1-5.';
+    var box = document.getElementById('frame');
+    box.innerHTML = '';
+    var f = document.createElement('iframe');
+    f.src = '/embed/none/' + encodeURIComponent(p.id) + '/feedback?viewer=1&site=1';
+    box.appendChild(f);
+    refresh();
+  }
+  function refresh() {
+    get('/api/stream/sessions', function (j) {
+      var box = document.getElementById('matches');
+      box.innerHTML = '';
+      var live = j ? j.sessions.filter(function (s) { return s.players.length; }) : [];
+      if (!j) { box.textContent = 'Could not reach the server.'; return; }
+      if (!live.length) { box.textContent = 'No live matches right now.'; return; }
+      for (var i = 0; i < live.length; i++) {
+        var s = live[i], m = el('div', 'match');
+        m.appendChild(el('div', 'dim', 'Match ' + s.id.slice(0, 8) + ' - ' + s.players.length + ' players' + (s.votes.length ? ' - vote running' : '')));
+        for (var k = 0; k < s.players.length; k++) {
+          var p = s.players[k], b = el('button', 'player' + (p.id === current ? ' on' : ''), p.name);
+          b.appendChild(el('small', '', p.viewers + ' watching'));
+          b.onclick = (function (pp) { return function () { pick(pp); }; })(p);
+          m.appendChild(b);
+        }
+        box.appendChild(m);
+      }
+    });
+  }
+  function fame() {
+    get('/api/stream/fame', function (j) {
+      var box = document.getElementById('fame');
+      box.innerHTML = '';
+      // Same rows as the game's Fame leaderboard (fame_solo): {member, rank, score, uname}.
+      var rows = (j && j.fame) || [];
+      if (!rows.length) { box.textContent = 'No fame earned yet.'; return; }
+      var t = el('table');
+      for (var i = 0; i < rows.length && i < 25; i++) {
+        var r = el('tr'); r.appendChild(el('td', '', rows[i].rank + '. ' + rows[i].uname)); r.appendChild(el('td', 'n', String(rows[i].score)));
+        t.appendChild(r);
+      }
+      box.appendChild(t);
+    });
+  }
+  refresh(); fame();
+  setInterval(refresh, 3000);
+  setInterval(fame, 30000);
+})();
+</script>
+</body></html>

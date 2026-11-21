@@ -1,0 +1,55 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>SOS performer</title>
+<!-- Performer's own audience panel: /embed/{account|none}/<id>/performer?skip-brand=&hide-view-count=1
+     (HERO_TV.md 4.1). Shows how many are watching and the feedback coming in. Plain ES5 for UE 4.12's CEF. -->
+<style>
+html, body { margin: 0; background: transparent; font-family: Arial, Helvetica, sans-serif; color: #fff; overflow: hidden; }
+#bar { padding: 4px 8px; display: inline-block; background: rgba(0,0,0,0.55); border-radius: 0 0 6px 0; font-size: 13px; font-weight: bold; }
+#brand { color: #e0412f; margin-right: 8px; letter-spacing: 1px; }
+#feed { position: absolute; left: 6px; bottom: 6px; right: 6px; }
+.toast { display: inline-block; margin: 2px 4px 0 0; padding: 3px 8px; border-radius: 10px; font-size: 13px; font-weight: bold;
+  background: rgba(0,0,0,0.6); border: 2px solid #888; opacity: 1; -webkit-transition: opacity 1s; transition: opacity 1s; }
+</style></head>
+<body>
+<div id="bar"><span id="brand">SOS LIVE</span><span id="count">0 watching</span></div>
+<div id="feed"></div>
+<script>
+var CFG = /*CFG*/null;
+(function () {
+  var COLORS = { laughter: '#f2c200', anger: '#e0412f', applause: '#2fa8e0', shock: '#9b59d0', love: '#e0559b' };
+  var NAMES = { laughter: 'LAUGH', anger: 'ANGER', applause: 'CLAP', shock: 'SHOCK', love: 'LOVE' };
+  if (CFG.skipBrand) document.getElementById('brand').style.display = 'none';
+  if (CFG.hideViewCount) document.getElementById('count').style.display = 'none';
+  if (CFG.skipBrand && CFG.hideViewCount) document.getElementById('bar').style.display = 'none';
+  var feed = document.getElementById('feed');
+
+  function toast(s, n) {
+    var t = document.createElement('span');
+    t.className = 'toast';
+    t.style.borderColor = COLORS[s] || '#888';
+    t.textContent = '+' + n + ' ' + (NAMES[s] || s.toUpperCase());
+    feed.appendChild(t);
+    while (feed.childNodes.length > 8) feed.removeChild(feed.firstChild);
+    setTimeout(function () { t.style.opacity = '0'; }, 2500);
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 3600);
+  }
+  function connect() {
+    var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/stream?client=web&role=performer' +
+      '&target=' + encodeURIComponent(CFG.target) + (CFG.token ? '&token=' + encodeURIComponent(CFG.token) : '');
+    var ws;
+    try { ws = new WebSocket(url); } catch (e) { setTimeout(connect, 5000); return; }
+    ws.onopen = function () { ws.send(JSON.stringify({ type: 'sub', data: { target: CFG.target, topics: ['viewers', 'feedback-batch'] } })); };
+    ws.onmessage = function (ev) {
+      var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      var d = m.data || {};
+      if (m.type !== 'message' || !d.message) return;
+      if (d.topic === 'viewers') document.getElementById('count').textContent = d.message.count + ' watching';
+      else if (d.topic === 'feedback-batch') { var c = d.message.counts || {}; for (var s in c) if (c.hasOwnProperty(s)) toast(s, c[s]); }
+    };
+    ws.onclose = function () { setTimeout(connect, 3000); };
+  }
+  connect();
+})();
+</script>
+</body></html>
