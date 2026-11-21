@@ -58,7 +58,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   let batchTimer = null;
 
   const uname = (id) => getUname(id) || id;
-  const newId = () => crypto.randomBytes(6).toString('hex');
+  const newId = () => crypto.randomUUID(); // the client's JoinSession rejects ids without a hyphen
   const nak = (c, error) => c.sendMsg('nak', { error });
 
   // ---------- snapshots ----------
@@ -195,7 +195,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
         joined.push(c);
       }
     }
-    for (const c of joined) { sendSession(c, s); sendStarted(c, s); }
+    for (const c of joined) { sendSession(c, s, true); sendStarted(c, s); }
   }
 
   function createMatch(batch) {
@@ -320,7 +320,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
     'leave-all-groups': (c) => {
       const g = leaveGroup(c);
-      c.sendMsg('group', emptyGroup(g ? g.id : ''));
+      c.sendMsg('ack'); // the client expects ack here; a group reply logs "unexpected packet"
     },
 
     'kick-from-group': (c, d) => {

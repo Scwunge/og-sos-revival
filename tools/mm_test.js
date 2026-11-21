@@ -112,7 +112,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await check('valid token upgrades, subprotocol echoed', async () => {
     const r = await Ws.connect(tokA); a = r.ws;
     assert(r.status === 101, `status ${r.status}`);
-    assert(r.headers['sec-websocket-protocol'] === 'wss', 'subprotocol ' + r.headers['sec-websocket-protocol']);
+    assert(r.headers['sec-websocket-protocol'] === 'wss,ws', 'subprotocol ' + r.headers['sec-websocket-protocol']);
   });
 
   await check('ready arrives first', async () => {
@@ -137,17 +137,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     assert(g.id && g['owner-id'] === idA && g.players[idA] && g.players[idA].user.uname, JSON.stringify(g));
     assert(g.players[idA].opts.char === 'c', 'user-data kept');
     const g2 = await a.req('get-group', undefined, 'group'); assert(g2.data.group.id === g.id, 'get-group id');
-    const left = await a.req('leave-all-groups', undefined, 'group'); assert(left.data.group, 'group payload');
+    const left = await a.req('leave-all-groups', undefined, 'ack'); assert(left.type === 'ack', 'leave-all-groups acks');
   });
 
   await check('unknown request -> nak not-found', async () => {
     const m = await a.req('bogus-type', {}, 'nak'); assert(m.data.error === 'not-found', JSON.stringify(m));
   });
 
-  await check('find-session -> ack, session (empty host), session-started', async () => {
+  await check('find-session -> ack, session (host filled, hyphenated id), session-started', async () => {
     await a.req('find-session', opts, 'ack');
     const s = await a.next('session');
-    assert(s.data.session.id && s.data.session.host === '' && s.data['access-token'], JSON.stringify(s));
+    assert(s.data.session.id && s.data.session.id.includes('-') && s.data.session.host === '127.0.0.1' && s.data.session.port === 7777 && s.data['access-token'], JSON.stringify(s));
     assert(s.data.session['player-map'][idA], 'player in player-map');
     const st = await a.next('session-started');
     assert(st.data.id === s.data.session.id, 'id matches');
