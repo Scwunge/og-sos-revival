@@ -1193,14 +1193,26 @@ static DWORD WINAPI backend_worker(LPVOID unused)
             u.dwUrlPathLength = (DWORD)-1;
             DWORD status = 0;
             if (WinHttpCrackUrl(cfg.backend, 0, 0, &u)) {
+                /* Keep the base URL's own path (e.g. /api), without a trailing '/'. */
+                wchar_t full[512], headers[640];
+                int base_len = u.lpszUrlPath ? (int)u.dwUrlPathLength : 0;
+                while (base_len > 0 && u.lpszUrlPath[base_len - 1] == L'/') base_len--;
+                if (base_len > 256) base_len = 256;
+                _snwprintf(full, 511, L"%.*ls%ls", base_len, base_len ? u.lpszUrlPath : L"", r->path);
+                full[511] = 0;
+                if (cfg.token[0])
+                    _snwprintf(headers, 639, L"Content-Type: application/json\r\nAuthorization: Token %ls\r\n", cfg.token);
+                else
+                    _snwprintf(headers, 639, L"Content-Type: application/json\r\n");
+                headers[639] = 0;
                 HINTERNET ses = WinHttpOpen(L"sos_host", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
                 HINTERNET con = ses ? WinHttpConnect(ses, hostname, u.nPort, 0) : NULL;
-                HINTERNET req = con ? WinHttpOpenRequest(con, L"POST", r->path, NULL, NULL, NULL,
+                HINTERNET req = con ? WinHttpOpenRequest(con, L"POST", full, NULL, NULL, NULL,
                                                          u.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : NULL;
                 if (req) {
                     WinHttpSetTimeouts(req, 5000, 5000, 5000, 5000);
                     DWORD len = (DWORD)strlen(r->body);
-                    if (WinHttpSendRequest(req, L"Content-Type: application/json\r\n", (DWORD)-1,
+                    if (WinHttpSendRequest(req, headers, (DWORD)-1,
                                            r->body, len, len, 0) && WinHttpReceiveResponse(req, NULL)) {
                         DWORD sz = sizeof status;
                         WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -1211,7 +1223,9 @@ static DWORD WINAPI backend_worker(LPVOID unused)
                 if (con) WinHttpCloseHandle(con);
                 if (ses) WinHttpCloseHandle(ses);
             }
-            hlog("Backend POST %ls %s -> %lu", r->path, r->body, status);
+            hlog("Backend POST %.*ls%ls %s (token %s) -> %lu",
+                 (int)(u.lpszUrlPath ? u.dwUrlPathLength : 0), u.lpszUrlPath ? u.lpszUrlPath : L"",
+                 r->path, r->body, cfg.token[0] ? "sent" : "none", status);
             free(r);
         }
     }
