@@ -64,6 +64,17 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 - Verified (with it on): the Founder's Pack T-Shirts row is listed and a gold shirt equips and renders on the character: `docs/client-mod-dlc-founders-listed.png`, `docs/client-mod-dlc-founders-equipped.png`.
 - Not checked in the game: the gestures and the name plate.
 
+## Branding and settings
+
+Set in `sos_client.ini` under `[Client]`:
+
+- `BuildLabel=OG SOS Revival` replaces the "SOSTEST v.x" label (main menu and in-game HUD). The label is the `BuildVersionText` text block, set by the Blueprint event `UpdateBuildInfoText` from the app id; the mod leaves the app id alone (it gates login) and calls the widget's own `SetText`, again after every `UpdateBuildInfoText`. Empty value = leave the original.
+- `HideShutdownNotice=1` closes the boot notice ("Thank you for playing SOS! ... servers will shut down ...") by running the notice's own OK handler on `FrontendHUD_C`.
+- `Borderless=1` makes a framed, windowed game a borderless window covering its monitor (off by default; exclusive fullscreen is untouched).
+- `DumpObjects=<text>` (development aid) logs live objects whose name contains the text, with class and outer, once a few seconds after the menu appears.
+
+Verified in the game (own copy, local backend): label reads "OG SOS Revival" and the notice is dismissed (`docs/client-mod-text-replace.png`, `docs/client-mod-borderless.png`). Both run on the game thread inside the `ProcessEvent` hook (a once-a-second scan of the object array, plus an immediate pass when `UpdateBuildInfoText` runs). Not checked: the in-game HUD's own label (the scan sets every `BuildVersionText` block, but I did not enter a match to look at it).
+
 ## Roadmap
 
 Ranked by value for the revival divided by effort and risk. Feasibility is for the UE 4.12.5 shipping client with the mod loaded as `xinput1_3.dll` (what the mod can already do: inline hooks, config overrides, Blueprint `ProcessEvent` calls, a D3D11 overlay, a window subclass, HTTP to the backend). "Status" says what is built.

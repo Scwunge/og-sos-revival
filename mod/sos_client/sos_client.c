@@ -98,10 +98,14 @@ static struct {
     int game_log;                /* 1: mirror UE_LOG lines to sos_client_game_<pid>.log */
     int overlay;                 /* 1: draw the server browser overlay */
     int auto_play;               /* 1: queue for a match right after a server is selected */
+    int hide_shutdown;           /* 1: dismiss the boot "servers shut down" overlay through its own OK handler */
     int borderless;              /* 1: windowed game becomes a borderless window covering its monitor */
     int unlock_dlc;              /* 1: report every Steam DLC / entitlement check as owned (cosmetics only) */
     int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
-} cfg = { 1, 0, 0, 1, 1, 0, 1, 1 };
+} cfg = { 1, 0, 0, 1, 1, 1, 0, 1, 1 };
+
+static wchar_t g_dump_pat[64];       /* DumpObjects=: log objects whose name contains this, once (development aid) */
+static wchar_t g_build_label[96];   /* replacement for the BuildVersionText label; empty = leave it */
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_ini[MAX_PATH];
@@ -185,6 +189,9 @@ static void load_config(HMODULE self)
     cfg.game_log           = GetPrivateProfileIntW(L"Client", L"GameLog", 0, g_ini);
     cfg.overlay            = GetPrivateProfileIntW(L"Client", L"Overlay", 1, g_ini);
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
+    cfg.hide_shutdown      = GetPrivateProfileIntW(L"Client", L"HideShutdownNotice", 1, g_ini);
+    GetPrivateProfileStringW(L"Client", L"BuildLabel", L"OG SOS Revival", g_build_label, 96, g_ini);
+    GetPrivateProfileStringW(L"Client", L"DumpObjects", L"", g_dump_pat, 64, g_ini);
     cfg.borderless         = GetPrivateProfileIntW(L"Client", L"Borderless", 0, g_ini);
     cfg.unlock_dlc         = GetPrivateProfileIntW(L"Client", L"UnlockDlcCosmetics", 1, g_ini);
     cfg.unlock_unreleased  = GetPrivateProfileIntW(L"Client", L"UnlockUnreleasedCosmetics", 1, g_ini);
@@ -2363,10 +2370,185 @@ static void play_tick(void *self)
     if (r != 0) InterlockedExchange(&g_play_flag, 0);
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* Text pass: build label and boot notice                                    */
+/* ------------------------------------------------------------------------ */
+/* The "SOSTEST v.x" label is the UTextBlock "BuildVersionText" (main menu HUD and in-game HUD), set
+   by the Blueprint event UpdateBuildInfoText from the app id (which must stay: it gates login). We
+   leave the app id alone and call the widget's own SetText with our label, again after every
+   UpdateBuildInfoText. The "servers shut down" overlay is closed by running its OK button handler.
+   Everything runs on the game thread inside the ProcessEvent detour. */
+
+static struct {
+    int init;
+    FNameI overlay_cls, build_text, update_build, textblock, ktl_cdo_name, conv_name, settext_name, overlay_name, ok_name;
+    void *ktl_cdo;
+    void *applied[16]; int napplied;          /* text blocks already set */
+    void *dismissed[8]; int ndismissed;       /* HUD widgets whose notice was closed */
+    ULONGLONG next_scan;
+    int logged_missing_ft;
+} T;
+
+static int in_list(void **l, int n, void *p) { for (int i = 0; i < n; i++) if (l[i] == p) return 1; return 0; }
+
+static int make_ftext(const wchar_t *s, uint8_t out[0x18])
+{
+    if (!T.ktl_cdo || !plausible_ptr(T.ktl_cdo)) return 0;
+    void *cls = *(void **)((uint8_t *)T.ktl_cdo + 0x10);
+    void *fn = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(cls, T.conv_name, 1);
+    if (!fn) return 0;
+    uint8_t parms[0x60];
+    memset(parms, 0, sizeof parms);
+    static wchar_t buf[128];
+    wcsncpy(buf, s, 127);
+    buf[127] = 0;
+    FString *fs = (FString *)parms;
+    fs->data = buf;
+    fs->num = fs->max = (int32_t)wcslen(buf) + 1;
+    o_pe(T.ktl_cdo, fn, parms);
+    if (!plausible_ptr(*(void **)(parms + 0x10))) return 0;     /* ReturnValue: FText at +0x10 */
+    memcpy(out, parms + 0x10, 0x18);
+    return 1;
+}
+
+static int set_textblock(void *tb, const wchar_t *s)
+{
+    uint8_t ft[0x18];
+    if (!make_ftext(s, ft)) return 0;
+    void *cls = *(void **)((uint8_t *)tb + 0x10);
+    void *fn = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(cls, T.settext_name, 1);
+    if (!fn) return 0;
+    uint8_t parms[0x40];
+    memset(parms, 0, sizeof parms);
+    memcpy(parms, ft, 0x18);
+    o_pe(tb, fn, parms);
+    return 1;
+}
+
+static void text_scan(int force)
+{
+    uint8_t *objs = *(uint8_t **)AT(RVA_GUOBJ_OBJECTS);
+    int32_t num = *(int32_t *)AT(RVA_GUOBJ_NUM);
+    if (!plausible_ptr(objs) || num <= 0 || num > 8 * 1024 * 1024) return;
+    if (force) T.napplied = 0;
+    for (int32_t i = 0; i < num; i++) {
+        uint8_t *item = objs + (size_t)i * 16;
+        uint8_t *obj = *(uint8_t **)item;
+        if (!obj || (*(int32_t *)(item + 8) & 0x20000000)) continue;
+        const FNameI *nm = (const FNameI *)(obj + 0x18);
+        if (nm->idx != T.build_text.idx && nm->idx != T.ktl_cdo_name.idx && nm->idx != T.overlay_name.idx) continue;
+        const uint8_t *cls = *(const uint8_t *const *)(obj + 0x10);
+        if (!plausible_ptr(cls)) continue;
+        if (nm->idx == T.ktl_cdo_name.idx) {
+            if (!T.ktl_cdo) { T.ktl_cdo = obj; slog("text: Default__KismetTextLibrary at %p", (void *)obj); }
+            continue;
+        }
+        if (nm->idx == T.build_text.idx && g_build_label[0]) {
+            if (((const FNameI *)(cls + 0x18))->idx != T.textblock.idx) continue;
+            if (*(const uint32_t *)(obj + 8) & 0x10) continue;                  /* class default object */
+            if (in_list(T.applied, T.napplied, obj)) continue;
+            if (set_textblock(obj, g_build_label)) {
+                if (T.napplied < 16) T.applied[T.napplied++] = obj;
+                slog("text: BuildVersionText %p set to \"%ls\"", (void *)obj, g_build_label);
+            } else if (!T.logged_missing_ft) {
+                T.logged_missing_ft = 1;
+                slog("text: could not build an FText or find SetText (library %p)", T.ktl_cdo);
+            }
+        } else if (nm->idx == T.overlay_name.idx && cfg.hide_shutdown) {
+            if (((const FNameI *)(cls + 0x18))->idx != T.overlay_cls.idx) continue;   /* the widget, not its package/class */
+            if (*(const uint32_t *)(obj + 8) & 0x10) continue;
+            /* widget -> WidgetTree -> owning UserWidget (the HUD) */
+            uint8_t *tree = *(uint8_t **)(obj + 0x20);
+            uint8_t *hud = plausible_ptr(tree) ? *(uint8_t **)(tree + 0x20) : NULL;
+            if (!plausible_ptr(hud) || in_list(T.dismissed, T.ndismissed, hud)) continue;
+            void *hcls = *(void **)(hud + 0x10);
+            void *fn = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(hcls, T.ok_name, 1);
+            if (!fn) {
+                wchar_t cn[96];
+                fname_str((uint8_t *)hcls + 0x18, cn, 96);
+                slog("text: ShutdownOverlay found, owner class \"%ls\" has no OK handler", cn);
+                if (T.ndismissed < 8) T.dismissed[T.ndismissed++] = hud;
+                continue;
+            }
+            uint8_t parms[0x40];
+            memset(parms, 0, sizeof parms);
+            o_pe(hud, fn, parms);
+            if (T.ndismissed < 8) T.dismissed[T.ndismissed++] = hud;
+            slog("text: boot notice dismissed through its OK handler (HUD %p)", (void *)hud);
+        }
+    }
+}
+
+
+/* Development aid: log every live object whose name contains g_dump_pat (case-insensitive) with its class
+   and outer, once, a few seconds after the main menu appears. */
+static void dump_objects(void)
+{
+    uint8_t *objs = *(uint8_t **)AT(RVA_GUOBJ_OBJECTS);
+    int32_t num = *(int32_t *)AT(RVA_GUOBJ_NUM);
+    if (!plausible_ptr(objs) || num <= 0 || num > 8 * 1024 * 1024) return;
+    wchar_t pat[64];
+    wcscpy(pat, g_dump_pat);
+    for (wchar_t *c = pat; *c; c++) *c = (wchar_t)towlower(*c);
+    int hits = 0;
+    for (int32_t i = 0; i < num && hits < 80; i++) {
+        uint8_t *item = objs + (size_t)i * 16;
+        uint8_t *obj = *(uint8_t **)item;
+        if (!obj || (*(int32_t *)(item + 8) & 0x20000000)) continue;
+        wchar_t nm[128], lo[128];
+        fname_str(obj + 0x18, nm, 128);
+        wcscpy(lo, nm);
+        for (wchar_t *c = lo; *c; c++) *c = (wchar_t)towlower(*c);
+        if (!wcsstr(lo, pat)) continue;
+        wchar_t cn[96] = L"", on[96] = L"";
+        const uint8_t *cls = *(const uint8_t *const *)(obj + 0x10);
+        if (plausible_ptr(cls)) fname_str(cls + 0x18, cn, 96);
+        const uint8_t *outer = *(const uint8_t *const *)(obj + 0x20);
+        if (plausible_ptr(outer)) fname_str(outer + 0x18, on, 96);
+        slog("dump: %p \"%ls\" class \"%ls\" outer \"%ls\" flags %08x", (void *)obj, nm, cn, on, *(const uint32_t *)(obj + 8));
+        hits++;
+    }
+    slog("dump: %d match(es) for \"%ls\"", hits, g_dump_pat);
+}
+
+static void text_tick(void *fn)
+{
+    if (!g_build_label[0] && !cfg.hide_shutdown && !g_dump_pat[0]) return;
+    if (GetCurrentThreadId() != *(DWORD *)AT(RVA_GAME_THREAD_ID)) return;
+    /* FName lookup without creating: a name is only known once the asset that has it is loaded, so retry. */
+    {
+        FNameCtorFn mk = (FNameCtorFn)AT(RVA_FNAME_CTOR);
+        FNameI *ns[] = { &T.overlay_cls, &T.build_text, &T.update_build, &T.textblock, &T.ktl_cdo_name, &T.conv_name, &T.settext_name,
+                         &T.overlay_name, &T.ok_name };
+        static const wchar_t *nn[] = { L"Overlay", L"BuildVersionText", L"UpdateBuildInfoText", L"TextBlock", L"Default__KismetTextLibrary",
+                                       L"Conv_StringToText", L"SetText", L"ShutdownOverlay",
+                                       L"BndEvt__ShutdownConfirmation_K2Node_ComponentBoundEvent_725_OnClicked__DelegateSignature" };
+        for (int i = 0; i < 9; i++) {
+            if (ns[i]->idx) continue;
+            mk(ns[i], nn[i], 0);
+            if (ns[i]->idx) slog("text: name \"%ls\" resolved (%d)", nn[i], ns[i]->idx);
+        }
+        T.init = 1;
+    }
+    ULONGLONG now = GetTickCount64();
+    int force = (T.update_build.idx != 0 && fn && plausible_ptr(fn) &&
+                 ((const FNameI *)((uint8_t *)fn + 0x18))->idx == T.update_build.idx);
+    if (!force && now < T.next_scan) return;
+    T.next_scan = now + 1000;
+    text_scan(force);
+    static int dumped; static ULONGLONG first;
+    if (g_dump_pat[0] && !dumped) {
+        if (!first) first = now;
+        if (now - first > 6000) { dumped = 1; dump_objects(); }
+    }
+}
+
 static void h_process_event(void *self, void *fn, void *parms)
 {
     if (g_play_flag) play_tick(self);
     o_pe(self, fn, parms);
+    if (g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0]) text_tick(fn);
 }
 
 
@@ -2545,7 +2727,7 @@ static void install(void)
         if (!o_avail) slog("unreleased cosmetics unavailable");
     }
 
-    if (cfg.auto_play) {
+    if (cfg.auto_play || g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0]) {
         /* push rbp; push rsi; push rdi; push r12; push r13; push r14; push r15 (REX on rbp) */
         static const uint8_t p_pe[12] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
         o_pe = (ProcessEventFn)hook_entry(&cursor, RVA_PROCESS_EVENT, p_pe, 12, (void *)h_process_event,
