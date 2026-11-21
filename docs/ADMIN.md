@@ -15,7 +15,7 @@ Add these to the backend `.env` (compose `environment:`):
 | Key | Meaning |
 |---|---|
 | `OGSOS_ADMINS` | Steam ID64s of the **owners**, separated by commas or spaces. Owners (plus the mods an owner adds in the panel, section 3a) can sign in. Re-read on every request, but the container needs a restart to see a changed `.env`. |
-| `OGSOS_ADMIN_ORIGIN` | The public origin, e.g. `https://sos.joltora.com`. Used for the Steam OpenID `realm` and `return_to`. **Set it in production**; without it the origin is built from the `Host` and `X-Forwarded-Proto` headers. |
+| `OGSOS_ADMIN_ORIGIN` | The public origin, e.g. `https://sos.example.com`. Used for the Steam OpenID `realm` and `return_to`. **Set it in production**; without it the origin is built from the `Host` and `X-Forwarded-Proto` headers. |
 | `OGSOS_ADMIN_DEV_LOGIN` | `1` enables `GET /admin/dev-login?steamid=<admin id>` for loopback requests without `X-Forwarded-For`. Tests only. **Never in production.** The backend warns at startup when it is on. |
 | `OGSOS_ADMIN_GAME_WATCH` | `1` enables the client mod's `POST /api/servers/<id>/watch` (game JWT of an admin). **Leave off until game logins verify the Steam ticket** (section 7): today anyone can claim an admin's Steam id at game login. |
 | `OGSOS_STEAM_OPENID` | OpenID endpoint override (tests). Default `https://steamcommunity.com/openid/login`. |
@@ -23,10 +23,10 @@ Add these to the backend `.env` (compose `environment:`):
 Nothing else to configure: no passwords are stored. The cookie key is derived from the backend's existing
 `secret.key` (state dir), so rotating that file signs everyone out (and also invalidates game logins).
 
-Reverse proxy (Caddy) for `sos.joltora.com`, when the lead sets up the HTTPS block:
+Reverse proxy (Caddy) for your backend's HTTPS site, for example:
 
 ```
-sos.joltora.com {
+sos.example.com {
     reverse_proxy <backend-host>:7781
 }
 ```
@@ -37,7 +37,7 @@ backend; the panel only owns `/admin` and `/admin/*`, so both fit behind the sam
 
 ## 2. Signing in
 
-1. Open `https://sos.joltora.com/admin/` and press **Sign in through Steam**.
+1. Open the admin path (`/admin/`) on your backend's HTTPS site and press **Sign in through Steam**.
 2. Steam's own page asks you to sign in. Steam then sends your browser back to `/admin/auth`.
 3. The backend checks the assertion with Steam (`check_authentication`, `is_valid:true`), that `return_to`,
    `op_endpoint` and `claimed_id` are what it expects, and that your Steam id is in `OGSOS_ADMINS`.
