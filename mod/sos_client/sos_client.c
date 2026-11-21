@@ -114,7 +114,9 @@ static struct {
 
 static struct { wchar_t name[64], val[48]; } g_cv[32];   /* [Cvars] section of the ini */
 static int g_ncv;
+#ifdef SOS_CORE
 static int g_auto_update = 1;      /* AutoUpdate in the ini (core build) */
+#endif
 static float g_vfov, g_vzfov;        /* VerticalFOV / VerticalZoomFOV from the ini, 0 = leave */
 static volatile LONG g_map_gen;      /* bumped on every LoadMap */
 static wchar_t g_dump_pat[64];       /* DumpObjects=: log objects whose name contains this, once (development aid) */
@@ -489,7 +491,17 @@ typedef struct {
     double countdown_ms;         /* epoch ms, 0 = none */
 } Server;
 
-enum { HIT_NONE = 0, HIT_BTN, HIT_REFRESH, HIT_VOTE, HIT_CLOSE, HIT_PANEL, HIT_ROW = 100 };
+#define MAX_ACCTS 200
+typedef struct {
+    char id[68];
+    wchar_t name[64];
+} RepAcct;
+
+enum { HIT_NONE = 0, HIT_BTN, HIT_REFRESH, HIT_VOTE, HIT_CLOSE, HIT_PANEL,
+       HIT_REPORT, HIT_REASON, HIT_PASTE, HIT_SEND, HIT_ROW = 100 };
+
+static const char *const k_rep_reason[4] = { "cheating", "harassment", "griefing", "other" };
+static const wchar_t *const k_rep_reason_w[4] = { L"cheating", L"harassment", L"griefing", L"other" };
 
 static CRITICAL_SECTION g_ui_lock;
 static struct {
@@ -506,6 +518,14 @@ static struct {
     Server join_srv;
     int loaded;
     int hwnd_ok;
+    /* report view */
+    int report;                  /* 1 = the panel body shows the report view */
+    int rscroll, rcount, rreason;
+    RepAcct racc[MAX_ACCTS];
+    char rsel[80];               /* selected account id */
+    char rlink[1700];            /* clip link, UTF-8, "" = none */
+    wchar_t rlink_w[512];
+    int job_accounts, job_paste, job_send;
 } U;
 
 static CRITICAL_SECTION g_tok_lock;
@@ -1283,6 +1303,248 @@ static void do_vote(void)
     LeaveCriticalSection(&g_ui_lock);
 }
 
+/* ---- report a player ---- */
+
+static int valid_acct_id(const char *s)
+{
+    size_t n = strlen(s);
+    if (n < 1 || n > 64) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '.' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+typedef struct { RepAcct a; char seen[40]; } AcctTmp;
+
+static int acct_cmp(const void *pa, const void *pb)
+{
+    const AcctTmp *a = pa, *b = pb;
+    int c = strcmp(b->seen, a->seen);          /* most recently seen first */
+    return c ? c : _wcsicmp(a->a.name, b->a.name);
+}
+
+static void do_accounts(void)
+{
+    char *resp;
+    size_t len;
+    int st = http_do(L"GET", L"/api/search/account", NULL, NULL, &resp, &len);
+    slog("search/account -> HTTP %d", st);
+    if (st != 200 || !resp) {
+        free(resp);
+        ui_set_status(st < 0 ? L"Backend unreachable" : L"Could not load players (HTTP %d)", st);
+        return;
+    }
+    JV *root = jparse(resp, len);
+    free(resp);
+    JV *arr = jget(root, "data");
+    if (!arr || arr->t != 'a') {
+        jfree(root);
+        ui_set_status(L"Backend sent an unexpected reply");
+        return;
+    }
+    size_t cap = 64, n = 0;
+    AcctTmp *tmp = malloc(cap * sizeof *tmp);
+    for (JV *o = arr->kid; o && tmp; o = o->next) {
+        if (o->t != 'o') continue;
+        const char *id = jstr(o, "account-id", "");
+        if (!id[0]) id = jstr(o, "id", "");
+        if (!valid_acct_id(id)) continue;
+        if (n >= 4000) break;
+        if (n == cap) {
+            AcctTmp *nt = realloc(tmp, cap * 2 * sizeof *tmp);
+            if (!nt) break;
+            tmp = nt;
+            cap *= 2;
+        }
+        AcctTmp *t = &tmp[n++];
+        memset(t, 0, sizeof *t);
+        snprintf(t->a.id, sizeof t->a.id, "%s", id);
+        const char *nm = jstr(o, "display-name", "");
+        if (!nm[0]) nm = jstr(o, "alias", "");
+        if (!nm[0]) nm = id;
+        u8w(nm, t->a.name, 64);
+        const char *seen = jstr(o, "last-access", "");
+        if (!seen[0]) seen = jstr(o, "created", "");
+        snprintf(t->seen, sizeof t->seen, "%s", seen);
+    }
+    jfree(root);
+    if (!tmp) { ui_set_status(L"Out of memory"); return; }
+    qsort(tmp, n, sizeof *tmp, acct_cmp);
+    if (n > MAX_ACCTS) n = MAX_ACCTS;
+    EnterCriticalSection(&g_ui_lock);
+    for (size_t i = 0; i < n; i++) U.racc[i] = tmp[i].a;
+    U.rcount = (int)n;
+    if (U.rscroll > U.rcount) U.rscroll = U.rcount > 0 ? U.rcount - 1 : 0;
+    if (!U.status[0] || !wcsncmp(U.status, L"Loading players", 15) || !wcsncmp(U.status, L"Pick", 4))
+        wcscpy(U.status, n ? L"Pick a player to report." : L"No players found.");
+    U.dirty = 1;
+    LeaveCriticalSection(&g_ui_lock);
+    free(tmp);
+}
+
+/* UTF-16 clipboard text -> clip link. Accepts http:// or https:// text without any whitespace, at most 500
+   characters. Returns 1 and fills out8 (UTF-8) and outw (display copy). */
+static int clip_to_link(const wchar_t *in, char *out8, int cap8, wchar_t *outw, int capw)
+{
+    wchar_t tmp[2048];
+    while (*in && *in <= 0x20) in++;
+    size_t n = wcslen(in);
+    if (n >= sizeof tmp / sizeof tmp[0]) return 0;
+    memcpy(tmp, in, (n + 1) * sizeof(wchar_t));
+    while (n && (tmp[n - 1] <= 0x20 || tmp[n - 1] == 0xFEFF)) tmp[--n] = 0;
+    if (n < 9 || n > 500 || n >= (size_t)capw) return 0;
+    size_t pl = !_wcsnicmp(tmp, L"https://", 8) ? 8 : !_wcsnicmp(tmp, L"http://", 7) ? 7 : 0;
+    if (!pl || n <= pl) return 0;
+    for (size_t i = 0; i < n; i++) {
+        wchar_t c = tmp[i];
+        if (c <= 0x20 || c == 0x7F || c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200B) ||
+            c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000 || c == 0xFEFF)
+            return 0;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, tmp, -1, out8, cap8, NULL, NULL) <= 0) return 0;
+    memcpy(outw, tmp, (n + 1) * sizeof(wchar_t));
+    return 1;
+}
+
+static int read_clipboard_w(wchar_t *out, int cap)
+{
+    int ok = 0;
+    out[0] = 0;
+    for (int i = 0; i < 5 && !ok; i++) {
+        if (!OpenClipboard(NULL)) { Sleep(15); continue; }
+        if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+            HANDLE h = GetClipboardData(CF_UNICODETEXT);
+            if (h) {
+                const wchar_t *p = GlobalLock(h);
+                if (p) {
+                    size_t room = (size_t)GlobalSize(h) / sizeof(wchar_t);
+                    size_t k = 0;
+                    while (k + 1 < (size_t)cap && k < room && p[k]) { out[k] = p[k]; k++; }
+                    out[k] = 0;
+                    GlobalUnlock(h);
+                    ok = 1;
+                }
+            }
+        }
+        CloseClipboard();
+        break;
+    }
+    return ok;
+}
+
+static void do_paste(void)
+{
+    static wchar_t w[2048];
+    char u8[1700];
+    wchar_t disp[512];
+    if (!read_clipboard_w(w, 2048) || !clip_to_link(w, u8, sizeof u8, disp, 512)) {
+        SecureZeroMemory(w, sizeof w);
+        ui_set_status(L"Clipboard has no link");
+        return;
+    }
+    SecureZeroMemory(w, sizeof w);
+    EnterCriticalSection(&g_ui_lock);
+    memcpy(U.rlink, u8, sizeof U.rlink < sizeof u8 ? sizeof U.rlink : sizeof u8);
+    wcscpy(U.rlink_w, disp);
+    wcscpy(U.status, L"Clip link pasted.");
+    U.dirty = 1;
+    LeaveCriticalSection(&g_ui_lock);
+}
+
+/* JSON string escape; returns the length written or -1 when it does not fit. */
+static int json_esc(const char *in, char *out, int cap)
+{
+    int n = 0;
+    for (; *in; in++) {
+        unsigned char c = (unsigned char)*in;
+        char tmp[8];
+        int l;
+        if (c == '"' || c == '\\') { tmp[0] = '\\'; tmp[1] = (char)c; l = 2; }
+        else if (c < 0x20) l = snprintf(tmp, sizeof tmp, "\\u%04x", c);
+        else { tmp[0] = (char)c; l = 1; }
+        if (n + l + 1 > cap) return -1;
+        memcpy(out + n, tmp, (size_t)l);
+        n += l;
+    }
+    out[n] = 0;
+    return n;
+}
+
+/* POST /api/reports. Sets the status line; returns the HTTP status (-1 transport failure, 0 not sent). */
+static int send_report(const char *target, const char *reason, const char *link)
+{
+    char tok[2100];
+    EnterCriticalSection(&g_tok_lock);
+    memcpy(tok, g_token, sizeof tok);
+    LeaveCriticalSection(&g_tok_lock);
+    if (!tok[0]) { ui_set_status(L"Not signed in yet"); return 0; }
+    char et[160], er[160], el[3400], body[3800];
+    if (json_esc(target, et, sizeof et) < 0 || json_esc(reason, er, sizeof er) < 0 ||
+        json_esc(link ? link : "", el, sizeof el) < 0) {
+        SecureZeroMemory(tok, sizeof tok);
+        ui_set_status(L"Report failed (bad input)");
+        return 0;
+    }
+    if (link && link[0])
+        snprintf(body, sizeof body, "{\"target\":\"%s\",\"reason\":\"%s\",\"text\":\"mod report\",\"evidenceUrl\":\"%s\"}", et, er, el);
+    else
+        snprintf(body, sizeof body, "{\"target\":\"%s\",\"reason\":\"%s\",\"text\":\"mod report\"}", et, er);
+    wchar_t hdr[2300], tokw[2100];
+    u8w(tok, tokw, 2100);
+    SecureZeroMemory(tok, sizeof tok);
+    _snwprintf(hdr, 2299, L"Content-Type: application/json\r\nAuthorization: Token %ls\r\n", tokw);
+    hdr[2299] = 0;
+    char *resp;
+    size_t rl;
+    int st = http_do(L"POST", L"/api/reports", hdr, body, &resp, &rl);
+    SecureZeroMemory(hdr, sizeof hdr);
+    SecureZeroMemory(tokw, sizeof tokw);
+    slog("report %s (%s%s) -> HTTP %d", target, reason, link && link[0] ? ", with clip link" : "", st);
+    JV *j = resp ? jparse(resp, rl) : NULL;
+    if (st == 200) {
+        const char *id = jstr(jget(j, "data"), "id", "");
+        if (!id[0]) id = jstr(j, "id", "");
+        if (id[0]) {
+            wchar_t idw[48];
+            u8w(id, idw, 48);
+            ui_set_status(L"Report %ls sent", idw);
+        } else {
+            ui_set_status(L"Report sent");
+        }
+        EnterCriticalSection(&g_ui_lock);
+        U.rlink[0] = 0;
+        U.rlink_w[0] = 0;
+        U.rsel[0] = 0;
+        U.dirty = 1;
+        LeaveCriticalSection(&g_ui_lock);
+    } else if (st == 400 && !strcmp(jstr(j, "error", ""), "self-report")) ui_set_status(L"You cannot report yourself");
+    else if (st == 400 && !strcmp(jstr(j, "error", ""), "bad-target")) ui_set_status(L"Unknown player");
+    else if (st == 429) ui_set_status(L"Slow down: you reported this player recently");
+    else if (st == 401) ui_set_status(L"Not signed in yet");
+    else if (st < 0) ui_set_status(L"Backend unreachable");
+    else ui_set_status(L"Report failed (HTTP %d)", st);
+    jfree(j);
+    free(resp);
+    return st;
+}
+
+static void do_send(void)
+{
+    char target[80], link[1700];
+    int ri;
+    EnterCriticalSection(&g_ui_lock);
+    snprintf(target, sizeof target, "%s", U.rsel);
+    snprintf(link, sizeof link, "%s", U.rlink);
+    ri = U.rreason;
+    LeaveCriticalSection(&g_ui_lock);
+    if (ri < 0 || ri > 3) ri = 0;
+    if (!target[0]) { ui_set_status(L"Pick a player to report first"); return; }
+    send_report(target, k_rep_reason[ri], link);
+}
+
 static DWORD WINAPI worker_main(LPVOID unused)
 {
     (void)unused;
@@ -1293,18 +1555,25 @@ static DWORD WINAPI worker_main(LPVOID unused)
     ULONGLONG last_poll = 0;
     for (;;) {
         WaitForSingleObject(g_worker_ev, 300);
-        int open, refresh, join, vote;
+        int open, refresh, join, vote, accts, paste, send;
         Server js;
         EnterCriticalSection(&g_ui_lock);
         open = U.open;
         refresh = U.job_refresh;
         join = U.job_join;
         vote = U.job_vote;
+        accts = U.job_accounts;
+        paste = U.job_paste;
+        send = U.job_send;
         js = U.join_srv;
         U.job_refresh = U.job_join = U.job_vote = 0;
+        U.job_accounts = U.job_paste = U.job_send = 0;
         LeaveCriticalSection(&g_ui_lock);
         if (join) do_join(&js);
         if (vote) do_vote();
+        if (accts) do_accounts();
+        if (paste) do_paste();
+        if (send) do_send();
         ULONGLONG now = GetTickCount64();
         if (open && (refresh || now - last_poll >= 3000)) {
             do_poll();
@@ -1334,7 +1603,8 @@ static void ensure_worker(void)
 typedef struct {
     float s;
     RECT btn, panel, header, rows, refresh, vote, close, status;
-    int row_h, vis_rows;
+    RECT report, send, reason, paste, linkbox, rrows;
+    int row_h, vis_rows, rvis_rows;
 } Layout;
 
 static RECT rc(int l, int t, int r, int b) { RECT x = { l, t, r, b }; return x; }
@@ -1365,6 +1635,17 @@ static void layout(int W, int H, Layout *L)
     L->vote = rc(L->refresh.right + S(16), by, L->refresh.right + S(16) + S(190), by + bhh);
     L->close = rc(px + pw - S(24) - S(130), by, px + pw - S(24), by + bhh);
     L->status = rc(px + S(24), py + ph - S(108), px + pw - S(24), py + ph - S(72));
+    /* report view: a shorter list plus a row of controls under it */
+    L->report = rc(L->vote.right + S(16), by, L->vote.right + S(16) + S(130), by + bhh);
+    L->send = L->vote;
+    int rrbot = rbot - S(48);
+    L->rrows = rc(px + S(16), rtop, px + pw - S(16), rrbot);
+    L->rvis_rows = (rrbot - rtop) / L->row_h;
+    if (L->rvis_rows < 1) L->rvis_rows = 1;
+    int cy = rrbot + S(4), ch = S(40);
+    L->reason = rc(px + S(16), cy, px + S(16) + S(230), cy + ch);
+    L->paste = rc(L->reason.right + S(12), cy, L->reason.right + S(12) + S(200), cy + ch);
+    L->linkbox = rc(L->paste.right + S(12), cy, px + pw - S(16), cy + ch);
 }
 
 static int pt_in(const RECT *r, int x, int y) { return x >= r->left && x < r->right && y >= r->top && y < r->bottom; }
@@ -1376,6 +1657,17 @@ static int hit_test(const Layout *L, int x, int y)
         if (!pt_in(&L->panel, x, y)) return HIT_NONE;
         if (pt_in(&L->close, x, y)) return HIT_CLOSE;
         if (pt_in(&L->refresh, x, y)) return HIT_REFRESH;
+        if (pt_in(&L->report, x, y)) return HIT_REPORT;
+        if (U.report) {
+            if (pt_in(&L->send, x, y)) return HIT_SEND;
+            if (pt_in(&L->reason, x, y)) return HIT_REASON;
+            if (pt_in(&L->paste, x, y)) return HIT_PASTE;
+            if (pt_in(&L->rrows, x, y)) {
+                int i = (y - L->rrows.top) / L->row_h;
+                if (i < L->rvis_rows && U.rscroll + i < U.rcount) return HIT_ROW + i;
+            }
+            return HIT_PANEL;
+        }
         if (pt_in(&L->vote, x, y)) return HIT_VOTE;
         if (pt_in(&L->rows, x, y)) {
             int i = (y - L->rows.top) / L->row_h;
@@ -1393,6 +1685,12 @@ static int server_usable(const Server *s)
     if (!s->online) return 0;
     if (!strcmp(s->state, "started") && !s->late_join) return 0;
     return 1;
+}
+
+/* Caller holds g_ui_lock and g_tok_lock. */
+static int send_enabled(void)
+{
+    return g_token[0] && U.rsel[0];
 }
 
 static int vote_enabled(void)
@@ -1523,10 +1821,17 @@ static void draw_button(const RECT *r, const wchar_t *label, int hover, int enab
     gtext(label, *r, DT_CENTER, g_f_bold, enabled ? C_TEXT : C_DIM);
 }
 
+typedef struct {
+    int on, count, scroll, reason, send_ok;
+    const RepAcct *acct;
+    const char *sel;
+    const wchar_t *link;
+} RepView;
+
 /* Draw the whole UI from a snapshot; returns the rect that holds UI pixels. */
 static RECT render_ui(int W, int H, const Layout *L, int btn_visible, int open, int hover,
                       const Server *srv, int count, int scroll, const char *sel_id, const wchar_t *status,
-                      int vote_ok)
+                      int vote_ok, const RepView *rv)
 {
     RECT used = { 0, 0, 0, 0 };
     fonts_for(L->s);
@@ -1552,11 +1857,53 @@ static RECT render_ui(int W, int H, const Layout *L, int btn_visible, int open, 
         int x0 = h->left + S(12);
         int cx[5] = { x0, x0 + S(330), x0 + S(450), x0 + S(580), h->right };
         const wchar_t *hn[4] = { L"Name", L"Region", L"Players", L"State" };
+        const wchar_t *hr_[4] = { L"Player to report", L"Account id", L"", L"" };
         for (int i = 0; i < 4; i++) {
             RECT c = rc(cx[i], h->top, cx[i + 1] - S(8), h->bottom);
-            gtext(hn[i], c, DT_LEFT, g_f_bold, C_DIM);
+            gtext(rv->on ? hr_[i] : hn[i], c, DT_LEFT, g_f_bold, C_DIM);
         }
         double now = now_epoch_ms();
+        if (rv->on) {
+            for (int i = 0; i < L->rvis_rows && rv->scroll + i < rv->count; i++) {
+                const RepAcct *ra = &rv->acct[rv->scroll + i];
+                RECT r = rc(L->rrows.left, L->rrows.top + i * L->row_h, L->rrows.right,
+                            L->rrows.top + (i + 1) * L->row_h);
+                int selected = rv->sel[0] && !strcmp(rv->sel, ra->id);
+                COLORREF bg = (i & 1) ? C_ROWB : C_ROWA;
+                if (selected) bg = C_SEL;
+                else if (hover == HIT_ROW + i) bg = C_HOVER;
+                gfill(&r, bg);
+                wchar_t idw[72];
+                u8w(ra->id, idw, 72);
+                RECT c0 = rc(cx[0], r.top, cx[1] - S(8), r.bottom);
+                RECT c1 = rc(cx[1], r.top, cx[4] - S(8), r.bottom);
+                gtext(ra->name, c0, DT_LEFT, g_f_text, C_TEXT);
+                gtext(idw, c1, DT_LEFT, g_f_small, C_DIM);
+            }
+            if (rv->count > L->rvis_rows) {
+                int th = L->rrows.bottom - L->rrows.top;
+                int thumb_h = th * L->rvis_rows / rv->count;
+                if (thumb_h < S(20)) thumb_h = S(20);
+                int maxs = rv->count - L->rvis_rows;
+                int ty = L->rrows.top + (maxs > 0 ? (th - thumb_h) * rv->scroll / maxs : 0);
+                RECT tb = rc(L->rrows.right - S(5), ty, L->rrows.right - S(1), ty + thumb_h);
+                gfill(&tb, C_BORDER);
+            }
+            if (rv->count == 0) {
+                RECT er = rc(L->rrows.left, L->rrows.top + S(8), L->rrows.right, L->rrows.top + S(44));
+                gtext(L"No players listed", er, DT_CENTER, g_f_text, C_DIM);
+            }
+            wchar_t rl[64];
+            _snwprintf(rl, 63, L"Reason: %ls", k_rep_reason_w[rv->reason & 3]);
+            rl[63] = 0;
+            draw_button(&L->reason, rl, hover == HIT_REASON, 1, C_BTN, C_BTN_H);
+            draw_button(&L->paste, L"Paste clip link", hover == HIT_PASTE, 1, C_BTN, C_BTN_H);
+            gfill(&L->linkbox, C_HEAD);
+            gframe(&L->linkbox, C_BORDER);
+            RECT lt = rc(L->linkbox.left + S(10), L->linkbox.top, L->linkbox.right - S(10), L->linkbox.bottom);
+            if (rv->link[0]) gtext(rv->link, lt, DT_LEFT, g_f_small, C_TEXT);
+            else gtext(L"No clip link (optional)", lt, DT_LEFT, g_f_small, C_DIM);
+        } else
         for (int i = 0; i < L->vis_rows && scroll + i < count; i++) {
             const Server *sv = &srv[scroll + i];
             RECT r = rc(L->rows.left, L->rows.top + i * L->row_h, L->rows.right,
@@ -1594,7 +1941,7 @@ static RECT render_ui(int W, int H, const Layout *L, int btn_visible, int open, 
             gtext(pl, c2, DT_LEFT, g_f_text, fg);
             gtext(stt, c3, DT_LEFT, g_f_text, sc);
         }
-        if (count > L->vis_rows) {      /* scrollbar */
+        if (!rv->on && count > L->vis_rows) {      /* scrollbar */
             int th = L->rows.bottom - L->rows.top;
             int thumb_h = th * L->vis_rows / count;
             if (thumb_h < S(20)) thumb_h = S(20);
@@ -1603,14 +1950,18 @@ static RECT render_ui(int W, int H, const Layout *L, int btn_visible, int open, 
             RECT tb = rc(L->rows.right - S(5), ty, L->rows.right - S(1), ty + thumb_h);
             gfill(&tb, C_BORDER);
         }
-        if (count == 0) {
+        if (!rv->on && count == 0) {
             RECT er = rc(L->rows.left, L->rows.top + S(8), L->rows.right, L->rows.top + S(44));
             gtext(L"No community servers listed", er, DT_CENTER, g_f_text, C_DIM);
         }
         gtext(status, L->status, DT_LEFT, g_f_text, C_TEXT);
         draw_button(&L->refresh, L"Refresh", hover == HIT_REFRESH, 1, C_BTN, C_BTN_H);
-        draw_button(&L->vote, L"Vote to start", hover == HIT_VOTE && vote_ok, vote_ok, C_ACCENT, C_ACCENT_H);
-        draw_button(&L->close, L"Close", hover == HIT_CLOSE, 1, C_BTN, C_BTN_H);
+        if (rv->on)
+            draw_button(&L->send, L"Send report", hover == HIT_SEND && rv->send_ok, rv->send_ok, C_ACCENT, C_ACCENT_H);
+        else
+            draw_button(&L->vote, L"Vote to start", hover == HIT_VOTE && vote_ok, vote_ok, C_ACCENT, C_ACCENT_H);
+        draw_button(&L->report, L"Report", hover == HIT_REPORT, 1, rv->on ? C_SEL : C_BTN, rv->on ? C_HOVER : C_BTN_H);
+        draw_button(&L->close, rv->on ? L"Back" : L"Close", hover == HIT_CLOSE, 1, C_BTN, C_BTN_H);
         used = *p;
     }
     (void)W; (void)H;
@@ -1949,6 +2300,16 @@ static void ov_frame(uint8_t *vp)
     static wchar_t status[200];
     char sel[80];
     int count, scroll, hover, vote_ok;
+    static RepAcct racc_snap[MAX_ACCTS];
+    static wchar_t rlink_snap[512];
+    char rsel_snap[80];
+    RepView rv;
+    memset(&rv, 0, sizeof rv);
+    rv.acct = racc_snap;
+    rv.sel = rsel_snap;
+    rv.link = rlink_snap;
+    rsel_snap[0] = 0;
+    rlink_snap[0] = 0;
     if (dirty) {
         U.dirty = 0;
         ov.force_render = 0;
@@ -1964,6 +2325,19 @@ static void ov_frame(uint8_t *vp)
         open = U.open;
         vis_btn = !open && (U.in_menu || cfg.show_everywhere);
         if (U.scroll > 0 && U.scroll > count - L.vis_rows) scroll = U.scroll = count > L.vis_rows ? count - L.vis_rows : 0;
+        if (U.rscroll > 0 && U.rscroll > U.rcount - L.rvis_rows) U.rscroll = U.rcount > L.rvis_rows ? U.rcount - L.rvis_rows : 0;
+        rv.on = U.report;
+        if (rv.on) {
+            rv.count = U.rcount;
+            rv.scroll = U.rscroll;
+            rv.reason = U.rreason;
+            memcpy(racc_snap, U.racc, sizeof(RepAcct) * (size_t)U.rcount);
+            memcpy(rsel_snap, U.rsel, sizeof rsel_snap);
+            wcscpy(rlink_snap, U.rlink_w);
+            EnterCriticalSection(&g_tok_lock);
+            rv.send_ok = send_enabled();
+            LeaveCriticalSection(&g_tok_lock);
+        }
     }
     LeaveCriticalSection(&g_ui_lock);
 
@@ -1974,7 +2348,7 @@ static void ov_frame(uint8_t *vp)
         clear_rect(&region);
         GdiFlush();
         RECT used = render_ui((int)bd.Width, (int)bd.Height, &L, vis_btn, open, hover, snap, count, scroll,
-                              sel, status, vote_ok);
+                              sel, status, vote_ok, &rv);
         GdiFlush();
         finish_alpha(&region, open ? &L.rows : (vis_btn ? &L.btn : NULL));
         g_last_rc = used;
@@ -2062,14 +2436,45 @@ static void click_action(int hit)
     /* g_ui_lock held by the caller. Returns after setting job flags. */
     if (hit == HIT_BTN) {
         U.open = 1;
+        U.report = 0;
         U.scroll = 0;
         wcscpy(U.status, L"Loading...");
         U.job_refresh = 1;
     } else if (hit == HIT_CLOSE) {
-        U.open = 0;
+        if (U.report) {
+            U.report = 0;
+            wcscpy(U.status, U.count ? L"Pick a server to join." : L"No servers found.");
+        } else {
+            U.open = 0;
+        }
+    } else if (hit == HIT_REPORT) {
+        U.report = !U.report;
+        if (U.report) {
+            U.rscroll = 0;
+            wcscpy(U.status, L"Loading players...");
+            U.job_accounts = 1;
+        } else {
+            wcscpy(U.status, U.count ? L"Pick a server to join." : L"No servers found.");
+        }
+    } else if (hit == HIT_REASON) {
+        U.rreason = (U.rreason + 1) & 3;
+    } else if (hit == HIT_PASTE) {
+        U.job_paste = 1;
+        wcscpy(U.status, L"Reading clipboard...");
+    } else if (hit == HIT_SEND) {
+        EnterCriticalSection(&g_tok_lock);
+        int has_tok = g_token[0] != 0;
+        LeaveCriticalSection(&g_tok_lock);
+        if (!U.rsel[0]) wcscpy(U.status, L"Pick a player to report first");
+        else if (!has_tok) wcscpy(U.status, L"Not signed in yet");
+        else {
+            U.job_send = 1;
+            wcscpy(U.status, L"Sending report...");
+        }
     } else if (hit == HIT_REFRESH) {
-        wcscpy(U.status, L"Loading...");
-        U.job_refresh = 1;
+        wcscpy(U.status, U.report ? L"Loading players..." : L"Loading...");
+        if (U.report) U.job_accounts = 1;
+        else U.job_refresh = 1;
     } else if (hit == HIT_VOTE) {
         EnterCriticalSection(&g_tok_lock);
         int ok = vote_enabled();
@@ -2077,6 +2482,12 @@ static void click_action(int hit)
         if (ok) {
             U.job_vote = 1;
             wcscpy(U.status, L"Sending vote...");
+        }
+    } else if (hit >= HIT_ROW && U.report) {
+        int idx = U.rscroll + (hit - HIT_ROW);
+        if (idx >= 0 && idx < U.rcount) {
+            snprintf(U.rsel, sizeof U.rsel, "%s", U.racc[idx].id);
+            _snwprintf(U.status, 199, L"Reporting %ls. Pick a reason, then Send.", U.racc[idx].name);
         }
     } else if (hit >= HIT_ROW) {
         int idx = U.scroll + (hit - HIT_ROW);
@@ -2163,11 +2574,13 @@ static LRESULT CALLBACK sub_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             to_bb(hw, MAKELPARAM(pt.x, pt.y), &x, &y);
             if (pt_in(&L.panel, x, y)) {
                 int d = (short)HIWORD(wp) > 0 ? -1 : 1;
-                int maxs = U.count > L.vis_rows ? U.count - L.vis_rows : 0;
-                int ns = U.scroll + d;
+                int *scp = U.report ? &U.rscroll : &U.scroll;
+                int cnt = U.report ? U.rcount : U.count, vis = U.report ? L.rvis_rows : L.vis_rows;
+                int maxs = cnt > vis ? cnt - vis : 0;
+                int ns = *scp + d;
                 if (ns < 0) ns = 0;
                 if (ns > maxs) ns = maxs;
-                if (ns != U.scroll) { U.scroll = ns; U.dirty = 1; }
+                if (ns != *scp) { *scp = ns; U.dirty = 1; }
                 consume = 1;
             }
         }
@@ -2180,7 +2593,7 @@ static LRESULT CALLBACK sub_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             EnterCriticalSection(&g_ui_lock);
             if (U.open) {
                 consume = 1;
-                if (msg == WM_KEYDOWN) { U.open = 0; U.dirty = 1; }
+                if (msg == WM_KEYDOWN) { U.open = 0; U.report = 0; U.dirty = 1; }
             }
             LeaveCriticalSection(&g_ui_lock);
             if (consume) return 0;
@@ -2873,6 +3286,60 @@ static void install(void)
     }
     slog("ready");
 }
+
+#ifdef SOS_REPORT_TEST
+/* Test build only (-DSOS_REPORT_TEST): drives the report worker functions synchronously from a small exe,
+   without the game. The token comes from the env var SOS_TEST_TOKEN. */
+__declspec(dllexport) int sos_test_init(const char *backend)
+{
+    InitializeCriticalSection(&g_log_lock);
+    InitializeCriticalSection(&g_ui_lock);
+    InitializeCriticalSection(&g_tok_lock);
+    wchar_t wb[256];
+    u8w(backend, wb, 256);
+    parse_backend(wb);
+    const char *t = getenv("SOS_TEST_TOKEN");
+    if (t) snprintf(g_token, sizeof g_token, "%s", t);
+    g_wh_session = WinHttpOpen(L"sos_client/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    if (g_wh_session) WinHttpSetTimeouts(g_wh_session, 3000, 3000, 5000, 5000);
+    return g_wh_session != NULL;
+}
+__declspec(dllexport) int sos_test_report(const char *target, const char *reason, const char *link, wchar_t *status_out)
+{
+    int st = send_report(target, reason, link);
+    EnterCriticalSection(&g_ui_lock);
+    wcscpy(status_out, U.status);
+    LeaveCriticalSection(&g_ui_lock);
+    return st;
+}
+__declspec(dllexport) int sos_test_accounts(void)
+{
+    do_accounts();
+    return U.rcount;
+}
+__declspec(dllexport) int sos_test_account(int i, char *id, wchar_t *name)
+{
+    if (i < 0 || i >= U.rcount) return 0;
+    strcpy(id, U.racc[i].id);
+    wcscpy(name, U.racc[i].name);
+    return 1;
+}
+__declspec(dllexport) int sos_test_link(const wchar_t *in, char *out8)
+{
+    wchar_t d[512];
+    return clip_to_link(in, out8, 1700, d, 512);
+}
+__declspec(dllexport) int sos_test_clip(char *out8, wchar_t *status_out)
+{
+    do_paste();
+    EnterCriticalSection(&g_ui_lock);
+    wcscpy(status_out, U.status);
+    strcpy(out8, U.rlink);
+    LeaveCriticalSection(&g_ui_lock);
+    return out8[0] != 0;
+}
+#endif
 
 #ifdef SOS_CORE
 #ifndef SOS_CORE_VERSION
