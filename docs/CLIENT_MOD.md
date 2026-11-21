@@ -6,11 +6,11 @@ Status: built and verified in the running game (21 Nov 2026) against a local bac
 
 ## Install (players)
 
-1. Build or download `xinput1_3.dll` and `sos_client.ini`.
-2. Copy both into the game's `SOS\Binaries\Win64` folder, next to `SOS-Win64-Shipping.exe` (Steam: right-click SOS: Classic, Manage, Browse local files, then open `SOS\Binaries\Win64`).
+1. Build or download `xinput1_3.dll` (the stable loader), `sos_client_core.dll` (the mod), `sos_client_core.manifest`, `sos_client_core.sig` and `sos_client.ini`.
+2. Copy them into the game's `SOS\Binaries\Win64` folder, next to `SOS-Win64-Shipping.exe` (Steam: right-click SOS: Classic, Manage, Browse local files, then open `SOS\Binaries\Win64`).
 3. Optional: edit `sos_client.ini`. `Backend=` is the community backend (default `sos.joltora.com:7781`).
 4. Start the game from Steam as usual. On the main menu press **START**, then use **SERVERS** (top centre). Click a server: the mod tells the backend you picked it and presses PLAY for you.
-5. To remove the mod, delete `xinput1_3.dll` (and the ini).
+5. To remove the mod, delete `xinput1_3.dll` and the `sos_client_*` files.
 
 It does not conflict with the host DLL (`mod/sos_host`, `version.dll`): the proxy names differ. Do not install it on a machine that runs a game host.
 
@@ -18,7 +18,7 @@ It does not conflict with the host DLL (`mod/sos_host`, `version.dll`): the prox
 
 ```powershell
 cd mod\sos_client
-.\build.ps1          # needs MinGW-w64 gcc on PATH; writes build\xinput1_3.dll and build\sos_client.ini
+.\build.ps1          # needs MinGW-w64 gcc on PATH; writes build\xinput1_3.dll (loader), build\sos_client_core.dll (the mod) and build\sos_client.ini; -CoreVersion N sets the build number
 ```
 
 `mod\sos_client\test\test_proxy.c` is a small harness that loads the DLL and checks the XInput forwarding.
@@ -86,7 +86,7 @@ Ranked by value for the revival divided by effort and risk. Feasibility is for t
 | 1 | Text replacement ("SOSTEST" to the revival name, boot notices, any UI string) | High (branding, honest notices) | Small once a draw hook exists | Low | Yes: one hook where Slate draws a string (`FSlateDrawElement::MakeText`), replacement table in a text file | Built (BuildLabel, HideShutdownNotice) |
 | 2 | Quality of life: FOV, FPS cap, VSync, borderless window, graphics cvars | High | Small to medium | Low | Borderless: yes (plain Win32). FOV: yes (`APlayerController::FOV` exec function through `ProcessEvent`). cvars: yes if cvar set by name works in shipping (checked below) | Built: Borderless, [Cvars]; VerticalFOV experimental |
 | 3 | Report with a clip link | Medium | Medium | Low | Yes. The native report dialog already works against the moderation backend; the mod only adds the clip link (`POST /api/reports`, then `/evidence`). Needs the target picked from the in-match player list | Design only, needs backend routes and a decision |
-| 4 | Self-update (signed) | Very high (fix and ship without asking players to copy files) | Medium | High if done carelessly | Yes. A loaded DLL can be renamed on Windows, so: tiny stable `xinput1_3.dll` stub plus a replaceable `sos_client_core.dll` | Design only (below), not built |
+| 4 | Self-update (signed) | Very high (fix and ship without asking players to copy files) | Medium | High if done carelessly | Yes. A loaded DLL can be renamed on Windows, so: tiny stable `xinput1_3.dll` stub plus a replaceable `sos_client_core.dll` | Built and tested (below); not yet in a released install |
 | 5 | Join a friend through Steam (rich presence `connect`, overlay invite, join request callback) | High | Medium | Low | Yes: call `steam_api64` flat API from the mod; the callback feeds the existing join-hint plus auto PLAY. Needs a lobby id in the rich presence | Not built |
 | 6 | Crash report upload | High (we can finally see why it crashed) | Medium | Medium (privacy: opt-in, strip user name and paths) | Yes. The game already writes crash contexts to `%LOCALAPPDATA%\SOS\Saved\Crashes\UE4CC-Windows-*`; upload them on the next start. Needs a backend route | Not built |
 | 7 | Content and asset patching (mount an extra `.pak`) | High long term (fix Blueprint text, loading screens) | Large | High (a pak runs Blueprint code: must be signed like the DLL) | Partly. Mounting a pak at startup is stock `FPakPlatformFile`; but we have no 4.12 cook, so only byte-level edits of existing assets (same-size strings) are realistic; pak version and signing of the game's own paks not yet checked | Design only |
@@ -96,7 +96,36 @@ Ranked by value for the revival divided by effort and risk. Feasibility is for t
 | 11 | Ultrawide / aspect | Medium | Small | Low | Mostly a camera aspect constraint setting; UI scaling depends on the game's UMG | Not checked |
 | 12 | Keybind remapping | Medium | Medium | Medium | Possible through the input settings, needs RE | Not checked |
 
-### Self-update design (not built; needs the lead's sign-off on the manifest and key)
+### Self-update (built)
+
+`xinput1_3.dll` (`loader.c`) is now the stable loader: XInput forwarding plus the update rules. The mod itself (`sos_client.c`, built with `-DSOS_CORE`) is `sos_client_core.dll`, which exports `sos_core_start` and `sos_core_version`. The loader loads it from its own DllMain (the core installs its hooks before the game reads any config, as before). Files next to the loader:
+
+| File | Meaning |
+|---|---|
+| `sos_client_core.dll`, `.manifest`, `.sig` | installed core and its signed manifest (a build without them never updates) |
+| `sos_client_core.new` (+ `.new.manifest`, `.new.sig`) | a downloaded update waiting for the next launch |
+| `sos_client_core.prev` (+ manifest, sig) | the previous core, kept for rollback |
+| `sos_client_core.trial` | present while a new core has not yet proven itself (the core deletes it after 60 s of running) |
+| `sos_client_loader.log` | what the loader did (swap, rejection, rollback), kept under 64 KB |
+
+Rules the loader enforces, and tests for them (`mod/sos_client/test/update_test.js`, 12 checks, all pass): a staged core is applied only if the manifest signature verifies against the compiled-in key (`update_pubkey.h`, two slots for rotation), its version is higher than the installed core's, and the file's size and SHA-256 match; a bad signature, an edited manifest, a tampered file, the same or a lower version are deleted unused. A core that fails to load, or that was not stable (trial file still there) on its third launch, is rolled back to `.prev`. With no core DLL the game runs with plain XInput.
+
+Core side (`core_update.inc`): 15 s after launch, once, the core asks `GET /mod/manifest.json` and `/mod/manifest.sig` on the configured backend, verifies, downloads `/mod/core-<version>.dll` (at most 1.9 MB), checks size and hash and stages it. `AutoUpdate=0` in the ini turns this off. The backend serves the three kinds of file from `data/mod` (`OGSOS_MOD_DIR`) in `server/server.js` (`serveMod`, GET only, fixed names); it holds no secret.
+
+Release procedure (private key stays on the lead's machine):
+
+```powershell
+node tools\mod_update.js keygen                                  # once; key to %USERPROFILE%\.ogsos\update-signing.key, public key to update_pubkey.h
+cd mod\sos_client; .\build.ps1 -CoreVersion 3                    # rebuild loader (only when update_pubkey.h changes) and core
+node tools\mod_update.js sign mod\sos_client\build\sos_client_core.dll 3 dist-mod "what changed"
+# copy dist-mod\manifest.json, manifest.sig, core-3.dll into the backend's data\mod
+```
+
+The first install also needs a signed manifest for the shipped core: sign the shipped core the same way and give players `manifest.json` renamed `sos_client_core.manifest` and `manifest.sig` renamed `sos_client_core.sig`. Verified end to end against a local backend: a v1 install staged v2 and applied it on the next launch (loader log: `core updated from v1 to v2`); a manifest with a flipped signature bit was ignored (`update: manifest signature invalid`). Not tested inside the real game (the updater runs the same in any host process).
+
+Limits: the backend speaks plain http, so the signature is the only protection (that is why it is mandatory); the loader itself cannot self-update except by manual replacement; losing the private key means a manual reinstall with a new key (the second key slot allows a planned rotation).
+
+### Self-update original design notes
 
 Goal: players install two files once; every later fix arrives by itself, and nothing unsigned ever runs.
 
