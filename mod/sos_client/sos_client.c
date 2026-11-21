@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <stdarg.h>
 #include <wchar.h>
 #include <wctype.h>
@@ -110,7 +111,7 @@ static struct {
     int borderless;              /* 1: windowed game becomes a borderless window covering its monitor */
     int unlock_dlc;              /* 1: report every Steam DLC / entitlement check as owned (cosmetics only) */
     int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
-} cfg = { 1, 0, 0, 1, 1, 1, 0, 1, 1 };
+} cfg = { 1, 0, 0, 1, 1, 0, 0, 1, 1 };
 
 static struct { wchar_t name[64], val[48]; } g_cv[32];   /* [Cvars] section of the ini */
 static int g_ncv;
@@ -119,6 +120,9 @@ static int g_auto_update = 1;      /* AutoUpdate in the ini (core build) */
 #endif
 static float g_vfov, g_vzfov;        /* VerticalFOV / VerticalZoomFOV from the ini, 0 = leave */
 static volatile LONG g_map_gen;      /* bumped on every LoadMap */
+static wchar_t g_notice_title[160], g_notice_body[640];   /* NoticeTitle / NoticeBody (boot notice replacement text) */
+static float g_notice_tc[3], g_notice_bc[3];                /* linear RGB of NoticeTitleColor / NoticeBodyColor */
+#define NOTICE_ON (!cfg.hide_shutdown && (g_notice_title[0] || g_notice_body[0]))
 static wchar_t g_dump_pat[64];       /* DumpObjects=: log objects whose name contains this, once (development aid) */
 static wchar_t g_build_label[96];   /* replacement for the BuildVersionText label; empty = leave it */
 
@@ -191,6 +195,15 @@ static void parse_backend(const wchar_t *in)
     g_backend_w[255] = 0;
 }
 
+/* "RRGGBB" or "#RRGGBB" (sRGB) -> linear floats for FLinearColor. */
+static void hex_to_linear(const wchar_t *s, float out[3])
+{
+    if (*s == L'#') s++;
+    unsigned long v = wcstoul(s, NULL, 16);
+    float c[3] = { (float)((v >> 16) & 255) / 255.0f, (float)((v >> 8) & 255) / 255.0f, (float)(v & 255) / 255.0f };
+    for (int i = 0; i < 3; i++) out[i] = c[i] <= 0.04045f ? c[i] / 12.92f : (float)pow((c[i] + 0.055f) / 1.055f, 2.4);
+}
+
 static void load_config(HMODULE self)
 {
     GetModuleFileNameW(self, g_dir, MAX_PATH);
@@ -204,7 +217,7 @@ static void load_config(HMODULE self)
     cfg.game_log           = GetPrivateProfileIntW(L"Client", L"GameLog", 0, g_ini);
     cfg.overlay            = GetPrivateProfileIntW(L"Client", L"Overlay", 1, g_ini);
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
-    cfg.hide_shutdown      = GetPrivateProfileIntW(L"Client", L"HideShutdownNotice", 1, g_ini);
+    cfg.hide_shutdown      = GetPrivateProfileIntW(L"Client", L"HideShutdownNotice", 0, g_ini);
 #ifdef SOS_CORE
     g_auto_update          = GetPrivateProfileIntW(L"Client", L"AutoUpdate", 1, g_ini);
 #endif
@@ -227,6 +240,21 @@ static void load_config(HMODULE self)
         g_vfov = (float)wcstod(fv, NULL);
         GetPrivateProfileStringW(L"Client", L"VerticalZoomFOV", L"0", fv, 32, g_ini);
         g_vzfov = (float)wcstod(fv, NULL);
+    }
+    {
+        static const wchar_t dt[] = L"SOS IS BACK!";
+        static const wchar_t db[] = L"The SOS servers are back online. Welcome to the community relaunch of SOS: Classic.\n\nGrab your friends, get out alive.\n\n- Scwunge";
+        wchar_t col[32];
+        GetPrivateProfileStringW(L"Client", L"NoticeTitle", dt, g_notice_title, 160, g_ini);
+        GetPrivateProfileStringW(L"Client", L"NoticeBody", db, g_notice_body, 640, g_ini);
+        for (wchar_t *s = g_notice_body, *d = g_notice_body;; s++) {      /* backslash + n in the ini = line break */
+            if (s[0] == L'\\' && s[1] == L'n') { *d++ = L'\n'; s++; } else *d++ = *s;
+            if (!*s) break;
+        }
+        GetPrivateProfileStringW(L"Client", L"NoticeTitleColor", L"FFB000", col, 32, g_ini);
+        hex_to_linear(col, g_notice_tc);
+        GetPrivateProfileStringW(L"Client", L"NoticeBodyColor", L"FFFFFF", col, 32, g_ini);
+        hex_to_linear(col, g_notice_bc);
     }
     GetPrivateProfileStringW(L"Client", L"DumpObjects", L"", g_dump_pat, 64, g_ini);
     cfg.borderless         = GetPrivateProfileIntW(L"Client", L"Borderless", 0, g_ini);
@@ -2835,8 +2863,9 @@ static void play_tick(void *self)
 
 static struct {
     int init;
-    FNameI overlay_cls, build_text, update_build, textblock, ktl_cdo_name, conv_name, settext_name, overlay_name, ok_name;
+    FNameI overlay_cls, build_text, update_build, textblock, ktl_cdo_name, conv_name, settext_name, overlay_name, ok_name, header_name, message_name;
     void *ktl_cdo;
+    void *notice_done[8]; int nnotice;        /* notice text blocks already restyled */
     void *applied[16]; int napplied;          /* text blocks already set */
     void *dismissed[8]; int ndismissed;       /* HUD widgets whose notice was closed */
     ULONGLONG next_scan;
@@ -2853,9 +2882,9 @@ static int make_ftext(const wchar_t *s, uint8_t out[0x18])
     if (!fn) return 0;
     uint8_t parms[0x60];
     memset(parms, 0, sizeof parms);
-    static wchar_t buf[128];
-    wcsncpy(buf, s, 127);
-    buf[127] = 0;
+    static wchar_t buf[704];
+    wcsncpy(buf, s, 703);
+    buf[703] = 0;
     FString *fs = (FString *)parms;
     fs->data = buf;
     fs->num = fs->max = (int32_t)wcslen(buf) + 1;
@@ -2879,6 +2908,46 @@ static int set_textblock(void *tb, const wchar_t *s)
     return 1;
 }
 
+/* TextBlock::SetColorAndOpacity(FSlateColor): specified colour, alpha 1. */
+static void set_tb_color(void *tb, const float rgb[3])
+{
+    static FNameI n_col;
+    if (!n_col.idx) ((FNameCtorFn)AT(RVA_FNAME_CTOR))(&n_col, L"SetColorAndOpacity", 0);
+    if (!n_col.idx) return;
+    void *fn = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(*(void **)((uint8_t *)tb + 0x10), n_col, 1);
+    if (!fn) { slog("text: SetColorAndOpacity not found"); return; }
+    float parms[16];
+    memset(parms, 0, sizeof parms);
+    parms[0] = rgb[0]; parms[1] = rgb[1]; parms[2] = rgb[2]; parms[3] = 1.0f;   /* SpecifiedColor; ColorUseRule 0 = specified */
+    o_pe(tb, fn, parms);
+}
+
+/* Current text of a TextBlock (GetText, then Conv_TextToString). 1 on success. */
+static int get_textblock(void *tb, wchar_t *out, int cap)
+{
+    static FNameI n_get, n_conv;
+    FNameCtorFn mk = (FNameCtorFn)AT(RVA_FNAME_CTOR);
+    if (!n_get.idx) mk(&n_get, L"GetText", 0);
+    if (!n_conv.idx) mk(&n_conv, L"Conv_TextToString", 0);
+    out[0] = 0;
+    if (!n_get.idx || !n_conv.idx || !T.ktl_cdo) return 0;
+    void *fg = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(*(void **)((uint8_t *)tb + 0x10), n_get, 1);
+    void *fc = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(*(void **)((uint8_t *)T.ktl_cdo + 0x10), n_conv, 1);
+    if (!fg || !fc) return 0;
+    uint8_t p1[0x40];
+    memset(p1, 0, sizeof p1);
+    o_pe(tb, fg, p1);
+    uint8_t p2[0x60];
+    memset(p2, 0, sizeof p2);
+    memcpy(p2, p1, 0x18);                      /* InText */
+    o_pe(T.ktl_cdo, fc, p2);
+    FString *r = (FString *)(p2 + 0x18);       /* ReturnValue */
+    if (!plausible_ptr(r->data) || r->num <= 0 || r->num > 4096) return 0;
+    wcsncpy(out, r->data, (size_t)cap - 1);
+    out[cap - 1] = 0;
+    return 1;
+}
+
 static void text_scan(int force)
 {
     uint8_t *objs = *(uint8_t **)AT(RVA_GUOBJ_OBJECTS);
@@ -2890,11 +2959,29 @@ static void text_scan(int force)
         uint8_t *obj = *(uint8_t **)item;
         if (!obj || (*(int32_t *)(item + 8) & 0x20000000)) continue;
         const FNameI *nm = (const FNameI *)(obj + 0x18);
-        if (nm->idx != T.build_text.idx && nm->idx != T.ktl_cdo_name.idx && nm->idx != T.overlay_name.idx) continue;
+        if (nm->idx != T.build_text.idx && nm->idx != T.ktl_cdo_name.idx && nm->idx != T.overlay_name.idx &&
+            !(NOTICE_ON && (nm->idx == T.header_name.idx || nm->idx == T.message_name.idx))) continue;
         const uint8_t *cls = *(const uint8_t *const *)(obj + 0x10);
         if (!plausible_ptr(cls)) continue;
         if (nm->idx == T.ktl_cdo_name.idx) {
             if (!T.ktl_cdo) { T.ktl_cdo = obj; slog("text: Default__KismetTextLibrary at %p", (void *)obj); }
+            continue;
+        }
+        if (NOTICE_ON && T.ktl_cdo && (nm->idx == T.header_name.idx || nm->idx == T.message_name.idx)) {
+            if (((const FNameI *)(cls + 0x18))->idx != T.textblock.idx) continue;
+            if (*(const uint32_t *)(obj + 8) & 0x10) continue;
+            if (in_list(T.notice_done, T.nnotice, obj)) continue;
+            int is_hdr = nm->idx == T.header_name.idx;
+            wchar_t cur[600];
+            if (!get_textblock(obj, cur, 600)) continue;
+            /* only the boot notice: its original wording */
+            if (wcsncmp(cur, is_hdr ? L"Thank you for playing SOS" : L"SOS servers will permanently", is_hdr ? 25 : 28) != 0) continue;
+            const wchar_t *txt = is_hdr ? g_notice_title : g_notice_body;
+            if (!txt[0]) continue;
+            set_textblock(obj, txt);
+            set_tb_color(obj, is_hdr ? g_notice_tc : g_notice_bc);
+            if (T.nnotice < 8) T.notice_done[T.nnotice++] = obj;
+            slog("text: boot notice %s replaced (%p)", is_hdr ? "title" : "body", (void *)obj);
             continue;
         }
         if (nm->idx == T.build_text.idx && g_build_label[0]) {
@@ -2951,6 +3038,23 @@ static void dump_objects(void)
         if (!obj || (*(int32_t *)(item + 8) & 0x20000000)) continue;
         wchar_t nm[128], lo[128];
         fname_str(obj + 0x18, nm, 128);
+        if (pat[0] == L'@') {      /* "@text": match TextBlocks by their current text instead of their name */
+            const uint8_t *tc = *(const uint8_t *const *)(obj + 0x10);
+            if (!plausible_ptr(tc) || ((const FNameI *)(tc + 0x18))->idx != T.textblock.idx) continue;
+            if (*(const uint32_t *)(obj + 8) & 0x10) continue;
+            wchar_t tx[600], tl[600];
+            if (!get_textblock(obj, tx, 600)) continue;
+            wcscpy(tl, tx);
+            for (wchar_t *c = tl; *c; c++) *c = (wchar_t)towlower(*c);
+            if (!wcsstr(tl, pat + 1)) continue;
+            for (wchar_t *c = tx; *c; c++) if (*c == L'\n' || *c == L'\r') *c = L'|';
+            const uint8_t *outer = *(const uint8_t *const *)(obj + 0x20);
+            wchar_t on[96] = L"";
+            if (plausible_ptr(outer)) fname_str(outer + 0x18, on, 96);
+            slog("dump: TextBlock %p \"%ls\" outer \"%ls\" text \"%.300ls\"", (void *)obj, nm, on, tx);
+            hits++;
+            continue;
+        }
         wcscpy(lo, nm);
         for (wchar_t *c = lo; *c; c++) *c = (wchar_t)towlower(*c);
         if (!wcsstr(lo, pat)) continue;
@@ -2967,17 +3071,17 @@ static void dump_objects(void)
 
 static void text_tick(void *fn)
 {
-    if (!g_build_label[0] && !cfg.hide_shutdown && !g_dump_pat[0]) return;
+    if (!g_build_label[0] && !cfg.hide_shutdown && !NOTICE_ON && !g_dump_pat[0]) return;
     if (GetCurrentThreadId() != *(DWORD *)AT(RVA_GAME_THREAD_ID)) return;
     /* FName lookup without creating: a name is only known once the asset that has it is loaded, so retry. */
     {
         FNameCtorFn mk = (FNameCtorFn)AT(RVA_FNAME_CTOR);
         FNameI *ns[] = { &T.overlay_cls, &T.build_text, &T.update_build, &T.textblock, &T.ktl_cdo_name, &T.conv_name, &T.settext_name,
-                         &T.overlay_name, &T.ok_name };
+                         &T.overlay_name, &T.ok_name, &T.header_name, &T.message_name };
         static const wchar_t *nn[] = { L"Overlay", L"BuildVersionText", L"UpdateBuildInfoText", L"TextBlock", L"Default__KismetTextLibrary",
                                        L"Conv_StringToText", L"SetText", L"ShutdownOverlay",
-                                       L"BndEvt__ShutdownConfirmation_K2Node_ComponentBoundEvent_725_OnClicked__DelegateSignature" };
-        for (int i = 0; i < 9; i++) {
+                                       L"BndEvt__ShutdownConfirmation_K2Node_ComponentBoundEvent_725_OnClicked__DelegateSignature", L"Header", L"Message" };
+        for (int i = 0; i < 11; i++) {
             if (ns[i]->idx) continue;
             mk(ns[i], nn[i], 0);
             if (ns[i]->idx) slog("text: name \"%ls\" resolved (%d)", nn[i], ns[i]->idx);
@@ -3078,7 +3182,7 @@ static void h_process_event(void *self, void *fn, void *parms)
 {
     if (g_play_flag) play_tick(self);
     o_pe(self, fn, parms);
-    if (g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0]) text_tick(fn);
+    if (g_build_label[0] || cfg.hide_shutdown || NOTICE_ON || g_dump_pat[0]) text_tick(fn);
     if (g_ncv || g_vfov > 0 || g_vzfov > 0) game_tick();
 }
 
@@ -3258,7 +3362,7 @@ static void install(void)
         if (!o_avail) slog("unreleased cosmetics unavailable");
     }
 
-    if (cfg.auto_play || g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0] || g_ncv || g_vfov > 0 || g_vzfov > 0) {
+    if (cfg.auto_play || g_build_label[0] || cfg.hide_shutdown || NOTICE_ON || g_dump_pat[0] || g_ncv || g_vfov > 0 || g_vzfov > 0) {
         /* push rbp; push rsi; push rdi; push r12; push r13; push r14; push r15 (REX on rbp) */
         static const uint8_t p_pe[12] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
         o_pe = (ProcessEventFn)hook_entry(&cursor, RVA_PROCESS_EVENT, p_pe, 12, (void *)h_process_event,
