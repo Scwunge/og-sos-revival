@@ -5,6 +5,9 @@
 // Admin panel: always checks that GET /admin/api/me without a cookie is 401 and /admin/ serves HTML. With env
 // OGSOS_SMOKE_ADMIN_COOKIE (the value of the ogsos_admin cookie from a signed-in browser, never logged) it also checks
 // GET /admin/api/me, /dashboard and /servers return 200 and the role is owner or mod.
+// Client mod updates: GET /mod/manifest.json must be 200 (valid JSON) when the backend has the file and 404 when it does
+// not; env OGSOS_SMOKE_MOD=present|absent requires one of them (default: either), OGSOS_SMOKE_MOD_SHA256 also checks the
+// manifest's sha256. Traversal attempts under /mod/ must be 404 and never return a file.
 'use strict';
 const net = require('net');
 const http = require('http');
@@ -102,6 +105,13 @@ function get(p, headers = {}) {
     }).on('error', reject);
   });
 }
+function getBuf(p) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: HOST, port: PORT, path: p }, (res) => {
+      const c = []; res.on('data', (d) => c.push(d)); res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(c) }));
+    }).on('error', reject);
+  });
+}
 const assert = (c, m) => { if (!c) throw new Error(m); };
 (async () => {
   const sv = JSON.parse((await get('/servers?local=1')).body).servers.filter((s) => s.game === 'classic');
@@ -130,6 +140,24 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
   const page = await get('/admin/');
   assert(page.status === 200 && /<html|<!doctype html/i.test(page.body), `/admin/ should serve HTML, got ${page.status}`);
   console.log('PASS  /admin/ serves the panel page');
+  // client mod update route
+  const want = process.env.OGSOS_SMOKE_MOD || '';
+  const mf = await getBuf('/mod/manifest.json');
+  if (mf.status === 200) {
+    assert(want !== 'absent', '/mod/manifest.json is 200 but OGSOS_SMOKE_MOD=absent');
+    JSON.parse(mf.body.toString('utf8'));
+    const sha = crypto.createHash('sha256').update(mf.body).digest('hex');
+    if (process.env.OGSOS_SMOKE_MOD_SHA256) assert(sha === process.env.OGSOS_SMOKE_MOD_SHA256.toLowerCase(), `/mod/manifest.json sha256 ${sha} does not match`);
+    console.log(`PASS  /mod/manifest.json is 200 (sha256 ${sha})`);
+  } else {
+    assert(mf.status === 404 && want !== 'present', `/mod/manifest.json returned ${mf.status}` + (want === 'present' ? ' (expected 200)' : ''));
+    console.log('PASS  /mod/manifest.json is 404 (no update published)');
+  }
+  for (const p of ['/mod/..%2Fpackage.json', '/mod/%2e%2e%2fpackage.json', '/mod/..%5Cpackage.json', '/mod/manifest.json%00', '/mod/core-1.dll%2F..%2F..%2Fpackage.json', '/mod/db.json', '/mod/']) {
+    const r = await getBuf(p);
+    assert(r.status === 404 && r.body.length === 0, `${p} should be 404 with no body, got ${r.status}`);
+  }
+  console.log('PASS  /mod/ rejects traversal and unknown names');
   const ck = process.env.OGSOS_SMOKE_ADMIN_COOKIE;
   if (ck) {
     const h = { Cookie: `ogsos_admin=${ck.replace(/^ogsos_admin=/, '')}` };

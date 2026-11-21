@@ -538,6 +538,19 @@ function handleApi(req, url, body, res) {
 }
 
 // ---------- HTTP server ----------
+// Client mod self-update (docs/CLIENT_MOD.md): serves manifest.json, manifest.sig and core-<n>.dll from data/mod
+// (OGSOS_MOD_DIR overrides). Only those names; the files are signed offline by tools/mod_update.js, so this
+// route holds no secret and the client trusts the signature, not this server.
+const MOD_DIR = process.env.OGSOS_MOD_DIR || path.join(DATA_DIR, 'mod');
+function serveMod(url, res) {
+  const name = url.pathname.slice(5);
+  if (!/^(manifest\.json|manifest\.sig|core-\d{1,6}\.dll)$/.test(name)) { res.writeHead(404); return res.end(); }
+  fs.readFile(path.join(MOD_DIR, name), (err, buf) => {
+    if (err) { res.writeHead(404); return res.end(); }
+    res.writeHead(200, { 'Content-Type': name.endsWith('.dll') ? 'application/octet-stream' : 'text/plain', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+    res.end(buf);
+  });
+}
 function serveServers(req, url, res) {
   allServers(url.searchParams.get('local') === '1').catch(() => localServers()).then((servers) => {
     const buf = Buffer.from(JSON.stringify({ servers }));
@@ -613,6 +626,7 @@ const server = http.createServer((req, res) => {
     try {
       if (url.pathname.startsWith('/kv/')) result = handleKv(url.pathname.slice(4), res, req);
       else if (url.pathname === '/servers' && req.method === 'GET') return serveServers(req, url, res);
+      else if (url.pathname.startsWith('/mod/') && req.method === 'GET') return serveMod(url, res);   // client mod self-update files
       else if (url.pathname.startsWith('/embed/') && req.method === 'GET') return serveEmbed(url, res);   // hero-tv
       else if ((url.pathname === '/' || url.pathname === '/watch') && req.method === 'GET') return servePage(res, 'watch.html', {});   // hero-tv
       else if (url.pathname.startsWith('/api/stream/') && req.method === 'GET') result = handleStreamApi(url, res);   // hero-tv
