@@ -64,11 +64,12 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 - Verified (with it on): the Founder's Pack T-Shirts row is listed and a gold shirt equips and renders on the character: `docs/client-mod-dlc-founders-listed.png`, `docs/client-mod-dlc-founders-equipped.png`.
 - Not checked in the game: the gestures and the name plate.
 
-## How Steam launches the game
+## How Steam launches the game, and why no .cmd is needed
 
-- Steam's `appinfo.vdf` for app 802240 has one launch option: `SOS\Binaries\Win64\SOS-Win64-Shipping.exe`. `SOS_BE.exe` and `BattlEye\` ship in `Win64` but are never started.
-- No BattlEye bypass is part of this design. If a future build routes Play through BattlEye, stop and ask.
+- Steam's `appinfo.vdf` for app 802240 lists `SOS\Binaries\Win64\SOS-Win64-Shipping.exe` ("Launch", no arguments) as the launch option, plus a `Win64\SOS.exe` entry that does not exist in this install. Steam never starts `SOS_BE.exe` or anything in `BattlEye\`. The game process Steam starts loads `xinput1_3.dll` from its own folder, so the mod is active on a normal Play. A direct launch of the exe from the install (what the real game folder does) shows an empty command line and no BattlEye lines in `SOS.log`.
+- `SOS_BE.exe` is the BattlEye launcher. Reading its strings: it installs the BattlEye Windows service, shows an EULA and says BattlEye is required. I did not run it (it changes the system). It is not on the Steam path, so nothing needs to neutralise it. If a player starts it by hand, it will not work; they should use Play in Steam.
 - Steam sets `SteamAppId` itself, so no `steam_appid.txt` is needed.
+- Config: the mod answers 16 `[Outpost*]` keys inside the game's `FConfigCacheIni::GetString` before the config file is consulted (Identity, AppPersistence, KeyValueStore x3, Leaderboards, LogReceiver, Streams, StreamClient x4, MatchmakingClient x4; the join file also sets IAP and Storefront, which a Classic session never reads). A run logged all 16 as overridden while the user's Engine.ini still pointed at outpostgames.com, so `Engine.ini` contents do not matter and the join `.cmd` is not needed. Not tested: a profile with no `Engine.ini` at all (an attempt with a redirected `LOCALAPPDATA` was ignored by the game, so it proved nothing). By the code the file is never read for these keys, so a missing file should behave the same.
 
 ## Server list API (backend)
 
