@@ -201,6 +201,8 @@ and the host also uses `toxicity` (POST only; `ToxicityLeaderboard`, no frontend
 ### KV keys (client reads `GET /kv/runtime-N.json`; per prefix P in `FAME_SOLO FAME_DUO SURVIVAL_SOLO SURVIVAL_DUO TRENDING_SOLO TRENDING_DUO TOXICITY`, plus `FAME`, `SURVIVAL`, `TRENDING` for the base classes) **[C]**
 
 `UE_CLIENT_<P>_ELO_K_FACTOR` (int), `_ELO_RATING_ADVANTAGE_STEP` (float), `_ELO_RATING_DISTRIBUTION_OFFSET` (int), `_REQUIRED_GAMES` (int), `_RATING_BRONZE_START`, `_RATING_SILVER_START`, `_RATING_GOLD_START`, `_RATING_GOLD_END` (floats, UI tier bands), `_LEADERBOARD_ID_POSTFIX` (string). Fame also: `UE_CLIENT_FAME_WEIGHTINGS`, `UE_CLIENT_FAME_REQUIRED_DELTA` (formats not decoded). Blueprint defaults: trending K=1000, required games 1; everything else 0/empty, **so with no KV keys the ratings never change** (K = 0) **[C]**. The leaderboard `OnReady` fires when the gold/silver keys arrive **[I]**.
+**Our values (our choice, NOT the originals, which are unknown)**, in `data/kv-classic/runtime-3.json` (live-rev 3), for `SURVIVAL`, `SURVIVAL_SOLO`, `SURVIVAL_DUO`: classic ELO, `ELO_K_FACTOR` 32, `ELO_RATING_ADVANTAGE_STEP` 400, `ELO_RATING_DISTRIBUTION_OFFSET` 1000 (everyone shows 1000 at start), `REQUIRED_GAMES` 10, bands bronze 1000 / silver 1200 / gold 1400, gold end 2000. Tune them there (add a new runtime-N.json and bump live-rev so clients refetch). `FAME_*` is left to the hero.tv work (server/fame.js computes Fame); `TRENDING_*` keeps the game defaults; `TOXICITY` is unset.
+
 Related: KV `UE_CLIENT_FRONTEND_LEADERBOARDS` gates the frontend leaderboard UI **[I]**, analytics `LeaderboardClicked` {LeaderboardName}.
 
 ## 4. Rewards, season, coins
