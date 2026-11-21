@@ -27,6 +27,7 @@ const DEFAULTS = {
   START_FULL_COUNTDOWN_SECONDS: 10, // hosted sessions only: a running countdown is cut to at most this once the session is full
   VOTE_START_MIN_PLAYERS: 2,   // hosted sessions only: seated players needed before a vote-start can count
   VOTE_START_COUNTDOWN_SECONDS: 10, // hosted sessions only: countdown once a majority voted to start
+  HOST_ONLINE_SECONDS: 90,     // hosted sessions only: a host counts as online this long after its last poll (pool seating + GET /servers)
   EMPTY_END_SECONDS: 120,      // hosted sessions only: a started session with no seated players this long is ended (0 = off)
   TRAVEL_GRACE_SECONDS: 300,   // hosted sessions only: a seated player whose WS closed keeps their seat this long
   HOSTS: [],                   // fixed game hosts: [{host, port, sessionId, sessionToken, hostIds, name?, region?}], see docs/CLASSIC.md
@@ -155,6 +156,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   const fullCountdownMs = Math.max(0, numCfg('START_FULL_COUNTDOWN_SECONDS')) * 1000;
   const voteMin = Math.max(1, Math.floor(numCfg('VOTE_START_MIN_PLAYERS')));
   const voteCountdownMs = Math.max(0, numCfg('VOTE_START_COUNTDOWN_SECONDS')) * 1000;
+  const hostOnlineMs = Math.max(0.01, numCfg('HOST_ONLINE_SECONDS')) * 1000;
   const emptyEndMs = Math.max(0, numCfg('EMPTY_END_SECONDS')) * 1000;
   const lateJoinMs = numCfg('LATE_JOIN_SECONDS') * 1000;   // hosted: 0 = never after the start, < 0 = always
   const publicHost = net.isIPv4(String(config.PUBLIC_HOST || '')) ? String(config.PUBLIC_HOST) : '';
@@ -256,7 +258,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       id: entry.sessionId, name: 'Match', host: entry.host, port: entry.port, owner: 'system',
       matchmade: true, started: false, hosted: entry, token: entry.sessionToken,
     });
-    s.countdownTimer = null; s.countdownEndsAt = null; s.countdownVote = false; s.emptyTimer = null;
+    s.countdownTimer = null; s.countdownEndsAt = null; s.countdownVote = false; s.countdownHeld = false; s.emptyTimer = null;
     s.state = 'waiting'; s.startedAt = null; s.endedAt = null; s.votes = new Set();
     hostedById.set(entry.sessionId, { s, entry });
   }
@@ -275,10 +277,23 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   }
 
   // The host's authenticated GET /api/session/<id> poll (called by server.js after the token check).
+  // A host is online while its last authenticated poll is within HOST_ONLINE_SECONDS (reset forgets the poll).
+  function hostOnline(id, now = Date.now()) {
+    const m = hostedMeta.get(String(id));
+    return !!m && m.lastPoll !== null && now - m.lastPoll <= hostOnlineMs;
+  }
   function markHostPolled(id) {
     const m = hostedMeta.get(String(id));
-    if (m) m.lastPoll = Date.now();
-    return !!m;
+    if (!m) return false;
+    const wasOnline = hostOnline(id);
+    m.lastPoll = Date.now();
+    if (!wasOnline) {
+      // Offline -> online: finish a countdown that was held while the host was away, then seat waiting players.
+      const s = hostedById.get(String(id)).s;
+      if (s.countdownHeld) setCountdown(s, fullCountdownMs, 'host back online');
+      if (pumpHosted()) sendSummary();
+    }
+    return true;
   }
   // POST /announce: override name and/or region in memory (invalid or empty values are ignored).
   function announceHosted(id, { name, region } = {}) {
@@ -297,7 +312,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       const last = m.lastPoll;
       return {
         id: entry.sessionId, name: m.name, region: m.region, host: entry.host, port: entry.port,
-        online: last !== null && now - last <= 20000,
+        online: hostOnline(entry.sessionId, now),
         lastSeenSec: last === null ? null : Math.floor((now - last) / 1000),
         players: [...s.players.keys()].filter((pid) => !entry.hostIds.includes(pid)).length,
         minPlayers: startMin, maxPlayers: config.MAX_PLAYERS,
@@ -359,19 +374,28 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   }
 
   function cancelCountdown(s) {
-    s.countdownVote = false; s.countdownEndsAt = null;
+    s.countdownVote = false; s.countdownEndsAt = null; s.countdownHeld = false;
     if (s.countdownTimer) { clearTimeout(s.countdownTimer); s.countdownTimer = null; log(`session ${s.id}: start countdown cancelled`); }
   }
 
   // Start (or shorten) the start countdown; a running countdown is never lengthened.
+  // A countdown that ends while the host is offline is held (state stays 'countdown') until the host polls again.
   function setCountdown(s, ms, why) {
-    if (ms <= 0) { startSession(s, why); return; }
+    if (ms <= 0) {
+      if (!hostOnline(s.id)) { s.countdownHeld = true; s.state = 'countdown'; return; }
+      startSession(s, why); return;
+    }
+    s.countdownHeld = false;
     const end = Date.now() + ms;
     if (s.countdownTimer && s.countdownEndsAt <= end) return;
     if (s.countdownTimer) clearTimeout(s.countdownTimer);
     s.countdownEndsAt = end;
     s.state = 'countdown';
-    s.countdownTimer = setTimeout(() => { s.countdownTimer = null; startSession(s, 'countdown ended'); }, ms);
+    s.countdownTimer = setTimeout(() => {
+      s.countdownTimer = null;
+      if (!hostOnline(s.id)) { s.countdownHeld = true; log(`session ${s.id}: countdown ended while the host is offline, holding`); return; }
+      startSession(s, 'countdown ended');
+    }, ms);
     s.countdownTimer.unref();
     const msg = `mm hosted session ${s.id}: ${s.players.size}/${startMin} players, starting in ${ms / 1000}s (${why})`;
     console.log(msg); log(msg);
@@ -440,7 +464,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       if (n >= config.MAX_PLAYERS && s.countdownTimer) setCountdown(s, fullCountdownMs, 'session full');
     } else if (!vote && !(s.countdownVote && n >= voteMin)) cancelCountdown(s);
     if (s.started) return;
-    if (!s.countdownTimer) s.state = 'waiting';
+    if (!s.countdownTimer && !s.countdownHeld) s.state = 'waiting';
     sendWaitingSummary(s);
   }
 
@@ -497,6 +521,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     }
     s.players.clear(); s.groups = {}; s.started = false; s.votes.clear();
     s.state = 'waiting'; s.startedAt = null; s.endedAt = null;
+    hostedMeta.get(s.id).lastPoll = null;   // the game restarts: offline until its next poll
     log(`hosted session ${s.id} reset (${ids.length} player(s) cleared)`);
     // Players who were kept waiting (late joiners) go into the fresh lobby.
     if (pumpHosted()) sendSummary();
@@ -571,12 +596,12 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     return lateJoinMs < 0 || (lateJoinMs > 0 && Date.now() - s.startedAt < lateJoinMs);
   }
 
-  // Pool choice: the fullest open lobby (waiting/countdown) that has room, else an idle waiting one,
+  // Pool choice (online lobbies only): the fullest open lobby (waiting/countdown) that has room, else an idle waiting one,
   // else a started session still inside its late-join window (fullest first).
   function pickHosted(count) {
     let best = null, bestRank = -1;
     for (const { s } of hostedById.values()) {
-      if (!hostedOpen(s) || s.players.size + count > config.MAX_PLAYERS) continue;
+      if (!hostOnline(s.id) || !hostedOpen(s) || s.players.size + count > config.MAX_PLAYERS) continue;
       const rank = s.state === 'started' ? 1 + s.players.size / 1000
         : s.players.size > 0 ? 10 + s.players.size : 5;
       if (rank > bestRank) { best = s; bestRank = rank; }

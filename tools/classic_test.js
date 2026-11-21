@@ -133,6 +133,7 @@ function verifyHs512(jwt, key) {
     const sid = HOST.sessionId, tok = HOST.sessionToken;
     // The earlier queue checks already seated players in the hosted session; start from a clean one.
     assert((await req('POST', `/api/session/${sid}/reset`, '{}', { Authorization: `Token ${tok}` })).status === 200, 'reset');
+    await req('GET', `/api/session/${sid}`, null, { Authorization: `Token ${tok}` });   // the restarted host polls: back online
     const d = await login('76561190000000103', 'sostest');
     const dw = await ws(d['access-token']);
     await wait(200);

@@ -9,7 +9,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const assert = (c, m) => { if (!c) throw new Error(m || 'assertion failed'); };
 
 const origLog = console.log; console.log = () => {};   // matchmaker chatter
-function make(over = {}) {
+function make(over = {}, polled = true) {
   const config = {
     MIN_PLAYERS: 1, MAX_PLAYERS: 4, QUEUE_TIMEOUT: 20, MATCH_BATCH_MS: 5, LATE_JOIN_SECONDS: 300, GROUP_MAX_SIZE: 8,
     START_MIN_PLAYERS: 2, START_COUNTDOWN_SECONDS: 0.3, START_FULL_COUNTDOWN_SECONDS: 0.05,
@@ -18,6 +18,7 @@ function make(over = {}) {
     HOSTS: [ENTRY], ...over,
   };
   const mm = createMatchmaker({ config });
+  if (polled) for (const h of config.HOSTS) mm.markHostPolled(h.sessionId);   // hosts are up unless a test says otherwise
   const mk = (id) => {
     const c = { id, connId: id, msgs: [], sendMsg(type, data) { this.msgs.push({ type, data }); }, close() {} };
     c.has = (type) => c.msgs.some((m) => m.type === type);
@@ -149,7 +150,7 @@ test('late join refused after LATE_JOIN_SECONDS, seated after reset', async () =
   assert(info().players === 1, 'late player not seated');
   assert(late.msgs.some((m) => m.type === 'summary' && m.data.players.waiting === 1), 'got the waiting summary');
   assert(!late.has('session'), 'no session sent');
-  mm.resetHosted(SID);
+  mm.resetHosted(SID); mm.markHostPolled(SID);   // the restarted host polls
   assert(info().players === 1 && late.has('session'), 'seated into the fresh lobby');
   mm.shutdown();
 });
@@ -188,7 +189,7 @@ test('end clears seats; state stays ended (no seating) until reset', async () =>
   const c = mk('c');
   find(c);
   assert(info().players === 0 && !c.has('session'), 'ended session refuses seats');
-  mm.resetHosted(SID);
+  mm.resetHosted(SID); mm.markHostPolled(SID);
   assert(info().players === 1 && c.has('session'), 'queued player seated after reset');
   assert(info().endedAt === null);
   mm.shutdown();
@@ -227,6 +228,114 @@ test('pool: joins the fullest open lobby', async () => {
   find(cs[0]); find(cs[1]); find(cs[2]);
   const l = mm.listHosted();
   assert(l[0].players === 3 && l[1].players === 0, JSON.stringify(l.map((x) => x.players)));
+  mm.shutdown();
+});
+
+const SID2 = '22222222-2222-3333-4444-555555555555';
+const E2 = { ...ENTRY, port: 7778, sessionId: SID2, sessionToken: 'tok2' };
+const listOf = (mm) => mm.listHosted();
+
+test('offline lobby is not picked; player stays queued with a waiting summary', async () => {
+  const { mm, mk, find, info } = make({}, false);
+  const a = mk('a');
+  find(a);
+  assert(info().online === false && info().players === 0, 'offline, nobody seated');
+  assert(!a.has('session'), 'not seated');
+  assert(a.msgs.some((m) => m.type === 'summary' && m.data.players.waiting === 1), 'waiting summary');
+  mm.shutdown();
+});
+
+test('queued player is seated when the only lobby polls', async () => {
+  const { mm, mk, find, info } = make({}, false);
+  const a = mk('a');
+  find(a);
+  mm.markHostPolled(SID);
+  assert(info().online === true && info().players === 1 && a.has('session'), 'seated after poll');
+  mm.shutdown();
+});
+
+test('all lobbies offline: seated into the first one that polls', async () => {
+  const { mm, mk, find } = make({ HOSTS: [ENTRY, E2] }, false);
+  const a = mk('a');
+  find(a);
+  assert(listOf(mm).every((l) => l.players === 0));
+  mm.markHostPolled(SID2);
+  const l = listOf(mm);
+  assert(l[0].players === 0 && l[1].players === 1 && a.has('session'), JSON.stringify(l.map((x) => x.players)));
+  mm.shutdown();
+});
+
+test('reset marks the lobby offline until the host polls again', async () => {
+  const { mm, mk, find, info } = make();
+  const a = mk('a');
+  find(a);
+  assert(info().online === true);
+  const r = mm.resetHosted(SID);
+  assert(r === 1 && info().online === false && info().lastSeenSec === null, 'offline after reset');
+  const b = mk('b');
+  find(b);
+  assert(info().players === 0 && !b.has('session'), 'nobody seated while offline');
+  mm.markHostPolled(SID);
+  assert(info().online === true && info().players === 1 && b.has('session'), 'seated after poll');
+  mm.shutdown();
+});
+
+test('online flag follows HOST_ONLINE_SECONDS', async () => {
+  const { mm, info } = make({ HOST_ONLINE_SECONDS: 0.1 });
+  assert(info().online === true);
+  await sleep(150);
+  assert(info().online === false, 'expired');
+  mm.shutdown();
+});
+
+test('countdown ending while offline holds, then starts shortly after the host polls', async () => {
+  const { mm, mk, find, info } = make({ HOST_ONLINE_SECONDS: 0.1, START_COUNTDOWN_SECONDS: 0.3, START_FULL_COUNTDOWN_SECONDS: 0.05 });
+  const a = mk('a'), b = mk('b');
+  find(a); find(b);
+  assert(info().state === 'countdown');
+  await sleep(450);   // poll expired mid-countdown, countdown over
+  assert(info().online === false && info().state === 'countdown' && !a.has('session-started'), 'held');
+  assert(info().players === 2, 'seats kept');
+  mm.markHostPolled(SID);
+  await sleep(120);
+  assert(info().state === 'started' && a.has('session-started') && b.has('session-started'), 'started after poll');
+  mm.shutdown();
+});
+
+test('pool: started lobby A routes new players to lobby B', async () => {
+  const { mm, mk, find } = make({ HOSTS: [ENTRY, E2], MAX_PLAYERS: 16, LATE_JOIN_SECONDS: 0, START_MIN_PLAYERS: 1, START_COUNTDOWN_SECONDS: 0 });
+  const a = mk('a');
+  find(a);
+  assert(listOf(mm)[0].state === 'started', 'A started');
+  const b = mk('b');
+  find(b);
+  const l = listOf(mm);
+  assert(l[0].players === 1 && l[1].players === 1 && b.has('session'), JSON.stringify(l.map((x) => x.players)));
+  mm.shutdown();
+});
+
+test('pool: full lobby A routes new players to lobby B', async () => {
+  const { mm, mk, find } = make({ HOSTS: [ENTRY, E2], MAX_PLAYERS: 2, START_MIN_PLAYERS: 3, START_COUNTDOWN_SECONDS: 30 });
+  const cs = ['a', 'b', 'c'].map(mk);
+  cs.forEach(find);
+  const l = listOf(mm);
+  assert(l[0].players === 2 && l[1].players === 1, JSON.stringify(l.map((x) => x.players)));
+  mm.shutdown();
+});
+
+test('pool: fullest open waiting lobby wins; listing keeps configured order and online', async () => {
+  const { mm, mk, find } = make({ HOSTS: [ENTRY, E2], START_MIN_PLAYERS: 5, START_COUNTDOWN_SECONDS: 30 });
+  const a = mk('a'), b = mk('b'), c = mk('c');
+  find(a);                        // idle tie: first lobby
+  mm.resetHosted(SID); mm.markHostPolled(SID);   // empty again
+  // put one player into lobby B directly by taking A offline
+  mm.resetHosted(SID);            // A offline
+  find(b);                        // -> B
+  mm.markHostPolled(SID);         // A back, empty
+  find(c);                        // fullest open = B (1 player) beats idle A
+  const l = listOf(mm);
+  assert(l[0].id === SID && l[1].id === SID2, 'order');
+  assert(l[1].players === 2 && l[0].players === 0 && l.every((x) => x.online), JSON.stringify(l.map((x) => [x.players, x.online])));
   mm.shutdown();
 });
 
