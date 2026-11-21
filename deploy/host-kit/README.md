@@ -13,6 +13,9 @@ ends or it hangs. It works on Windows 10/11 (PowerShell script) or on a Linux bo
 - Windows 10/11, or a Linux machine with Docker and Docker Compose.
 - A public IPv4 address you can forward a UDP port on (see Network).
 
+No BattlEye: the kit starts `SOS-Win64-Shipping.exe` directly, not the BattlEye launcher (`SOS_BE.exe`), and never installs,
+changes or removes anything of BattlEye. There is no anti-cheat on revival servers; abusive servers are removed by the admins.
+
 ## Resources per server
 
 Measured on our live hosts during matches: about 2 to 4 GB RAM and 1 to 2 CPU cores. Idle it is about 1 GB and little CPU.
