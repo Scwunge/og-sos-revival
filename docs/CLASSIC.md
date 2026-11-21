@@ -236,6 +236,13 @@ A listen server is started with `-SESSION_ID=<hyphenated guid> -SESSION_TOKEN=<s
 
 Unknown id gives 404, a wrong or missing token gives 401. Both matchmakers are searched (Classic first).
 
+**Public server list.** Every `HOSTS` entry (Classic and main) is listed by `GET /servers`, for a future in-game server browser.
+
+- `GET /servers` (no auth, `Access-Control-Allow-Origin: *`) returns `{"servers":[{id, game, name, region, online, players, minPlayers, maxPlayers, state, map, address, backend, lastSeenSec}]}`. `game` is `classic` or `main`; `state` is `waiting` (below the minimum), `countdown` or `started`; `players` counts seated players without the `hostIds`; `address` is `<PUBLIC_HOST or the entry's host>:<game port>`; `backend` is `OGSOS_PUBLIC_BACKEND` (IPv4:port) if set, else `<PUBLIC_HOST>:<listening port>`, else `null`. `online` is true when the game host's last authenticated `GET /api/session/<id>` poll (it polls every 5 s) was within 20 s; `lastSeenSec` is the age of that poll, `null` before the first one. No token is ever included.
+- `POST /api/session/<id>/announce` with `{"name":"...","region":"..."}` (both optional; same `Authorization: Token <sessionToken>` as `/start`) overrides the entry's `name` (max 48 chars, default "OG SOS server") and `region` (max 16) in memory and answers `{"result":true}`. Control characters are stripped; an empty name is ignored, an explicit empty region clears it. `tools/host_classic.js --name "..." --region EU` calls it at startup and every 60 s (so a backend restart gets the name back); failures are only warnings.
+- Federation (optional): `OGSOS_DIRECTORY='["203.0.113.5:7781"]'` (or `DIRECTORY` in `data/config.json`) makes `GET /servers` also fetch `http://<peer>/servers?local=1` (2 s timeout, cached 15 s, failures ignored) and append the peers' servers, skipping any whose `backend` equals ours. `?local=1` returns only this backend's own servers, so lists never recurse.
+- Tests: `tools/servers_test.js` (env in its header).
+
 With `HOSTS` configured, matchmade solo/duo players are **added to the host's fixed session** (id = `sessionId`, owner `system`, host/port from the entry) instead of a new session. Everyone who calls `find-session` at any time lands in that one session, and `GET /api/session/<id>` lists all of them plus `hostIds`. Custom matches (`create-session`) are unchanged. Only the first host is used for now.
 
 **Start gate (hosted sessions only).** A hosted session starts un-started (`session-started` is not sent yet):

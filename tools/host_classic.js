@@ -3,6 +3,7 @@
 //   node tools/host_classic.js [--public-host <IPv4>] [--port 7781] [--game-port 7777]
 //        [--min-players N] [--countdown S] [--steam-id <id64>] [--sos-host-dir <dir>]
 //        [--game "<Classic install folder>"] [--no-game-log] [--dry-run]
+//        [--name "<server name, max 48>"] [--region <text, max 16>]   (listed in the backend's GET /servers; re-sent every 60 s)
 //   node tools/host_classic.js --cleanup     remove installed files / restore Engine.ini after a crash
 //
 // Remote backend (server already running elsewhere, e.g. Docker, with a FIXED hosted session in its
@@ -125,7 +126,8 @@ function parseArgs(argv) {
   const valued = { '--public-host': 'publicHost', '--port': 'port', '--game-port': 'gamePort', '--min-players': 'minPlayers',
     '--countdown': 'countdown', '--steam-id': 'steamId', '--sos-host-dir': 'sosHostDir', '--game': 'game',
     '--win64': 'win64', '--engine-ini': 'engineIni', '--exe': 'exe',
-    '--backend': 'backend', '--session-id': 'sessionId', '--session-token': 'sessionToken', '--session-file': 'sessionFile' };
+    '--backend': 'backend', '--session-id': 'sessionId', '--session-token': 'sessionToken', '--session-file': 'sessionFile',
+    '--name': 'name', '--region': 'region' };
   const bool = { '--no-game-log': 'noGameLog', '--dry-run': 'dryRun', '--cleanup': 'cleanup', '--help': 'help' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -137,6 +139,8 @@ function parseArgs(argv) {
   const num = (k, lo, hi) => { if (o[k] !== undefined && !(Number.isInteger(+o[k]) && +o[k] >= lo && +o[k] <= hi)) throw new Error(`bad --${k}`); };
   num('port', 1, 65535); num('gamePort', 1, 65535); num('minPlayers', 1, 1000);
   if (o.countdown !== undefined && !(Number.isFinite(+o.countdown) && +o.countdown >= 0)) throw new Error('bad --countdown');
+  if (o.name !== undefined && (!o.name.trim() || o.name.length > 48)) throw new Error('--name must be 1 to 48 characters');
+  if (o.region !== undefined && o.region.length > 16) throw new Error('--region must be at most 16 characters');
   if (o.backend) {
     const m = o.backend.match(/^([^:]+):(\d+)$/);
     if (!m || !net.isIPv4(m[1]) || +m[2] < 1 || +m[2] > 65535) throw new Error('--backend must be <IPv4>:<port> (the client does no DNS)');
@@ -234,18 +238,41 @@ async function waitForServer(port, child, timeoutMs = 20000) {
 }
 
 // Request to the backend's session API; the host auth is 'Token <SESSION_TOKEN>'. Resolves {status, json}.
-function sessionApi(backend, method, session, suffix = '', timeoutMs = 5000) {
+function sessionApi(backend, method, session, suffix = '', timeoutMs = 5000, jsonBody = null) {
   const [host, port] = backend.split(':');
+  const payload = jsonBody === null ? null : Buffer.from(JSON.stringify(jsonBody));
   return new Promise((resolve, reject) => {
+    const headers = { Authorization: `Token ${session.sessionToken}`, 'Content-Length': payload ? payload.length : 0 };
+    if (payload) headers['Content-Type'] = 'application/json';
     const req = http.request({ host, port: Number(port), method, path: `/api/session/${encodeURIComponent(session.sessionId)}${suffix}`,
-      headers: { Authorization: `Token ${session.sessionToken}`, 'Content-Length': 0 }, timeout: timeoutMs }, (res) => {
+      headers, timeout: timeoutMs }, (res) => {
       let b = ''; res.on('data', (d) => { b += d; });
       res.on('end', () => { let json = null; try { json = JSON.parse(b); } catch { /* not json */ } resolve({ status: res.statusCode, json }); });
     });
     req.on('timeout', () => req.destroy(new Error('timed out')));
     req.on('error', (e) => reject(new Error(`${method} ${backend} session API: ${e.message}`)));
-    req.end();
+    req.end(payload || undefined);
   });
+}
+
+// Public server list: tell the backend this host's name/region (POST /announce) now and every intervalMs, so a
+// backend restart gets the name back. Failures are warnings only. Returns a stop function (null if nothing to announce).
+function announceBody(o) {
+  const b = {};
+  if (o.name !== undefined) b.name = o.name;
+  if (o.region !== undefined) b.region = o.region;
+  return Object.keys(b).length ? b : null;
+}
+function startAnnounce(cfg, session, o, log, intervalMs = 60000) {
+  const body = announceBody(o);
+  if (!body) return null;
+  const once = () => sessionApi(cfg.backend, 'POST', session, '/announce', 5000, body).then(
+    (r) => { if (r.status !== 200) log(`WARNING: announce to ${cfg.backend} failed: HTTP ${r.status}`); },
+    (e) => log(`WARNING: announce failed: ${e.message}`));
+  once();
+  const t = setInterval(once, intervalMs);
+  t.unref();
+  return () => clearInterval(t);
 }
 
 // Read-only checks of a remote backend: reachable, token accepted, host SteamID seated in the session.
@@ -378,6 +405,8 @@ function printPlan(cfg, o, session, jwt) {
     L(`1. REMOTE backend ${cfg.backend}: no local server is started`);
     L(`2. check GET http://${cfg.backend}/kv/live-rev.txt, then GET /api/session/<id> (Authorization: Token <redacted>); 'start' -> POST /api/session/<id>/start`);
   }
+  const ann = announceBody(o);
+  L(ann ? `   announce: POST http://${cfg.backend}/api/session/<id>/announce ${JSON.stringify(ann)} (Authorization: Token <redacted>), then every 60 s` : '   announce: none planned (pass --name / --region to list this server)');
   L(`3. launcher: ${process.execPath} ${launcherArgs(cfg, o).join(' ')}`);
   L(`4. install into Win64: version.dll, sos_host.ini [Host] ${Object.entries({ ...HOST_INI_KEYS, ...(o.noGameLog ? { GameLog: '0' } : {}) }).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   L(`   steam_appid.txt (${APP_ID}) ${fs.existsSync(path.join(cfg.win64, 'steam_appid.txt')) ? 'already present, left alone' : 'will be created'}`);
@@ -404,7 +433,7 @@ function printBanner(cfg, o) {
 
 async function main() {
   const o = parseArgs(process.argv.slice(2));
-  if (o.help) { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 12).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')); return 0; }
+  if (o.help) { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 13).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')); return 0; }
   const cfg = resolveConfig(o);
   const log = (m) => console.log(`[host_classic] ${m}`);
 
@@ -437,6 +466,7 @@ async function main() {
   if (cfg.remote) { await checkRemote(cfg, session); console.log(`[host_classic] remote backend ${cfg.backend} OK (token accepted, host SteamID seated)`); }
   else if (await probe(cfg.port)) throw new Error(`something already answers on port ${cfg.port}; pick another --port`);
 
+  let stopAnnounce = null;
   let server = null, host = null, shuttingDown = false, installed = false, appIdCreated = false, backedUp = false;
   let resolveDone; const done = new Promise((r) => { resolveDone = r; });
   let exitCode = 0;
@@ -445,6 +475,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true; exitCode = code;
     log(`stopping (${why})`);
+    if (stopAnnounce) stopAnnounce();
     for (const c of [host, server]) if (c && c.exitCode === null) { try { c.kill(); } catch { /* gone */ } }
     for (const c of [host, server]) if (c && c.exitCode === null) await Promise.race([new Promise((r) => c.once('exit', r)), sleep(5000)]);
     const left = await doCleanup(cfg, appIdCreated, log);
@@ -466,6 +497,7 @@ async function main() {
         if (l.trim().toLowerCase() !== 'start') return;
         sessionApi(cfg.backend, 'POST', session, '/start').then((r) => log(`start: HTTP ${r.status} ${JSON.stringify(r.json)}`), (e) => log(`start failed: ${e.message}`));
       });
+      stopAnnounce = startAnnounce(cfg, session, o, log);
     } else {
       const srv = buildServerSpawn(cfg, o, session);
       server = spawn(srv.cmd, srv.args, { cwd: srv.cwd, env: srv.env, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -474,6 +506,7 @@ async function main() {
       server.on('exit', (c) => { if (!shuttingDown) shutdown(`server exited (code ${c})`, 1); });
       await waitForServer(cfg.port, server);
       log(`backend answering on port ${cfg.port}`);
+      stopAnnounce = startAnnounce(cfg, session, o, log);
       // Forward typed lines (e.g. "start") to the backend.
       const rl = readline.createInterface({ input: process.stdin });
       rl.on('line', (l) => { if (server.exitCode === null) server.stdin.write(l + '\n'); });
@@ -498,7 +531,7 @@ async function main() {
   return exitCode;
 }
 
-module.exports = { parseVdf, mostRecentSteamId, setIniKeys, buildGameArgs, redactArgs, isOurFile, parseArgs, resolveRemoteSession, sessionFromJson, HOST_INI_KEYS, cleanupWin64, installFile };
+module.exports = { parseVdf, mostRecentSteamId, setIniKeys, buildGameArgs, redactArgs, isOurFile, parseArgs, resolveRemoteSession, sessionFromJson, announceBody, startAnnounce, sessionApi, HOST_INI_KEYS, cleanupWin64, installFile };
 
 if (require.main === module) {
   main().then((c) => process.exit(c), (e) => { console.error(`ERROR: ${e.message}`); process.exit(1); });

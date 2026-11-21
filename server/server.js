@@ -10,7 +10,8 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, DEFAULTS } = require('./matchmaking');
+const net = require('net');
+const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, DEFAULTS } = require('./matchmaking');
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -174,6 +175,88 @@ function appAccount() {
   };
 }
 
+// ---------- public server list (GET /servers) ----------
+const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+const isIpPort = (v) => { const m = String(v).match(/^([^:]+):(\d{1,5})$/); return !!m && net.isIPv4(m[1]) && +m[2] >= 1 && +m[2] <= 65535; };
+// PUBLIC_BACKEND / DIRECTORY: env OGSOS_<KEY> wins over data/config.json.
+let CONFIG_FILE = {};
+try { CONFIG_FILE = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'config.json'), 'utf8')); } catch { /* none or invalid: loadConfig warned */ }
+let PUBLIC_BACKEND_ENV = String(process.env.OGSOS_PUBLIC_BACKEND || CONFIG_FILE.PUBLIC_BACKEND || '');
+if (PUBLIC_BACKEND_ENV && !isIpPort(PUBLIC_BACKEND_ENV)) { console.warn(`OGSOS_PUBLIC_BACKEND ignored: "${PUBLIC_BACKEND_ENV}" is not <IPv4>:<port>`); PUBLIC_BACKEND_ENV = ''; }
+// Other backends whose lists are merged into ours (OGSOS_DIRECTORY = JSON array of "ip:port").
+const DIRECTORY = (() => {
+  const raw = process.env.OGSOS_DIRECTORY || CONFIG_FILE.DIRECTORY;
+  if (!raw) return [];
+  let a = raw;
+  if (typeof raw === 'string') { try { a = JSON.parse(raw); } catch (e) { console.warn(`OGSOS_DIRECTORY ignored: not valid JSON (${e.message})`); return []; } }
+  if (!Array.isArray(a)) { console.warn('OGSOS_DIRECTORY ignored: not an array'); return []; }
+  return a.map(String).filter((x) => { if (isIpPort(x)) return true; console.warn(`OGSOS_DIRECTORY entry "${x}" skipped: not <IPv4>:<port>`); return false; });
+})();
+const ourBackend = (publicHost) => PUBLIC_BACKEND_ENV || (publicHost ? `${publicHost}:${PORT}` : null);
+function localServers() {
+  const out = [];
+  for (const [game, m, cfg] of [['classic', mmClassic, CLASSIC_CONFIG], ['main', mm, CONFIG]]) {
+    for (const h of m.listHosted()) {
+      out.push({
+        id: h.id, game, name: h.name, region: h.region, online: h.online, players: h.players,
+        minPlayers: h.minPlayers, maxPlayers: h.maxPlayers, state: h.state, map: h.map,
+        address: `${h.publicHost || h.host}:${h.port}`, backend: ourBackend(cfg.PUBLIC_HOST), lastSeenSec: h.lastSeenSec,
+      });
+    }
+  }
+  return out;
+}
+// Peer lists: cached 15 s (failures too), 2 s timeout, always asked with ?local=1 so lists never recurse.
+const peerCache = new Map();   // "ip:port" -> { at, promise }
+function fetchPeer(addr) {
+  const hit = peerCache.get(addr);
+  if (hit && Date.now() - hit.at < 15000) return hit.promise;
+  const [host, port] = addr.split(':');
+  const promise = new Promise((resolve) => {
+    const r = http.get({ host, port: Number(port), path: '/servers?local=1', timeout: 2000 }, (res) => {
+      const chunks = []; let size = 0;
+      res.on('data', (d) => { size += d.length; if (size > 1 << 20) res.destroy(); else chunks.push(d); });
+      res.on('end', () => {
+        try { const j = JSON.parse(Buffer.concat(chunks).toString('utf8')); resolve(res.statusCode === 200 && Array.isArray(j.servers) ? j.servers : []); } catch { resolve([]); }
+      });
+      res.on('error', () => resolve([]));
+    });
+    r.on('timeout', () => r.destroy());
+    r.on('error', () => resolve([]));
+  });
+  peerCache.set(addr, { at: Date.now(), promise });
+  return promise;
+}
+// Whitelist the fields of a peer's entry, so nothing else (a token, say) is ever passed on.
+function cleanPeerServer(x) {
+  const o = obj(x);
+  const n = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  return {
+    id: String(o.id ?? '').slice(0, 64), game: o.game === 'main' ? 'main' : 'classic',
+    name: cleanLabel(o.name, 48), region: cleanLabel(o.region, 16), online: o.online === true,
+    players: n(o.players), minPlayers: n(o.minPlayers), maxPlayers: n(o.maxPlayers),
+    state: ['waiting', 'countdown', 'started'].includes(o.state) ? o.state : 'waiting', map: cleanLabel(o.map, 64),
+    address: cleanLabel(o.address, 64), backend: isIpPort(o.backend) ? String(o.backend) : null,
+    lastSeenSec: o.lastSeenSec === null || o.lastSeenSec === undefined ? null : n(o.lastSeenSec),
+  };
+}
+async function allServers(localOnly) {
+  const servers = localServers();
+  if (localOnly || !DIRECTORY.length) return servers;
+  const ours = new Set(servers.map((x) => x.backend).filter(Boolean));
+  const seen = new Set(servers.map((x) => `${x.backend}|${x.id}`));
+  for (const list of await Promise.all(DIRECTORY.map(fetchPeer))) {
+    for (const raw of list) {
+      const x = cleanPeerServer(raw);
+      if (!x.id || (x.backend && ours.has(x.backend))) continue;
+      const key = `${x.backend}|${x.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key); servers.push(x);
+    }
+  }
+  return servers;
+}
+
 // ---------- REST API ----------
 // Routes come from the paths baked into SOS-Win64-Shipping.exe.
 function handleApi(req, url, body, res) {
@@ -183,7 +266,7 @@ function handleApi(req, url, body, res) {
 
   // Routes the game host (a listen server) calls on its MMS, authorised by `Token <SESSION_TOKEN>`.
   // POST .../start and .../reset are for whoever runs the server (same token; or type `start` in the console).
-  if ((r = m(/^\/api\/session\/([^/]+?)(\/events|\/start|\/reset)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
+  if ((r = m(/^\/api\/session\/([^/]+?)(\/events|\/start|\/reset|\/announce)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
     const id = decodeURIComponent(r[1]);
     const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
     const found = owner.getHostedSession(id);
@@ -193,6 +276,12 @@ function handleApi(req, url, body, res) {
     const tokenOk = given.length === want.length && crypto.timingSafeEqual(given, want);
     // Token only, no loopback bypass: behind a tunnel (playit etc.) remote callers arrive as loopback.
     if (!tokenOk) return send(res, 401, { error: 'unauthorized' });
+    if (r[2] === '/announce') {
+      let j = {}; try { j = JSON.parse(body || '{}'); } catch {}
+      const now = owner.announceHosted(id, obj(j));
+      console.log(`announce for hosted session ${id}: "${now.name}" [${now.region}]`);
+      return send(res, 200, { result: true });
+    }
     if (r[2] === '/start') {
       const players = owner.forceStartHosted(id);
       console.log(`forced start of hosted session ${id} via HTTP (${players} player(s))`);
@@ -210,6 +299,7 @@ function handleApi(req, url, body, res) {
       log('ws.jsonl', { event: 'host-event', session: id, type: j.type, body });
       return send(res, 200, { result: true });
     }
+    owner.markHostPolled(id);   // an authenticated poll = the game host is alive (see GET /servers)
     return send(res, 200, found.session);
   }
 
@@ -289,6 +379,15 @@ function handleApi(req, url, body, res) {
 }
 
 // ---------- HTTP server ----------
+function serveServers(req, url, res) {
+  allServers(url.searchParams.get('local') === '1').catch(() => localServers()).then((servers) => {
+    const buf = Buffer.from(JSON.stringify({ servers }));
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length, 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+    res.end(buf);
+    log('http.jsonl', { method: 'GET', path: req.url, host: req.headers.host, status: 200, out: `<${servers.length} server(s)>`, handled: true });
+    console.log(`   GET ${req.url} -> 200 (${servers.length})`);
+  });
+}
 const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
@@ -299,6 +398,7 @@ const server = http.createServer((req, res) => {
     let handled = true;
     try {
       if (url.pathname.startsWith('/kv/')) result = handleKv(url.pathname.slice(4), res, req);
+      else if (url.pathname === '/servers' && req.method === 'GET') return serveServers(req, url, res);
       else result = handleApi(req, url, body, res);
       if (!result) {
         handled = false;

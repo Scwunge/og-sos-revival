@@ -15,10 +15,13 @@
     "START_COUNTDOWN_SECONDS": "Hosted sessions only: seconds between reaching START_MIN_PLAYERS and session-started (0 = at once). Default: 10",
     "TRAVEL_GRACE_SECONDS": "Hosted sessions only: seconds a seated player whose WebSocket closed keeps the seat (they disconnect while travelling to the host). Default: 300",
     "hosted-control": "Hosted sessions: POST /api/session/<id>/start force-starts, POST /api/session/<id>/reset clears players and the started flag (Authorization: Token <sessionToken>). Typing start + Enter in the server console force-starts all hosted sessions.",
+    "server-list": "GET /servers lists every HOSTS entry (public, no tokens). HOSTS entries take optional name (max 48, default OG SOS server) and region (max 16); the host can override them with POST /api/session/<id>/announce (tools/host_classic.js --name/--region). PUBLIC_BACKEND (env OGSOS_PUBLIC_BACKEND): this backend's public IPv4:port as shown in the list; default <PUBLIC_HOST>:<port>. DIRECTORY (env OGSOS_DIRECTORY, JSON array of ip:port strings): other backends whose lists are merged into GET /servers (2 s timeout, cached 15 s, no recursion).",
     "env": "Every key can also be set with an environment variable named OGSOS_<KEY>, e.g. OGSOS_GAME_SERVER_HOST. Env wins over this file. Keys starting with _ are ignored.",
     "classic": "SOS: Classic (app-id sostest) options. EXTRA_ROLES: roles added for every Classic login (everyone already gets app-user, user, testserver). DEV_ACCOUNTS: account ids or Steam ids that also get the dev role (Director button, server browser). Any matchmaking key above may be repeated here to override it for Classic only (e.g. GAME_SERVER_PORT for a Classic host); env OGSOS_CLASSIC_<KEY> also works. Classic live config is served from data/kv-classic/. HOSTS (Classic only here, or env OGSOS_CLASSIC_HOSTS as a JSON string): fixed game hosts, see docs/CLASSIC.md \"MMS session routes for a hosted server\"; with it set, matchmade players join the host's fixed session instead of a new one."
   },
   "REGION_NAME": "local",
+  "PUBLIC_BACKEND": "",
+  "DIRECTORY": [],
   "BEACON_URL": "",
   "GAME_SERVER_HOST": "127.0.0.1",
   "GAME_SERVER_PORT": 7777,
@@ -46,6 +49,8 @@
         "port": 7777,
         "sessionId": "00000000-0000-0000-0000-000000000000",
         "sessionToken": "CHANGE-ME-placeholder",
+        "name": "My OG SOS server",
+        "region": "EU",
         "hostIds": ["76561190000000000"]
       }
     ]

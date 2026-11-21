@@ -25,8 +25,14 @@ const DEFAULTS = {
   START_MIN_PLAYERS: 1,        // hosted sessions only: seated players needed before the start countdown begins
   START_COUNTDOWN_SECONDS: 10, // hosted sessions only: countdown before session-started is sent (0 = start at once)
   TRAVEL_GRACE_SECONDS: 300,   // hosted sessions only: a seated player whose WS closed keeps their seat this long
-  HOSTS: [],                   // fixed game hosts: [{host, port, sessionId, sessionToken, hostIds}], see docs/CLASSIC.md
+  HOSTS: [],                   // fixed game hosts: [{host, port, sessionId, sessionToken, hostIds, name?, region?}], see docs/CLASSIC.md
 };
+
+// Public server-list labels (name/region): a string without control characters, trimmed and cut to max.
+const DEFAULT_SERVER_NAME = 'OG SOS server';
+function cleanLabel(v, max) {
+  return typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim().slice(0, max) : '';
+}
 
 // Validate a HOSTS value (array or JSON string). Bad entries are warned about and skipped.
 function parseHosts(raw, warn = console.warn, defaultPort = 7777) {
@@ -48,6 +54,7 @@ function parseHosts(raw, warn = console.warn, defaultPort = 7777) {
     out.push({
       host: o.host, port, sessionId: o.sessionId, sessionToken: o.sessionToken,
       hostIds: Array.isArray(o.hostIds) ? o.hostIds.map(String).filter(Boolean) : [],
+      name: cleanLabel(o.name, 48) || DEFAULT_SERVER_NAME, region: cleanLabel(o.region, 16),
     });
   });
   return out;
@@ -225,6 +232,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     s.countdownTimer = null;
     hostedById.set(entry.sessionId, { s, entry });
   }
+  // Public server list data (GET /servers): label overrides from /announce and the time of the host's last poll.
+  const hostedMeta = new Map(hostEntries.map((e) => [e.sessionId, { name: e.name || DEFAULT_SERVER_NAME, region: e.region || '', lastPoll: null }]));
   const hostedSession = () => (hostEntries.length ? hostedById.get(hostEntries[0].sessionId).s : null);
 
   // For the host's own GET /api/session/<id>: the live session plus the host's configured player ids
@@ -235,6 +244,40 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     const session = sessionObj(h.s, true, true);
     for (const hid of h.entry.hostIds) session['player-map'][hid] ??= { uname: uname(hid), 'auto-group': false };
     return { session, token: h.entry.sessionToken };
+  }
+
+  // The host's authenticated GET /api/session/<id> poll (called by server.js after the token check).
+  function markHostPolled(id) {
+    const m = hostedMeta.get(String(id));
+    if (m) m.lastPoll = Date.now();
+    return !!m;
+  }
+  // POST /announce: override name and/or region in memory (invalid or empty values are ignored).
+  function announceHosted(id, { name, region } = {}) {
+    const m = hostedMeta.get(String(id));
+    if (!m) return null;
+    const n = cleanLabel(name, 48), r = cleanLabel(region, 16);
+    if (n) m.name = n;
+    if (typeof region === 'string') m.region = r;   // an explicit empty region clears it
+    return { name: m.name, region: m.region };
+  }
+  // Public view of every hosted session; never contains a token.
+  function listHosted() {
+    const now = Date.now();
+    return [...hostedById.values()].map(({ s, entry }) => {
+      const m = hostedMeta.get(entry.sessionId);
+      const last = m.lastPoll;
+      return {
+        id: entry.sessionId, name: m.name, region: m.region, host: entry.host, port: entry.port,
+        online: last !== null && now - last <= 20000,
+        lastSeenSec: last === null ? null : Math.floor((now - last) / 1000),
+        players: [...s.players.keys()].filter((pid) => !entry.hostIds.includes(pid)).length,
+        minPlayers: startMin, maxPlayers: config.MAX_PLAYERS,
+        state: s.started ? 'started' : s.countdownTimer ? 'countdown' : 'waiting',
+        map: s.opts.map || '',
+        publicHost,
+      };
+    });
   }
 
   function addPlayerToSession(s, c, groupId, notifyIds = s.players.keys()) {
@@ -662,7 +705,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, resetHosted, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
-module.exports = { parseHosts, pickPublicHost, makeSessionJwt, loadConfig, createMatchmaker, DEFAULTS };
+module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, loadConfig, createMatchmaker, DEFAULTS };
