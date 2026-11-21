@@ -127,8 +127,44 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Progression test (profile "prog"): its own backend on 7784 and one game host slot (pool dir 9) that talks only to
+  # it, so prod lobbies and the hero.tv test backend (7782/7783) are never touched.
+  #   docker compose --profile prog up -d backend-prog host-prog      (.env.prog and pool/host-prog.env, never committed)
+  backend-prog:
+    profiles: ["prog"]
+    image: ogsos-backend:prog-test
+    restart: "no"
+    env_file: .env.prog
+    ports:
+      - "${BIND_IP:-0.0.0.0}:7784:7781"
+    volumes:
+      - state-prog:/state
+      - logs-prog:/logs
+    mem_limit: 1g
+    cpus: 0.5
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+  host-prog:
+    <<: *classic-host
+    profiles: ["prog"]
+    restart: "no"
+    env_file: pool/host-prog.env
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${OGSOS_PROG_PORT:-7786}:7777/udp"
+    volumes:
+      - /srv/ogsos/pool/9/game:/game
+      - /srv/ogsos/pool/9/prefix:/home/ubuntu/prefix
+      - /srv/ogsos/pool/9/logs:/home/ubuntu/logs
+
 volumes:
   state:
   logs:
   state-test:
   logs-test:
+  state-prog:
+  logs-prog:

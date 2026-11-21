@@ -8,3 +8,4 @@ dist/
 deploy/classic-backend/host.env
 deploy/classic-backend/.env.test
 deploy/classic-backend/pool/*.env
+deploy/classic-backend/.env.prog
