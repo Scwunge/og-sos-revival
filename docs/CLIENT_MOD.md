@@ -59,7 +59,7 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 
 ## Steam DLC cosmetics (optional)
 
-`UnlockDlcCosmetics=1` in `sos_client.ini` (default on) hooks `IsEntitlementAvailable` (0x140166D90) and `IsDLCInstalled` (0x140166CD0) and makes both answer true, so every Steam-DLC-gated outfit, gesture and the name plate can be selected. Set it to 0 to turn it off. It only changes what the local client shows; it buys nothing and sends nothing to any server.
+`UnlockDlcCosmetics=1` in `sos_client.ini` (default OFF since 1.0.0: Nexus rules do not allow unlocking paid DLC) hooks `IsEntitlementAvailable` (0x140166D90) and `IsDLCInstalled` (0x140166CD0) and makes both answer true, so every Steam-DLC-gated outfit, gesture and the name plate can be selected. Set it to 0 to turn it off. It only changes what the local client shows; it buys nothing and sends nothing to any server.
 
 - Verified (with it on): the Founder's Pack T-Shirts row is listed and a gold shirt equips and renders on the character: `docs/client-mod-dlc-founders-listed.png`, `docs/client-mod-dlc-founders-equipped.png`.
 - Not checked in the game: the gestures and the name plate.

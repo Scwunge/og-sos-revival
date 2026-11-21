@@ -1,0 +1,37 @@
+[size=5][b]OG SOS Revival - SOS: Classic community client mod[/b][/size]
+
+SOS: Classic's own servers are gone. This mod points the game at the community relaunch servers (sos.joltora.com) so you can log in and play again, and adds an in-game server list.
+
+[b]Requires:[/b] SOS: Classic on Steam (you must own the game). This mod contains no game files.
+
+[size=4][b]Features[/b][/size]
+[list]
+[*][b]SERVERS button[/b] on the main menu: a live list of community servers. Click one to join; the mod queues the match for you.
+[*][b]Vote to start[/b] a match from the list.
+[*][b]Report a player[/b] with a reason and an optional clip link (goes to the community moderators).
+[*][b]Relaunch announcement[/b] in place of the old shutdown notice. Text and colours are editable in the ini.
+[*]"OG SOS Revival" build label instead of the old test label.
+[*]Unreleased Ronin outfit parts and one beard selectable in character customisation.
+[*]Optional: borderless window, console variables (frame cap, screen percentage and more), all in [i]sos_client.ini[/i].
+[*][b]Signed self-update[/b]: new versions are checked once per start and installed on the next launch. Updates must carry the author's Ed25519 signature and cannot be older than what you have; the previous version is kept for rollback. Turn it off with [i]AutoUpdate=0[/i].
+[/list]
+
+[size=4][b]Install[/b][/size]
+[list=1]
+[*]In Steam: right-click SOS: Classic, Manage, Browse local files, open [i]SOS\Binaries\Win64[/i].
+[*]Copy the five files from the archive into that folder (xinput1_3.dll, sos_client_core.dll, sos_client_core.manifest, sos_client_core.sig, sos_client.ini).
+[*]Start the game from Steam. On the main menu press START, then SERVERS.
+[/list]
+
+[size=4][b]Uninstall[/b][/size]
+Delete [i]xinput1_3.dll[/i] and every file starting with [i]sos_client[/i] from that folder.
+
+[size=4][b]Notes[/b][/size]
+[list]
+[*]The mod is a replacement [i]xinput1_3.dll[/i] that the game loads from its own folder (it forwards controller input to Windows). Some antivirus tools flag unknown DLLs; nothing else is modified.
+[*]It only talks to sos.joltora.com. Steam DLC items are [b]not[/b] unlocked.
+[*]Logs: [i]sos_client.log[/i] in the same folder. Please attach it to bug reports.
+[*]Not affiliated with the original developers or publisher of SOS.
+[/list]
+
+Made by Scwunge and the OG SOS Revival team.

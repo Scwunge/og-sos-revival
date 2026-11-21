@@ -111,7 +111,7 @@ static struct {
     int borderless;              /* 1: windowed game becomes a borderless window covering its monitor */
     int unlock_dlc;              /* 1: report every Steam DLC / entitlement check as owned (cosmetics only) */
     int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
-} cfg = { 1, 0, 0, 1, 1, 0, 0, 1, 1 };
+} cfg = { 1, 0, 0, 1, 1, 0, 0, 0, 1 };
 
 static struct { wchar_t name[64], val[48]; } g_cv[32];   /* [Cvars] section of the ini */
 static int g_ncv;
@@ -258,7 +258,7 @@ static void load_config(HMODULE self)
     }
     GetPrivateProfileStringW(L"Client", L"DumpObjects", L"", g_dump_pat, 64, g_ini);
     cfg.borderless         = GetPrivateProfileIntW(L"Client", L"Borderless", 0, g_ini);
-    cfg.unlock_dlc         = GetPrivateProfileIntW(L"Client", L"UnlockDlcCosmetics", 1, g_ini);
+    cfg.unlock_dlc         = GetPrivateProfileIntW(L"Client", L"UnlockDlcCosmetics", 0, g_ini);
     cfg.unlock_unreleased  = GetPrivateProfileIntW(L"Client", L"UnlockUnreleasedCosmetics", 1, g_ini);
 
     wchar_t be[256];
