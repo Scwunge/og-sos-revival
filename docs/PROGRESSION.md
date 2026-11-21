@@ -256,3 +256,14 @@ Cannot work / not available:
 - **Fame hook point**: `fameHooks` in `server/server.js` (null by default). The hero.tv work sets it to its `createFame(...)` instance; then `applyToBlob` runs on blob GET/POST, `isFameBoard`/`fameLeaderboard`/`fameAround` answer fame board GETs (falling back to the host-posted scores when they return `[]`), and `fameForMatch(sessionId)` is stored with each match.
 - Tests: `node tools/progression_test.js` (unit), `tools/progression_live_test.js` (end to end over HTTP, test backends only: its match-end ends the lobby).
 
+
+### 7.1 Per-match stats from blob diffs (fallback when the DLL list is empty)
+
+On every host blob POST, `server/progression.js` diffs the new blob against the stored one and records the positive
+deltas as that player's entry (`source: "blob"`) in the session's current match record (the session's latest match if it
+ended within 60 s, else a new `blob:<session>:<ts>` record). Fields: `xp` (from level + levelProgress, inferred curve),
+`escaped`, `relics`, `fameWins`, `alliances`, `feedback{shock,laughter,applause,love,anger}`, `badges`, `level`.
+The blob has no kill, death or damage counters; those only come from the DLL's `match-end` list. When a DLL list
+arrives for the same session it wins: its entries replace the blob ones (totals undone first), deduped by matchId plus
+player; blob-only players stay. `GET /api/stats/player/<id>` also returns `lifetime` (level, xp, games, escapes, relics,
+fameWins) read from the stored blob.

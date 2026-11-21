@@ -44,7 +44,9 @@ function createProgression(opts = {}) {
   function handleAppData(method, accountId, appId, bodyText, token) {
     if (appId !== APP_ID) return null;
     if (!ID_RE.test(String(accountId))) return reply(400, { error: 'bad account id' });
-    const isHost = !!isHostToken(token);
+    const hostRes = isHostToken(token);   // true, or the lobby's sessionId (string) when the token is a host's
+    const isHost = !!hostRes;
+    const hostSession = typeof hostRes === 'string' ? hostRes : null;
     const acct = isHost ? null : jwtAccount(token);
     const unauthorized = reply(401, { version: 1, data: { error: 'unauthorized' } });
     const key = `${accountId}/${appId}`;
@@ -76,6 +78,10 @@ function createProgression(opts = {}) {
     data = applyFame(accountId, data);
     const newVersion = version + 1;
     db.appData[key] = { version: newVersion, data };
+    // Fallback per-player match stats from the game's own lifetime counters (the DLL's list may be empty).
+    if (isHost && hostSession) {
+      try { recordBlobDelta(hostSession, String(accountId), stored, data); } catch { /* never break a save */ }
+    }
     save();
     return reply(200, { version: newVersion, data });
   }
@@ -149,6 +155,132 @@ function createProgression(opts = {}) {
     return reply(200, sorted.slice(from, idx + n + 1).map(([m, s], i) => rowOf(m, s, from + i)));
   }
 
+  // ---- per-match stats derived from blob diffs (fallback when the DLL's player list is empty) ----
+  // The host saves each player's whole blob at match end. The blob holds lifetime counters (games, escapes, relics,
+  // fame wins, alliances, feedback received, badges) and level/progress; the difference to the stored previous blob
+  // is what that player did in the match. There are no kill/damage counters in the blob; those come only from the DLL.
+  const XP_KEYS = [[1, 500], [3, 1900], [6, 3400], [10, 5000], [20, 7000]];   // XP per level, docs/PROGRESSION.md [C]
+  const xpCost = (l) => {
+    if (l <= XP_KEYS[0][0]) return XP_KEYS[0][1];
+    for (let i = 1; i < XP_KEYS.length; i++) {
+      const [x1, y1] = XP_KEYS[i];
+      if (l <= x1) { const [x0, y0] = XP_KEYS[i - 1]; return y0 + ((y1 - y0) * (l - x0)) / (x1 - x0); }
+    }
+    return XP_KEYS[XP_KEYS.length - 1][1];   // above level 20: assumed constant [I]
+  };
+  const xpTotal = (prog) => {
+    const level = Math.min(200, Math.max(1, Math.floor(Number(prog && prog.level) || 1)));
+    const frac = Math.min(1, Math.max(0, Number(prog && prog.levelProgress) || 0));
+    let t = 0;
+    for (let l = 1; l < level; l++) t += Math.round(xpCost(l));
+    return t + frac * Math.round(xpCost(level));
+  };
+  const numLeaves = (o, prefix, out) => {
+    if (!isObj(o)) return out;
+    for (const [k, v] of Object.entries(o)) {
+      if (typeof v === 'number' && Number.isFinite(v)) out[`${prefix}${k}`] = v;
+      else if (isObj(v)) numLeaves(v, `${prefix}${k}.`, out);
+    }
+    return out;
+  };
+  const posDelta = (a, b) => {
+    const out = {};
+    for (const [k, v] of Object.entries(b)) { const d = v - (a[k] || 0); if (d > 0) out[k] = d; }
+    return out;
+  };
+  const FEEDBACK = { shock: 'totalShockFeedbackReceived', laughter: 'totalLaughterFeedbackReceived', applause: 'totalApplauseFeedbackReceived', love: 'totalLoveFeedbackReceived', anger: 'totalAngerFeedbackReceived' };
+
+  // -> null when nothing the match could have caused changed, else a cleaned entry (source 'blob').
+  function blobDelta(oldData, newData) {
+    const oS = numLeaves(oldData && oldData.stats, 'stats.', {}), nS = numLeaves(newData && newData.stats, 'stats.', {});
+    const sd = posDelta(oS, nS);
+    const bd = posDelta(numLeaves(oldData && oldData.badges, '', {}), numLeaves(newData && newData.badges, '', {}));
+    const xp = Math.round(xpTotal(newData && newData.progression) - xpTotal(oldData && oldData.progression));
+    const games = sd['stats.objectives.classic.totalGamesPlayed'] || 0;
+    if (!Object.keys(sd).length && !Object.keys(bd).length && xp <= 0) return null;
+    const e = { source: 'blob' };
+    if (xp > 0) e.xp = Math.min(xp, 1e6);
+    if (games > 0 || sd['stats.objectives.classic.totalEscapes']) e.escaped = (sd['stats.objectives.classic.totalEscapes'] || 0) > 0;
+    const relics = clampInt(sd['stats.objectives.classic.totalRelicsRetrieved'], 0, 200);
+    if (relics) e.relics = relics;
+    if (sd['stats.social.totalFameWins']) e.fameWins = clampInt(sd['stats.social.totalFameWins'], 0, 50);
+    if (sd['stats.social.totalAlliancesFormed']) e.alliances = clampInt(sd['stats.social.totalAlliancesFormed'], 0, 50);
+    const fb = {};
+    for (const [name, k] of Object.entries(FEEDBACK)) { const d = sd[`stats.hero.${k}`]; if (d) fb[name] = clampInt(d, 0, 1e6); }
+    if (Object.keys(fb).length) e.feedback = fb;
+    const badges = {};
+    for (const [k, d] of Object.entries(bd).slice(0, 20)) badges[k] = clampInt(d, 0, 1e6);
+    if (Object.keys(badges).length) e.badges = badges;
+    const lv = newData && newData.progression && newData.progression.level;
+    if (Number.isFinite(lv)) e.level = Math.min(200, Math.max(1, Math.floor(lv)));
+    return e;
+  }
+
+  const BLOB_MATCH_WINDOW_MS = 60 * 1000;
+  const ensureStats = (id) => {
+    db.playerStats = db.playerStats || {};
+    return db.playerStats[id] || (db.playerStats[id] = { matches: 0, escapes: 0, kills: 0, deaths: 0, damageDealt: 0, relics: 0, totalSurvivalSec: 0 });
+  };
+
+  function recordBlobDelta(sessionId, playerId, oldData, newData) {
+    if (!/^\d{17}$/.test(playerId)) return;
+    const d = blobDelta(oldData, newData);
+    if (!d) return;
+    const t = now();
+    db.matches = Array.isArray(db.matches) ? db.matches : [];
+    // The match this save belongs to: the session's latest match, if it ended just now (the DLL's match-end comes
+    // first, then the host saves each player), else a new record that a later DLL match-end can still adopt.
+    let match = null;
+    for (let i = db.matches.length - 1; i >= 0 && !match; i--) {
+      const m = db.matches[i];
+      if (m.sessionId === sessionId && t - Date.parse(m.endedAt) <= BLOB_MATCH_WINDOW_MS) match = m;
+    }
+    if (!match) {
+      match = { id: `blob:${sessionId}:${t}`.slice(0, 64), sessionId, endedAt: new Date(t).toISOString(), reason: 'blob', players: [], source: 'blob' };
+      db.matches.push(match);
+      while (db.matches.length > MAX_MATCHES) db.matches.shift();
+    }
+    const ex = match.players.find((p) => p.playerId === playerId);
+    if (ex && ex.source !== 'blob') {
+      // The DLL's own entry wins; the blob only adds what the DLL does not send.
+      for (const [k, v] of Object.entries(d)) if (k !== 'source' && ex[k] === undefined) ex[k] = v;
+      return;
+    }
+    const name = displayName(playerId);
+    if (ex) {   // a second save of the same player in the same match: add up
+      for (const [k, v] of Object.entries(d)) {
+        if (k === 'escaped') ex.escaped = ex.escaped || v;
+        else if (typeof v === 'number' && k !== 'level') ex[k] = (ex[k] || 0) + v;
+        else if (isObj(v)) { ex[k] = ex[k] || {}; for (const [k2, v2] of Object.entries(v)) ex[k][k2] = (ex[k][k2] || 0) + v2; }
+        else ex[k] = v;
+      }
+      applyBlobTotals(ex, d, playerId, match, false);
+      return;
+    }
+    const entry = { playerId, ...(name && name !== playerId ? { name: [...name].slice(0, 32).join('') } : {}), ...d };
+    match.players.push(entry);
+    applyBlobTotals(entry, d, playerId, match, true);
+  }
+
+  // Lifetime totals for a blob-derived entry; remembered in entry.totalsApplied so a DLL entry that replaces it later can undo them.
+  function applyBlobTotals(entry, d, playerId, match, first) {
+    const s = ensureStats(playerId);
+    const ta = entry.totalsApplied || (entry.totalsApplied = { matches: 0, escapes: 0, relics: 0 });
+    if (first) { s.matches += 1; ta.matches += 1; }
+    if (d.escaped === true && ta.escapes === 0) { s.escapes += 1; ta.escapes += 1; }
+    if (d.relics) { s.relics += d.relics; ta.relics += d.relics; }
+    s.lastMatchAt = match.endedAt;
+    s.lastMatchId = match.id;
+  }
+  function undoBlobTotals(entry, playerId) {
+    const ta = entry && entry.totalsApplied;
+    const s = db.playerStats && db.playerStats[playerId];
+    if (!ta || !s) return;
+    s.matches = Math.max(0, s.matches - ta.matches);
+    s.escapes = Math.max(0, s.escapes - ta.escapes);
+    s.relics = Math.max(0, s.relics - ta.relics);
+  }
+
   // ---- matches ----
   function cleanPlayer(p) {
     if (!isObj(p) || typeof p.playerId !== 'string' || !/^\d{17}$/.test(p.playerId)) return null;
@@ -176,6 +308,13 @@ function createProgression(opts = {}) {
     else matchId = `${sessionId}:${t}`.slice(0, 64);
     db.matches = Array.isArray(db.matches) ? db.matches : [];
     if (db.matches.some((m) => m.id === matchId)) return { accepted: 0, duplicate: true, matchId };
+    // A record the blob fallback made for this session just before (the host saved first): the DLL's list replaces
+    // its entries (and their totals), the blob-only players stay.
+    let adopt = null;
+    for (let i = db.matches.length - 1; i >= 0 && !adopt; i--) {
+      const m = db.matches[i];
+      if (m.sessionId === sessionId && m.source === 'blob' && String(m.id).startsWith('blob:') && t - Date.parse(m.endedAt) <= 2 * BLOB_MATCH_WINDOW_MS) adopt = m;
+    }
 
     const seated = seatedIds && (seatedIds.size ?? seatedIds.length) ? new Set(seatedIds) : null;
     const players = [];
@@ -185,18 +324,32 @@ function createProgression(opts = {}) {
       players.push(p);
     }
     const endedAt = new Date(t).toISOString();
-    const match = {
+    const fields = {
       id: matchId,
       sessionId,
       endedAt,
       startedAt: typeof pl.startedAt === 'string' ? pl.startedAt.slice(0, 40) : undefined,
       reason: typeof pl.reason === 'string' ? pl.reason.slice(0, 32) : undefined,
       durationSec: clampNum(pl.durationSec, 0, 14400),
-      players,
       fame: fameCall('fameForMatch', sessionId) ?? undefined,
     };
-    db.matches.push(match);
-    while (db.matches.length > MAX_MATCHES) db.matches.shift();
+    let match;
+    if (adopt) {
+      const keep = [];
+      for (const e of adopt.players) {
+        const dll = players.find((p) => p.playerId === e.playerId);
+        if (dll) {
+          undoBlobTotals(e, e.playerId);
+          for (const [k, v] of Object.entries(e)) if (!['source', 'totalsApplied', 'name', 'escaped', 'relics'].includes(k) && dll[k] === undefined) dll[k] = v;
+        } else keep.push(e);
+      }
+      match = Object.assign(adopt, fields, { players: [...players, ...keep] });
+      delete match.source;
+    } else {
+      match = { ...fields, players };
+      db.matches.push(match);
+      while (db.matches.length > MAX_MATCHES) db.matches.shift();
+    }
 
     db.playerStats = db.playerStats || {};
     for (const p of players) {
@@ -219,13 +372,28 @@ function createProgression(opts = {}) {
   }
 
   const playerStats = (accountId) => (db.playerStats && db.playerStats[accountId]) || null;
+  // Totals from match records plus the game's own lifetime counters from the player's blob (level, escapes, ...).
+  function playerSummary(accountId) {
+    const out = { ...(playerStats(accountId) || {}) };
+    const b = db.appData && db.appData[`${accountId}/${APP_ID}`];
+    const d = b && isObj(b.data) ? b.data : null;
+    if (d) {
+      const c = (d.stats && d.stats.objectives && d.stats.objectives.classic) || {};
+      out.lifetime = {
+        level: d.progression && d.progression.level, levelProgress: d.progression && d.progression.levelProgress,
+        xp: Math.round(xpTotal(d.progression)), games: c.totalGamesPlayed, escapes: c.totalEscapes, relics: c.totalRelicsRetrieved,
+        fameWins: d.stats && d.stats.social && d.stats.social.totalFameWins,
+      };
+    }
+    return out;
+  }
   const recentMatches = (limit = 20) => {
     const n = Math.min(100, Math.max(1, Math.round(Number(limit)) || 20));
     return (db.matches || []).slice(-n).reverse();
   };
   const matchById = (id) => (db.matches || []).find((m) => m.id === id) || null;
 
-  return { handleAppData, handleLeaderboard, recordMatchEnd, playerStats, recentMatches, matchById };
+  return { handleAppData, handleLeaderboard, recordMatchEnd, playerStats, playerSummary, recentMatches, matchById };
 }
 
 module.exports = { createProgression };

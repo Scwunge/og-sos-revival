@@ -460,7 +460,7 @@ function handleApi(req, url, body, res) {
   if (p.startsWith('/api/leaderboard/')) return send(res, 200, []);
   // Match stats from our host DLL's match-end (public, read-only).
   if (req.method === 'GET' && (r = m(/^\/api\/stats\/player\/([^/]+)$/))) {
-    return send(res, 200, progression.playerStats(decodeURIComponent(r[1])) || {});
+    return send(res, 200, progression.playerSummary(decodeURIComponent(r[1])) || {});
   }
   if (req.method === 'GET' && p === '/api/stats/matches') return send(res, 200, progression.recentMatches(Number(url.searchParams.get('limit')) || 20));
   if (p.startsWith('/api/search/account')) return send(res, 200, wrap(Object.values(db.accounts)));
@@ -563,7 +563,7 @@ function isHostToken(tok) {
   for (const owner of [mmClassic, mm]) {
     for (const h of owner.listHosted()) {
       const want = Buffer.from(owner.getHostedSession(h.id)?.token || '');
-      if (want.length && given.length === want.length && crypto.timingSafeEqual(given, want)) return true;
+      if (want.length && given.length === want.length && crypto.timingSafeEqual(given, want)) return h.id;   // truthy: the lobby's session id
     }
   }
   return false;

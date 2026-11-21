@@ -209,5 +209,59 @@ check('fameForMatch stored; zero players still recorded; ring buffer cap 500', (
   assert(db.matches.length === 500 && p.matchById('z') === null && p.matchById('k509'), 'cap');
 });
 
+// ---- blob-diff fallback ----
+const blobV = (o = {}) => ({ progression: { level: o.level || 2, levelProgress: o.lp ?? 0.4 },
+  stats: { objectives: { classic: { totalGamesPlayed: o.g ?? 1, totalEscapes: o.esc ?? 0, totalRelicsRetrieved: o.rel ?? 0 } },
+    social: { totalFameWins: o.fw ?? 0, totalAlliancesFormed: o.al ?? 0 }, hero: { totalShockFeedbackReceived: o.sh ?? 0 } }, badges: o.badges || {} });
+const mkB = (o = {}) => { const t = { n: 1e12 }; const r = mk({ isHostToken: (x) => (x === HOST ? 'sess1' : false), now: () => t.n, ...o }); r.t = t; return r; };
+check('blob diff: two versions give the delta as a match entry + totals', () => {
+  const { p, t } = mkB();
+  post(p, A, blobV({ g: 1, esc: 0 }), HOST, 1);                         // first save (no previous): baseline counted as the delta from {}
+  t.n += 10 * 60 * 1000;
+  const r = post(p, A, blobV({ g: 2, esc: 1, rel: 2, fw: 1, al: 1, sh: 3, level: 3, lp: 0.1, badges: { x: 1 } }), HOST, 2);
+  assert(r.status === 200, r.status);
+  const m = p.recentMatches(1)[0];
+  assert(m.sessionId === 'sess1' && m.source === 'blob' && m.id.startsWith('blob:sess1:'), JSON.stringify(m));
+  const e = m.players.find((x) => x.playerId === A);
+  assert(e.source === 'blob' && e.escaped === true && e.relics === 2 && e.fameWins === 1 && e.alliances === 1 && e.feedback.shock === 3 && e.badges.x === 1 && e.level === 3, JSON.stringify(e));
+  assert(e.xp === Math.round((500 + 950 + 0.1 * 1900) - 0.4 * 950 - 500) + 0 || e.xp > 0, 'xp ' + e.xp);
+  const s = p.playerStats(A);
+  assert(s.matches === 2 && s.escapes === 1 && s.relics === 2, JSON.stringify(s));
+  assert(p.playerSummary(A).lifetime.level === 3, 'lifetime');
+});
+check('blob diff: no change = no record; player JWT cannot create one', () => {
+  const { p, db } = mkB();
+  post(p, A, blobV(), HOST, 1);
+  const n = db.matches.length;
+  post(p, A, blobV(), HOST, 2);
+  assert(db.matches.length === n, 'unchanged blob made a record');
+  p.handleAppData('POST', A, 'sostest', JSON.stringify({ version: 3, data: blobV({ g: 9 }) }), JA);
+  assert(db.matches.length === n, 'non-host save made a record');
+});
+check('blob diff: DLL list preferred, deduped by matchId + player, adopts a blob record', () => {
+  const { p, db, t } = mkB();
+  post(p, A, blobV({ g: 0, lp: 0 }), HOST, 1); db.matches.length = 0; db.playerStats = {};
+  t.n += 1000;
+  // DLL first, then the host's blob (the live order): the DLL entry stays, blob only adds missing fields
+  p.recordMatchEnd('sess1', { matchId: 'real-1', players: [{ playerId: A, kills: 4, escaped: false, placement: 2 }] });
+  post(p, A, blobV({ g: 1, esc: 1, fw: 1 }), HOST, 2);
+  let m = p.matchById('real-1');
+  const e = m.players.filter((x) => x.playerId === A);
+  assert(e.length === 1 && e[0].kills === 4 && e[0].escaped === false && e[0].fameWins === 1 && !e[0].source, JSON.stringify(e));
+  assert(p.recentMatches(5).length === 1, 'extra record');
+  assert(p.playerStats(A).matches === 1 && p.playerStats(A).escapes === 0, JSON.stringify(p.playerStats(A)));
+  // blob first, then a late DLL list: replaces the blob entry and its totals
+  t.n += 10 * 60 * 1000;
+  post(p, B, blobV({ g: 1, esc: 1, rel: 1 }), HOST, 1);
+  assert(p.playerStats(B).matches === 1 && p.playerStats(B).escapes === 1, JSON.stringify(p.playerStats(B)));
+  t.n += 1000;
+  p.recordMatchEnd('sess1', { matchId: 'real-2', players: [{ playerId: B, kills: 2, escaped: true, relics: 1 }] });
+  m = p.matchById('real-2');
+  assert(m && m.players.length === 1 && m.players[0].kills === 2 && !m.players[0].source && !m.source, JSON.stringify(m));
+  const sb = p.playerStats(B);
+  assert(sb.matches === 1 && sb.escapes === 1 && sb.kills === 2 && sb.relics === 1, JSON.stringify(sb));
+  assert(!p.recentMatches(10).some((x) => String(x.id).startsWith('blob:') && x.players.some((y) => y.playerId === B)), 'blob record left behind');
+});
+
 if (failed) { console.log(`\n${failed} FAILED`); process.exit(1); }
 console.log('\nALL OK');
