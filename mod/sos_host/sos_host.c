@@ -939,7 +939,14 @@ static struct {
     float first_pawn, last_alive;   /* world seconds; 0 = never */
     int had_pawn, deaths, connected, escaped;
     unsigned seen;
+    /* Last stats read from the PlayerState, kept for when the player has left
+       (the PlayerState is gone by the time the match ends). */
+    int sn_native, sn_score_ok;
+    int sn_kills, sn_npc_kills, sn_deaths, sn_dealt, sn_dealt_npc, sn_taken, sn_taken_npc, sn_healed, sn_team, sn_score;
+    char sn_props[512];
+    float sn_time;
 } g_pl[MAX_TRACKED];
+static void snapshot_player(int slot, float now, int force);
 static float g_match_first_pawn;
 static char g_match_id[40], g_started_at[40];   /* set when the first joiner gets a pawn */
 
@@ -963,6 +970,12 @@ static void track_player(uint8_t *pc, float now, unsigned pass)
     int slot = -1;
     for (int i = 0; i < MAX_TRACKED; i++)
         if (g_pl[i].pc == pc) { slot = i; break; }
+    if (slot >= 0 && !g_pl[slot].connected && g_pl[slot].seen) {
+        /* A new connection reusing a departed player's controller address. */
+        slot = -1;
+        for (int i = 0; i < MAX_TRACKED; i++)
+            if (g_pl[i].pc == pc) g_pl[i].pc = (uint8_t *)(uintptr_t)1;   /* keep its record, release the address */
+    }
     if (slot < 0)
         for (int i = 0; i < MAX_TRACKED; i++)
             if (!g_pl[i].pc) { slot = i; g_pl[i].pc = pc; break; }
@@ -988,6 +1001,7 @@ static void track_player(uint8_t *pc, float now, unsigned pass)
     g_pl[slot].had_pawn = alive;
     g_pl[slot].connected = 1;
     g_pl[slot].seen = pass;
+    snapshot_player(slot, now, 0);
 }
 
 /* After a pass: joiners not seen in it have left. */
@@ -1078,7 +1092,7 @@ static EscapedFn o_escaped;
 static void h_escaped(uint8_t *ch)
 {
     for (int i = 0; ch && i < MAX_TRACKED; i++)
-        if (g_pl[i].pc && *(uint8_t **)(g_pl[i].pc + PC_PAWN) == ch) {
+        if (g_pl[i].pc && g_pl[i].connected && *(uint8_t **)(g_pl[i].pc + PC_PAWN) == ch) {
             g_pl[i].escaped = 1;
             post_player_event("escape", i, -1);
             break;
@@ -1138,13 +1152,36 @@ static int better_than(int a, int b, float now)
     return g_pl[a].last_alive > g_pl[b].last_alive + 0.5f;
 }
 
+/* Copy the live PlayerState's stats into the slot's snapshot (about once a second). */
+static void snapshot_player(int slot, float now, int force)
+{
+    uint8_t *ps = g_pl[slot].connected || force ? g_pl[slot].ps : NULL;
+    if (!ps || !(class_flags(ps) & CLS_SHOOTERPS)) return;
+    if (!force && g_pl[slot].sn_time && now - g_pl[slot].sn_time < 1.0f) return;
+    g_pl[slot].sn_time = now > 0 ? now : 0.001f;
+    g_pl[slot].sn_native = 1;
+    g_pl[slot].sn_kills = *(int32_t *)(ps + SPS_PLAYER_KILLS);
+    g_pl[slot].sn_npc_kills = *(int32_t *)(ps + SPS_NPC_KILLS);
+    g_pl[slot].sn_deaths = *(int32_t *)(ps + SPS_DEATHS);
+    g_pl[slot].sn_dealt = *(int32_t *)(ps + SPS_DMG_DEALT_PL);
+    g_pl[slot].sn_dealt_npc = *(int32_t *)(ps + SPS_DMG_DEALT_NPC);
+    g_pl[slot].sn_taken = *(int32_t *)(ps + SPS_DMG_TAKEN_PL);
+    g_pl[slot].sn_taken_npc = *(int32_t *)(ps + SPS_DMG_TAKEN_NPC);
+    g_pl[slot].sn_healed = *(int32_t *)(ps + SPS_DMG_HEALED);
+    g_pl[slot].sn_team = *(int32_t *)(ps + SPS_TEAM);
+    g_pl[slot].sn_score_ok = ps_int_prop(ps, L"TotalScore", &g_pl[slot].sn_score);
+    if (ps_escaped(ps) == 1) g_pl[slot].escaped = 1;
+    g_pl[slot].sn_props[0] = 0;
+    stat_props_json(ps, g_pl[slot].sn_props, sizeof g_pl[slot].sn_props);
+}
+
 /* JSON body of the match-end event, with one entry per joiner seen this match. */
 static void build_match_end_json(char *out, size_t cap, float now)
 {
     /* Escaped flags from the PlayerStates (the escape hook may have set them already). */
     for (int i = 0; i < MAX_TRACKED; i++)
-        if (g_pl[i].pc && g_pl[i].connected && g_pl[i].ps && ps_escaped(g_pl[i].ps) == 1)
-            g_pl[i].escaped = 1;
+        if (g_pl[i].pc && g_pl[i].connected && g_pl[i].ps)
+            snapshot_player(i, now, 1);
     size_t o = (size_t)snprintf(out, cap, "{\"type\":\"match-end\",\"reason\":\"postgame\"");
     if (g_match_id[0])
         o += snprintf(out + o, cap - o, ",\"matchId\":\"%s\",\"startedAt\":\"%s\"", g_match_id, g_started_at);
@@ -1155,10 +1192,9 @@ static void build_match_end_json(char *out, size_t cap, float now)
     for (int i = 0; i < MAX_TRACKED && o + 512 < cap; i++) {
         if (!g_pl[i].pc || !g_pl[i].id[0]) continue;
         int alive = g_pl[i].had_pawn && g_pl[i].connected;
-        uint8_t *ps = g_pl[i].connected ? g_pl[i].ps : NULL;
-        int native = ps && (class_flags(ps) & CLS_SHOOTERPS);
+        int native = g_pl[i].sn_native;
         /* The game's own death count; our pawn-loss count also counts an escape. */
-        int deaths = native ? *(int32_t *)(ps + SPS_DEATHS) : g_pl[i].deaths;
+        int deaths = native ? g_pl[i].sn_deaths : g_pl[i].deaths;
         o += snprintf(out + o, cap - o, "%s{\"playerId\":\"%s\",\"name\":\"%s\",\"connected\":%s,\"aliveAtEnd\":%s,\"deaths\":%d",
                       n++ ? "," : "", g_pl[i].id, g_pl[i].name, g_pl[i].connected ? "true" : "false",
                       alive ? "true" : "false", deaths);
@@ -1174,15 +1210,11 @@ static void build_match_end_json(char *out, size_t cap, float now)
             o += snprintf(out + o, cap - o,
                           ",\"kills\":%d,\"npcKills\":%d,\"damageDealt\":%d,\"damageDealtNpc\":%d,"
                           "\"damageTaken\":%d,\"damageTakenNpc\":%d,\"damageHealed\":%d,\"teamId\":%d",
-                          *(int32_t *)(ps + SPS_PLAYER_KILLS), *(int32_t *)(ps + SPS_NPC_KILLS),
-                          *(int32_t *)(ps + SPS_DMG_DEALT_PL),
-                          *(int32_t *)(ps + SPS_DMG_DEALT_NPC), *(int32_t *)(ps + SPS_DMG_TAKEN_PL),
-                          *(int32_t *)(ps + SPS_DMG_TAKEN_NPC), *(int32_t *)(ps + SPS_DMG_HEALED),
-                          *(int32_t *)(ps + SPS_TEAM));
-            int score;
-            if (ps_int_prop(ps, L"TotalScore", &score)) o += snprintf(out + o, cap - o, ",\"score\":%d", score);
+                          g_pl[i].sn_kills, g_pl[i].sn_npc_kills, g_pl[i].sn_dealt, g_pl[i].sn_dealt_npc,
+                          g_pl[i].sn_taken, g_pl[i].sn_taken_npc, g_pl[i].sn_healed, g_pl[i].sn_team);
+            if (g_pl[i].sn_score_ok) o += snprintf(out + o, cap - o, ",\"score\":%d", g_pl[i].sn_score);
         }
-        if (ps) o += stat_props_json(ps, out + o, cap - o);
+        o += snprintf(out + o, cap - o, "%s", g_pl[i].sn_props);
         o += snprintf(out + o, cap - o, "}");
     }
     snprintf(out + o, cap - o, "]}");
@@ -1267,8 +1299,16 @@ static void replicate_actors(uint8_t *drv)
     uint8_t **conns = *(uint8_t ***)(drv + DRV_CLIENTCONNS);
     int nconns = *(int32_t *)(drv + DRV_CLIENTCONNS + 8);
     uint8_t *world = *(uint8_t **)(drv + DRV_WORLD);
-    if (!conns || nconns <= 0 || !world) return;
+    if (!world) return;
     if (*(uint8_t **)(world + UWORLD_NETDRIVER) != drv) return;  /* game driver only, not demo */
+    if (!conns || nconns <= 0) {
+        /* The last joiner left: nobody is connected any more. Mark every
+           tracked player disconnected (their snapshots stay for the match-end
+           event) and keep the world clock moving for it. */
+        track_disconnects(~0u);
+        g_world_now = *(float *)(world + WORLD_TIMESECONDS);
+        return;
+    }
 
     float now = *(float *)(world + WORLD_TIMESECONDS);
     int rate = *(int32_t *)(drv + DRV_MAXTICKRATE);
