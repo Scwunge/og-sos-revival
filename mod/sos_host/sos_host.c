@@ -721,10 +721,12 @@ static int near_loc(uint8_t *actor, const float *loc, float r)
 #define CLASS_SUPER       0x30    /* UStruct::SuperStruct */
 #define OBJ_CLASS         0x10
 #define OBJ_NAME          0x18
-static struct { uint8_t *cls; uint8_t is_char; } g_cls_cache[2048];
-static uint64_t g_char_name;
+static struct { uint8_t *cls; uint8_t flags; } g_cls_cache[2048];
+static uint64_t g_char_name, g_show_name;
+#define CLS_CHARACTER 1
+#define CLS_GAMESHOW  2   /* the pregame/match show the joiner's intro plays from */
 
-static int is_character(uint8_t *actor)
+static uint8_t class_flags(uint8_t *actor)
 {
     uint8_t *cls = *(uint8_t **)(actor + OBJ_CLASS);
     if (!cls) return 0;
@@ -732,22 +734,29 @@ static int is_character(uint8_t *actor)
         FName n;
         ((FNameCtorFn)AT(g_build->fname_ctor))(&n, L"Character", 1 /* FNAME_Add */);
         memcpy(&g_char_name, &n, sizeof g_char_name);
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&n, L"GameShow_C", 1);
+        memcpy(&g_show_name, &n, sizeof g_show_name);
     }
     unsigned h = (unsigned)(((uintptr_t)cls >> 4) * 2654435761u) & 2047;
     for (unsigned k = 0; k < 2048; k++, h = (h + 1) & 2047) {
-        if (g_cls_cache[h].cls == cls) return g_cls_cache[h].is_char;
+        if (g_cls_cache[h].cls == cls) return g_cls_cache[h].flags;
         if (!g_cls_cache[h].cls) {
             uint8_t r = 0;
             int depth = 0;
-            for (uint8_t *c = cls; c && depth < 64; c = *(uint8_t **)(c + CLASS_SUPER), depth++)
-                if (*(uint64_t *)(c + OBJ_NAME) == g_char_name) { r = 1; break; }
+            for (uint8_t *c = cls; c && depth < 64; c = *(uint8_t **)(c + CLASS_SUPER), depth++) {
+                uint64_t nm = *(uint64_t *)(c + OBJ_NAME);
+                if (nm == g_char_name) r |= CLS_CHARACTER;
+                if (nm == g_show_name) r |= CLS_GAMESHOW;
+            }
             g_cls_cache[h].cls = cls;
-            g_cls_cache[h].is_char = r;
+            g_cls_cache[h].flags = r;
             return r;
         }
     }
     return 0;   /* cache full */
 }
+
+static int is_character(uint8_t *actor) { return class_flags(actor) & CLS_CHARACTER; }
 
 /* A listen host only ticks a skeletal mesh's pose while it is rendered there
    (OnlyTickPoseWhenRendered). Off the host's screen, montages on joiner pawns
@@ -950,7 +959,11 @@ static void replicate_actors(uint8_t *drv)
                 if (cfg.tick_char_radius > 0 && ploc_any && is_character(a) &&
                     near_loc(a, ploc_any, (float)cfg.tick_char_radius))
                     tick_pose_always(a);
-                if (cfg.replicate_startup == 2 && startup) {
+                /* Always-relevant map actors and the GameShow (the pregame intro and
+                   match flow play on the joiner from its replicated segment index)
+                   go to every joiner at once, pawn or not, near or not. */
+                if (cfg.replicate_startup == 2 && startup &&
+                    !(a[ACTOR_FLAGS] & 0x10) && !(class_flags(a) & CLS_GAMESHOW)) {
                     /* No pawn yet: hold map actors back. Not yet near: skip; a channel
                        that is already open keeps getting updates. */
                     if (!ploc) { g_served[i]++; continue; }
