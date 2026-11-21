@@ -105,9 +105,11 @@ services:
       - /srv/ogsos/pool/3/logs:/home/ubuntu/logs
 
   # Side backend for testing a new host before cut-over (own session, own state). Profile "test".
+  # Its own image tag, so testing new server code never changes what `backend` would run:
+  #   docker build -t ogsos-backend:test -f deploy/classic-backend/Dockerfile <source tree>
   backend-test:
     profiles: ["test"]
-    image: ogsos-backend:local
+    image: ${OGSOS_TEST_IMAGE:-ogsos-backend:test}
     restart: "no"
     env_file: .env.test
     ports:
