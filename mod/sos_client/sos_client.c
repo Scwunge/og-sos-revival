@@ -98,9 +98,10 @@ static struct {
     int game_log;                /* 1: mirror UE_LOG lines to sos_client_game_<pid>.log */
     int overlay;                 /* 1: draw the server browser overlay */
     int auto_play;               /* 1: queue for a match right after a server is selected */
+    int borderless;              /* 1: windowed game becomes a borderless window covering its monitor */
     int unlock_dlc;              /* 1: report every Steam DLC / entitlement check as owned (cosmetics only) */
     int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
-} cfg = { 1, 0, 0, 1, 1, 1, 1 };
+} cfg = { 1, 0, 0, 1, 1, 0, 1, 1 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_ini[MAX_PATH];
@@ -184,6 +185,7 @@ static void load_config(HMODULE self)
     cfg.game_log           = GetPrivateProfileIntW(L"Client", L"GameLog", 0, g_ini);
     cfg.overlay            = GetPrivateProfileIntW(L"Client", L"Overlay", 1, g_ini);
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
+    cfg.borderless         = GetPrivateProfileIntW(L"Client", L"Borderless", 0, g_ini);
     cfg.unlock_dlc         = GetPrivateProfileIntW(L"Client", L"UnlockDlcCosmetics", 1, g_ini);
     cfg.unlock_unreleased  = GetPrivateProfileIntW(L"Client", L"UnlockUnreleasedCosmetics", 1, g_ini);
 
@@ -1816,6 +1818,26 @@ static void ov_subclass(IDXGISwapChain *sc, uint8_t *vp)
     g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(hw, GWLP_WNDPROC, (LONG_PTR)sub_proc);
     if (!g_orig_wndproc) { slog("subclass failed (%lu)", GetLastError()); return; }
     slog("window subclassed (hwnd %p)", (void *)hw);
+    if (cfg.borderless) {
+        /* Only for a normal framed window: exclusive fullscreen has no caption to remove. The style change
+           is safe from this thread; the move is posted asynchronously so the game thread is never waited on. */
+        LONG_PTR st = GetWindowLongPtrW(hw, GWL_STYLE);
+        if (st & WS_CAPTION) {
+            MONITORINFO mi;
+            mi.cbSize = sizeof mi;
+            HMONITOR mon = MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST);
+            if (mon && GetMonitorInfoW(mon, &mi)) {
+                SetWindowLongPtrW(hw, GWL_STYLE, (st & ~(LONG_PTR)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU)) | WS_POPUP);
+                SetWindowPos(hw, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                             SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE);
+                slog("borderless: window covers the monitor (%ldx%ld)", (long)(mi.rcMonitor.right - mi.rcMonitor.left),
+                     (long)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+            }
+        } else {
+            slog("borderless: window has no caption (already fullscreen/borderless), nothing to do");
+        }
+    }
 }
 
 static void ov_frame(uint8_t *vp)
