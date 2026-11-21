@@ -75,10 +75,12 @@ static struct {
     int tick_char_radius;     /* cm; >0: Characters this near a joiner always tick their pose */
     int max_fps;              /* >0: cap the host's frame rate (sleep in TickFlush) */
     int conn_net_speed;       /* >0: bytes/s each joiner connection may receive (UPlayer::CurrentNetSpeed) */
+    int set_pawn_owner;       /* 1: joiner pawn Owner = its controller */
+    int mirror_streaming;     /* 1: send the host's streaming-level states to joiners (kept joiners on the loading screen) */
 } cfg = {
     .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
     .replicate_actors = 1, .startup_radius = 15000, .ack_moves = 1,
-    .tick_char_radius = 15000, .conn_net_speed = 400000,
+    .tick_char_radius = 15000, .conn_net_speed = 400000, .set_pawn_owner = 1,
 };
 
 static wchar_t g_dir[MAX_PATH];
@@ -144,6 +146,8 @@ static void load_config(HMODULE self)
     cfg.tick_char_radius = GetPrivateProfileIntW(L"Host", L"TickCharacterRadius", cfg.tick_char_radius, ini);
     cfg.max_fps          = GetPrivateProfileIntW(L"Host", L"MaxFPS", cfg.max_fps, ini);
     cfg.conn_net_speed   = GetPrivateProfileIntW(L"Host", L"JoinerNetSpeed", cfg.conn_net_speed, ini);
+    cfg.set_pawn_owner   = GetPrivateProfileIntW(L"Host", L"SetPawnOwner", cfg.set_pawn_owner, ini);
+    cfg.mirror_streaming = GetPrivateProfileIntW(L"Host", L"MirrorStreamingLevels", cfg.mirror_streaming, ini);
     {
         char ev[16];
         if (GetEnvironmentVariableA("SOS_HOST_MAX_FPS", ev, sizeof ev) > 0)
@@ -885,7 +889,7 @@ static void replicate_actors(uint8_t *drv)
             uint8_t *vt_pawn = *(uint8_t **)(pc + PC_PAWN);
             *(uint8_t **)(conn + CONN_VIEWTARGET) = vt_pawn ? vt_pawn : pc;
         }
-        mirror_streaming(world, conn, pc);
+        if (cfg.mirror_streaming) mirror_streaming(world, conn, pc);
         /* The client asks for its ConfiguredInternetSpeed (100000) and the host
            clamps it to MaxClientRate, so a joiner over the internet gets
            100 KB/s: the first seconds of map actors saturate it and its own
@@ -910,7 +914,7 @@ static void replicate_actors(uint8_t *drv)
            my head") and hides its first-person arms. */
         {
             uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
-            if (p && !*(uint8_t **)(p + ACTOR_OWNER)) {
+            if (cfg.set_pawn_owner && p && !*(uint8_t **)(p + ACTOR_OWNER)) {
                 *(uint8_t **)(p + ACTOR_OWNER) = pc;
                 hlog("Pawn %p: Owner set to its controller %p", (void *)p, (void *)pc);
             }
