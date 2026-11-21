@@ -65,6 +65,7 @@ $want = [ordered]@{
   OutpostLeaderboards      = [ordered]@{ Endpoint = "`"$base`"" }
   OutpostLogReceiver       = [ordered]@{ Endpoint = "`"$base`"" }
   OutpostStreams           = [ordered]@{ EmbedEndpoint = "`"$base`"" }
+  OutpostStreamClient      = [ordered]@{ StreamEndpoint = $hostName; StreamPort = $port; StreamSSL = 'False'; StreamPath = '/ws/stream' }
   OutpostMatchmakingClient = [ordered]@{ MatchmakingSSL = 'False'; MatchmakingPort = $port; MatchmakingEndpoint = $hostName; MatchmakingApi = "`"$base/api`"" }
 }
 $out = New-Object System.Collections.Generic.List[string]

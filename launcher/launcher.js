@@ -65,6 +65,7 @@ const WANT = {
   OutpostLeaderboards: { Endpoint: `"${base}"` },
   OutpostLogReceiver: { Endpoint: `"${base}"` },
   OutpostStreams: { EmbedEndpoint: `"${base}"` },   // HERO panel (hero.tv is parked); server.js serves a blank /embed/
+  OutpostStreamClient: { StreamEndpoint: host, StreamPort: String(port), StreamSSL: 'False', StreamPath: '/ws/stream' },   // HERO stream WS stub in server.js
   OutpostMatchmakingClient: {
     MatchmakingSSL: 'False',
     MatchmakingPort: port,

@@ -472,7 +472,9 @@ server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
   if (!key) return socket.destroy();
   socket.on('error', () => {});
-  const isMm = new URL(req.url, 'http://x').pathname === '/ws';
+  const wsPath = new URL(req.url, 'http://x').pathname;
+  const isMm = wsPath === '/ws';
+  const isStream = wsPath === '/ws/stream';   // HERO "Stream" service ([OutpostStreamClient], see docs/HERO_TV.md)
   const who = isMm ? wsAccount(req) : null;
   const accountId = who ? who.id : null;
   const mmFor = who && isClassic(who.appId) ? mmClassic : mm;
@@ -514,6 +516,14 @@ server.on('upgrade', (req, socket) => {
     };
     mmFor.onConnect(client);
   }
+  // Stream stub: ready on connect, pong to ping, ack everything else. Every message is logged to ws.jsonl
+  // so the real HERO shapes can be captured before anything more is built.
+  const streamSend = (obj) => {
+    const text = JSON.stringify(obj);
+    sendFrame(0x1, Buffer.from(text));
+    log('ws.jsonl', { id, event: 'sent', stream: true, text });
+  };
+  if (isStream) streamSend({ type: 'ready' });
 
   let buf = Buffer.alloc(0);
   socket.on('data', (d) => {
@@ -540,6 +550,15 @@ server.on('upgrade', (req, socket) => {
       log('ws.jsonl', { id, event: 'msg', opcode, text });
       console.log(`ws ${id} <- ${text.slice(0, 200)}`);
       if (client) mmFor.onMessage(client, text);
+      else if (isStream) {
+        let m = null;
+        try { m = JSON.parse(text); } catch {}
+        const nonce = m ? (m.nonce ?? (m.data ? m.data.nonce : undefined)) : undefined;
+        const reply = { type: m && m.type === 'ping' ? 'pong' : 'ack' };
+        if (nonce !== undefined) reply.nonce = nonce;
+        if (reply.type === 'ack') reply.data = nonce !== undefined ? { nonce } : {};
+        streamSend(reply);
+      }
     }
   });
   // The http server leaves upgraded sockets half-open, so a client that just drops the TCP connection
