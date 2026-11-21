@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 #include <string.h>
+#include <winhttp.h>
 
 /* ------------------------------------------------------------------------ */
 /* version.dll forwarding                                                    */
@@ -76,6 +77,9 @@ static struct {
     int max_fps;              /* >0: cap the host's frame rate (sleep in TickFlush) */
     int conn_net_speed;       /* >0: bytes/s each joiner connection may receive (UPlayer::CurrentNetSpeed) */
     int set_pawn_owner;       /* 1: joiner pawn Owner = its controller */
+    wchar_t backend[256];     /* http://host:port of the revival backend ("" = no lobby events) */
+    wchar_t session[128];     /* backend session id of this match */
+    wchar_t token[512];       /* optional "Authorization: Token <this>" for backend calls */
     int mirror_streaming;     /* 1: send the host's streaming-level states to joiners (kept joiners on the loading screen) */
 } cfg = {
     .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
@@ -146,6 +150,12 @@ static void load_config(HMODULE self)
     cfg.tick_char_radius = GetPrivateProfileIntW(L"Host", L"TickCharacterRadius", cfg.tick_char_radius, ini);
     cfg.max_fps          = GetPrivateProfileIntW(L"Host", L"MaxFPS", cfg.max_fps, ini);
     cfg.conn_net_speed   = GetPrivateProfileIntW(L"Host", L"JoinerNetSpeed", cfg.conn_net_speed, ini);
+    GetPrivateProfileStringW(L"Host", L"BackendUrl", L"", cfg.backend, 256, ini);
+    GetPrivateProfileStringW(L"Host", L"SessionId", L"", cfg.session, 128, ini);
+    GetEnvironmentVariableW(L"SOS_HOST_BACKEND", cfg.backend, 256);
+    GetEnvironmentVariableW(L"SOS_HOST_SESSION", cfg.session, 128);
+    GetPrivateProfileStringW(L"Host", L"SessionToken", L"", cfg.token, 512, ini);
+    GetEnvironmentVariableW(L"SOS_HOST_TOKEN", cfg.token, 512);
     cfg.set_pawn_owner   = GetPrivateProfileIntW(L"Host", L"SetPawnOwner", cfg.set_pawn_owner, ini);
     cfg.mirror_streaming = GetPrivateProfileIntW(L"Host", L"MirrorStreamingLevels", cfg.mirror_streaming, ini);
     {
@@ -449,6 +459,23 @@ static HANDLE g_game_log = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_game_lock;
 void *g_log_tramp;   /* referenced from log_hook */
 
+/* Match end. The match's end (extraction, everyone out) loads the post-game
+   show's sublevel: "ActivateLevel /Game/Maps/Test_Ben/Ben_Layout_02_PostGame 1 1 0"
+   right after RopeExtractionComponent.MatchHasEnded. Log one clear line for
+   host supervisors and tell the backend so it can recycle the session. */
+static void backend_session_event(const char *json);
+static DWORD g_match_end_tick;
+
+static void match_end_on_log(const wchar_t *msg)
+{
+    if (!wcsstr(msg, L"ActivateLevel") || !wcsstr(msg, L"_PostGame")) return;
+    DWORD t = GetTickCount();
+    if (g_match_end_tick && t - g_match_end_tick < 60000) return;   /* logged twice per end */
+    g_match_end_tick = t;
+    hlog("[sos_host] MatchEnded reason=postgame");
+    backend_session_event("{\"type\":\"match-end\",\"reason\":\"postgame\"}");
+}
+
 void log_capture(uint64_t *frame)
 {
     /* frame[0] = return address, frame[1..4] = homed rcx rdx r8 r9,
@@ -458,13 +485,15 @@ void log_capture(uint64_t *frame)
     const FName *category = (const FName *)frame[3];
     unsigned verbosity = (unsigned)frame[4] & 0xF;
     const wchar_t *fmt = (const wchar_t *)frame[5];
-    if (!fmt || g_game_log == INVALID_HANDLE_VALUE) return;
+    if (!fmt) return;
 
     DWORD saved_error = GetLastError();
     wchar_t msg[2048];
     int n = _vsnwprintf(msg, 2047, fmt, (va_list)(frame + 6));
     if (n < 0) n = 2047;
     msg[n] = 0;
+    match_end_on_log(msg);
+    if (g_game_log == INVALID_HANDLE_VALUE) { SetLastError(saved_error); return; }
     autojoin_on_log(msg);
 
     wchar_t cat[64] = L"?";
@@ -996,6 +1025,17 @@ static void replicate_actors(uint8_t *drv)
              g_destroy_closed, g_destroy_startup);
         g_pass_ticks = 0;
         g_last_report = t;
+        int alive = 0, connected = 0;
+        for (int c = 0; c < nconns; c++) {
+            uint8_t *conn = conns[c];
+            if (!conn || *(int32_t *)(conn + CONN_STATE) == 1) continue;
+            uint8_t *pc = *(uint8_t **)(conn + CONN_OWNINGACTOR);
+            if (!pc) continue;
+            connected++;
+            uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
+            if (p && !pending_kill(p)) alive++;
+        }
+        hlog("[sos_host] Players alive=%d connected=%d", alive, connected);
     }
 }
 
@@ -1095,6 +1135,93 @@ static void h_tick_flush(uint8_t *drv, float dt)
         uint8_t *world = *(uint8_t **)(drv + DRV_WORLD);
         if (world && *(uint8_t **)(world + UWORLD_NETDRIVER) == drv) cap_frame();
     }
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* Backend events (lobby lifecycle)                                          */
+/* ------------------------------------------------------------------------ */
+
+/* Fire-and-forget JSON POSTs to the revival backend, on a worker thread so the
+   game thread never waits on the network. */
+typedef struct BackendReq { struct BackendReq *next; wchar_t path[256]; char body[512]; } BackendReq;
+static BackendReq *g_req_head, *g_req_tail;
+static CRITICAL_SECTION g_req_lock;
+static HANDLE g_req_event;
+
+static DWORD WINAPI backend_worker(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(g_req_event, INFINITE);
+        for (;;) {
+            EnterCriticalSection(&g_req_lock);
+            BackendReq *r = g_req_head;
+            if (r) { g_req_head = r->next; if (!g_req_head) g_req_tail = NULL; }
+            LeaveCriticalSection(&g_req_lock);
+            if (!r) break;
+            URL_COMPONENTS u;
+            wchar_t hostname[128];
+            memset(&u, 0, sizeof u);
+            u.dwStructSize = sizeof u;
+            u.lpszHostName = hostname; u.dwHostNameLength = 128;
+            u.dwUrlPathLength = (DWORD)-1;
+            DWORD status = 0;
+            if (WinHttpCrackUrl(cfg.backend, 0, 0, &u)) {
+                HINTERNET ses = WinHttpOpen(L"sos_host", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+                HINTERNET con = ses ? WinHttpConnect(ses, hostname, u.nPort, 0) : NULL;
+                HINTERNET req = con ? WinHttpOpenRequest(con, L"POST", r->path, NULL, NULL, NULL,
+                                                         u.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : NULL;
+                if (req) {
+                    WinHttpSetTimeouts(req, 5000, 5000, 5000, 5000);
+                    DWORD len = (DWORD)strlen(r->body);
+                    if (WinHttpSendRequest(req, L"Content-Type: application/json\r\n", (DWORD)-1,
+                                           r->body, len, len, 0) && WinHttpReceiveResponse(req, NULL)) {
+                        DWORD sz = sizeof status;
+                        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                            NULL, &status, &sz, NULL);
+                    }
+                    WinHttpCloseHandle(req);
+                }
+                if (con) WinHttpCloseHandle(con);
+                if (ses) WinHttpCloseHandle(ses);
+            }
+            hlog("Backend POST %ls %s -> %lu", r->path, r->body, status);
+            free(r);
+        }
+    }
+    return 0;
+}
+
+/* path relative to the backend root, e.g. L"/session/<id>/events". */
+static void backend_post(const wchar_t *path, const char *json)
+{
+    if (!cfg.backend[0]) return;
+    static int started;
+    if (!started) {
+        started = 1;
+        InitializeCriticalSection(&g_req_lock);
+        g_req_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        CloseHandle(CreateThread(NULL, 0, backend_worker, NULL, 0, NULL));
+    }
+    BackendReq *r = (BackendReq *)calloc(1, sizeof *r);
+    if (!r) return;
+    wcsncpy(r->path, path, 255);
+    strncpy(r->body, json, 511);
+    EnterCriticalSection(&g_req_lock);
+    if (g_req_tail) g_req_tail->next = r; else g_req_head = r;
+    g_req_tail = r;
+    LeaveCriticalSection(&g_req_lock);
+    SetEvent(g_req_event);
+}
+
+static void backend_session_event(const char *json)
+{
+    if (!cfg.session[0]) return;
+    wchar_t path[256];
+    _snwprintf(path, 255, L"/session/%ls/events", cfg.session);
+    path[255] = 0;
+    backend_post(path, json);
 }
 
 /* ------------------------------------------------------------------------ */

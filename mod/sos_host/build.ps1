@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 New-Item -ItemType Directory -Force build | Out-Null
 & $Gcc -shared -O2 -Wall -Wextra -o build\version.dll sos_host.c version.def `
-    -static -static-libgcc -s '-Wl,--enable-stdcall-fixup' -lkernel32
+    -static -static-libgcc -s '-Wl,--enable-stdcall-fixup' -lkernel32 -lwinhttp
 if ($LASTEXITCODE -ne 0) { throw "gcc failed ($LASTEXITCODE)" }
 Copy-Item sos_host.ini build\sos_host.ini -Force
 Get-Item build\version.dll | Select-Object FullName, Length
