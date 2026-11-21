@@ -104,7 +104,12 @@ trap 'log "stopping"; stop_game; kill "$XVFB_PID" 2>/dev/null; exit 0' TERM INT
 [ -f "$WIN64/$EXE" ] || { log "no $WIN64/$EXE (game copy missing)"; sleep 60; exit 1; }
 [ -f "$WIN64/version.dll" ] && [ -f "$WIN64/sos_host.ini" ] || { log "version.dll / sos_host.ini missing in Win64"; sleep 60; exit 1; }
 
+# A restarted container (docker restart / compose restart) keeps /tmp, so the old display lock is still there,
+# Xvfb refuses to start, and the game then dies about 10 s after the world comes up (crash loop). Clear it first.
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 Xvfb :99 -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 & XVFB_PID=$!
+sleep 1
+kill -0 "$XVFB_PID" 2>/dev/null || { log "Xvfb did not start"; sleep 60; exit 1; }
 for d in "$WINEPREFIX" "$HOME/logs"; do
   mkdir -p "$d" 2>/dev/null; [ -w "$d" ] || { log "$d is not writable by uid $(id -u) (chown the host dir)"; sleep 60; exit 1; }
 done
@@ -154,5 +159,11 @@ while :; do
   log "game stopped: $REASON"
   mkdir -p "$HOME/logs" && cp -f "$WIN64/sos_host.log" "$HOME/logs/sos_host.last.log" 2>/dev/null
   stop_game
+  # Crash loop guard: a game that dies within 90 s of starting backs off (up to 5 min). While it is down the backend
+  # sees no polls and lists the lobby as offline, so players are not sent to a dead host.
+  if [ $(( $(date +%s) - START )) -lt 90 ] && [ "$REASON" = exited ]; then
+    FAILS=$(( ${FAILS:-0} + 1 )); BACKOFF=$(( 90 + FAILS * 30 )); [ $BACKOFF -gt 300 ] && BACKOFF=300
+    [ $FAILS -ge 3 ] && { log "game died within 90s ${FAILS} times in a row, waiting ${BACKOFF}s (lobby shows offline)"; sleep "$BACKOFF"; }
+  else FAILS=0; fi
   sleep 5
 done

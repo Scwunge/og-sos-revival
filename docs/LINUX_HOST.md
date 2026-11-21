@@ -116,3 +116,7 @@ Measured on Windows: 2.5 GB RAM and about 1.4 cores idle, uncapped. Expected per
 4. Proton launch with Steam. Check `Client API initialized 1` and `Listening with`.
 5. Join test from the user's PC through the backend. This needs a host account different from the joiner's.
 6. Hand over to the backend: compose service, watchdog and daily restart.
+
+## Restarting a host container
+
+Recreate it (`docker compose up -d --force-recreate hostN`), never `docker compose restart hostN` / `docker restart`. A restarted container keeps `/tmp`, including the stale Xvfb display lock; Xvfb then does not start and the game dies about 10 s after its world comes up, over and over (a crash loop that looks like "listening after 15s, game stopped: exited"). The entrypoint now clears the lock and backs off after repeated early deaths, so the lobby shows offline (HOST_ONLINE_SECONDS=90) instead of sending players to a dead host.
