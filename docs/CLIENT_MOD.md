@@ -64,6 +64,13 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 - Verified (with it on): the Founder's Pack T-Shirts row is listed and a gold shirt equips and renders on the character: `docs/client-mod-dlc-founders-listed.png`, `docs/client-mod-dlc-founders-equipped.png`.
 - Not checked in the game: the gestures and the name plate.
 
+## Input diagnostics (post-death prompt report)
+
+A player reported that the spectate/leave prompt after dying did not take clicks (on prod, launched from Steam). Code review found no mod path that touches input in a match: the window subclass only consumes mouse messages while the SERVERS panel is open (it is closed when a non-menu map loads) or over the SERVERS button on the main menu; the XInput exports jump straight to the system DLL, so no gamepad is invented; the mod never calls SetCursor, ShowCursor, ClipCursor or SetCapture. It could not be reproduced here (no local death test). To settle it from a player's log the mod now writes:
+- `xinput: real XInput loaded, N gamepad(s) connected` at start;
+- `input: in-match left click, CONSUMED|passed to the game ...` for the first 12 left clicks outside the main menu, with the system cursor state.
+If the prompt fails again, check these lines in `sos_client.log`, and compare with the DLL renamed away.
+
 ## How Steam launches the game, and why no .cmd is needed
 
 - Steam's `appinfo.vdf` for app 802240 lists `SOS\Binaries\Win64\SOS-Win64-Shipping.exe` ("Launch", no arguments) as the launch option, plus a `Win64\SOS.exe` entry that does not exist in this install. Steam never starts `SOS_BE.exe` or anything in `BattlEye\`. The game process Steam starts loads `xinput1_3.dll` from its own folder, so the mod is active on a normal Play. A direct launch of the exe from the install (what the real game folder does) shows an empty command line and no BattlEye lines in `SOS.log`.

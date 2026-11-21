@@ -2067,6 +2067,17 @@ static LRESULT CALLBACK sub_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 if (msg == WM_LBUTTONUP) { click_action(HIT_BTN); wake = 1; }
             }
         }
+        {
+            /* Diagnostics for "clicks do nothing in a match": the first few left clicks outside the menu. */
+            static volatile LONG diag_n;
+            if (msg == WM_LBUTTONDOWN && !U.in_menu && diag_n < 12) {
+                CURSORINFO ci; ci.cbSize = sizeof ci;
+                int shown = GetCursorInfo(&ci) ? (ci.flags & CURSOR_SHOWING) != 0 : -1;
+                slog("input: in-match left click, %s by the mod (panel open=%d), system cursor visible=%d, foreground=%d",
+                     consume ? "CONSUMED" : "passed to the game", U.open, shown, GetForegroundWindow() == hw);
+                InterlockedIncrement(&diag_n);
+            }
+        }
         LeaveCriticalSection(&g_ui_lock);
         if (wake) { ensure_worker(); if (g_worker_ev) SetEvent(g_worker_ev); }
         if (consume) return 0;
@@ -2528,6 +2539,15 @@ static void install(void)
         if (!o_present) slog("overlay unavailable");
     } else if (cfg.overlay) {
         slog("overlay needs map tracking; overlay off");
+    }
+    {
+        /* Pass-through check: does the real XInput report a connected pad? (The proxy never invents one.) */
+        int pads = 0;
+        for (DWORD i = 0; i < 4; i++) {
+            uint8_t st[16];
+            if (((DWORD (WINAPI *)(DWORD, void *))p_XInputGetState)(i, st) == 0) pads++;
+        }
+        slog("xinput: real XInput %s, %d gamepad(s) connected", g_real_xinput ? "loaded" : "NOT loaded (stub)", pads);
     }
     slog("ready");
 }
