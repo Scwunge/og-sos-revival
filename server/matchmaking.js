@@ -283,7 +283,43 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (!h) return null;
     const session = sessionObj(h.s, true, true);
     for (const hid of h.entry.hostIds) session['player-map'][hid] ??= { uname: uname(hid), 'auto-group': false };
+    // moderation: spectators/directors are allow-listed in player-map (the host kicks anyone missing) but never seated.
+    const wlist = listWatchers(id);
+    for (const wid of wlist) session['player-map'][wid] ??= { uname: uname(wid), 'auto-group': false };
+    session['ogsos-watchers'] = wlist;
     return { session, token: h.entry.sessionToken };
+  }
+
+  // moderation: watchers (admin spectators) per hosted session, with an expiry; kept across match end, pruned when expired.
+  const watchers = new Map();   // sessionId -> Map(playerId -> expiresAtMs)
+  function addWatcher(id, playerId, ttlMs = 3 * 3600 * 1000) {
+    if (!hostedById.has(String(id)) || !playerId) return null;
+    const m = watchers.get(String(id)) || new Map();
+    watchers.set(String(id), m);
+    const expiresAt = Date.now() + ttlMs;
+    m.set(String(playerId), expiresAt);
+    return { expiresAt };
+  }
+  function removeWatcher(id, playerId) {
+    const m = watchers.get(String(id));
+    return !!m && m.delete(String(playerId));
+  }
+  function listWatchers(id) {
+    const m = watchers.get(String(id));
+    if (!m) return [];
+    const t = Date.now();
+    for (const [pid, exp] of m) if (exp <= t) m.delete(pid);
+    return [...m.keys()];
+  }
+  function watcherExpiry(id, playerId) {
+    const m = watchers.get(String(id));
+    const e = m && m.get(String(playerId));
+    return e && e > Date.now() ? e : null;
+  }
+  function watchToken(id, playerId) {
+    const h = hostedById.get(String(id));
+    if (!h || !watcherExpiry(id, playerId)) return null;
+    return makeSessionJwt(h.entry, playerId);
   }
 
   // The host's authenticated GET /api/session/<id> poll (called by server.js after the token check).
@@ -593,6 +629,23 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     // Players who were kept waiting (late joiners) go into the fresh lobby.
     if (pumpHosted()) sendSummary();
     return ids.length;
+  }
+  // Moderation kick: take a player's seat in a hosted session. The host's next session poll no longer lists them,
+  // so the game removes them ("Not In Session"). Returns { result: true } or { error: 'not-found' | 'not-seated' }.
+  function kickHosted(id, playerId) {
+    const h = hostedById.get(String(id));
+    if (!h) return { error: 'not-found' };
+    const s = h.s, pid = String(playerId);
+    if (!s.players.has(pid)) return { error: 'not-seated' };
+    removeSeat(s, pid);
+    const c = clients.get(pid);
+    if (c && c.sessionId === s.id) {
+      c.sessionId = null;
+      c.sendMsg('player-leave', { id: s.id, 'player-id': pid });
+    }
+    sendSummary();
+    log(`kicked ${pid} from hosted session ${s.id}`);
+    return { result: true };
   }
   const endHosted = (id) => { const h = hostedById.get(String(id)); return h ? endSession(h.s, 'host') : null; };
   const forceStartHosted = (id) => { const h = hostedById.get(String(id)); return h ? startSession(h.s, 'forced') : null; };
@@ -988,7 +1041,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, addWatcher, removeWatcher, listWatchers, watcherExpiry, watchToken, kickHosted, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
 module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };

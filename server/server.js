@@ -17,6 +17,7 @@ const { createProgression } = require('./progression');
 const { createCommunityRegistry, loadCommunityConfig } = require('./community');
 const { createStream } = require('./stream');   // hero-tv
 const { createFame } = require('./fame');       // hero-tv
+const { createModeration } = require('./admin');   // moderation
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -101,6 +102,9 @@ const CLASSIC_COSMETIC_ROLES = ['alpha-beta'];
 function classicRoles(accountId, steamId, asked) {
   const roles = new Set([...(Array.isArray(asked) ? asked.map(String) : []), 'app-user', 'user', 'testserver', ...CLASSIC_COSMETIC_ROLES, ...CLASSIC.extraRoles]);
   if (CLASSIC.devAccounts.includes(accountId) || (steamId && CLASSIC.devAccounts.includes(steamId))) roles.add('dev');
+  // moderation: admins get the dev role (Director button and server browser in Classic); env read each time
+  const admins = String(process.env.OGSOS_ADMINS || '').split(/[\s,]+/).filter(Boolean);
+  if (admins.includes(accountId) || (steamId && admins.includes(steamId))) roles.add('dev');
   return [...roles];
 }
 
@@ -297,6 +301,11 @@ function handleApi(req, url, body, res) {
     }
     if (out) return send(res, out.status, out.body);
   }
+  // moderation: an admin's spectate/director join link from the client mod (game JWT; OGSOS_ADMINS only), docs/ADMIN.md
+  if (req.method === 'POST' && (r = m(/^\/api\/servers\/([^/]+)\/watch$/))) {
+    const out = moderation.handleWatchApi(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
 
   // Vote to start: authorised by the PLAYER's bearer token (the per-player session access token from the
   // backend, or the account JWT), not the host's. The player must be seated in the session.
@@ -380,6 +389,7 @@ function handleApi(req, url, body, res) {
         if (!cinfo || cinfo.verified) {
           const players = (Array.isArray(j.players) ? j.players : []).filter((pl) => pl && db.accounts[String(pl.playerId)]);
           const rec = progression.recordMatchEnd(id, { ...j, players }, null);
+          moderation.onMatchEnd(id, rec.matchId);   // moderation
           console.log(`match-end stats for session ${id}: ${rec.duplicate ? 'duplicate' : `${rec.accepted} player(s)`} (${rec.matchId})`);
         } else console.log(`match-end stats for session ${id} ignored (unverified community host)`);
       }
@@ -389,7 +399,7 @@ function handleApi(req, url, body, res) {
       return send(res, 200, { result: true });
     }
     owner.markHostPolled(id);   // an authenticated poll = the game host is alive (see GET /servers)
-    return send(res, 200, found.session);
+    return send(res, 200, moderation.filterPlayerMap(found.session));   // moderation: banned ids are dropped from player-map
   }
 
   // Login. The client posts {"steam-app-id","steam-id","session-auth-token","roles","app-id"}
@@ -401,6 +411,12 @@ function handleApi(req, url, body, res) {
     let j = {}; try { j = JSON.parse(body || '{}'); } catch {}
     const steamId = String(j['steam-id'] || j.steamId || '');
     const accountId = steamId || crypto.createHash('sha1').update(body || '').digest('hex').slice(0, 16);
+    // moderation: a banned account gets no token. The exact client ban shape may change after RE.
+    const ban = moderation.isBanned(accountId);
+    if (ban) {
+      log('http.jsonl', { event: 'login-refused-banned', account: accountId });
+      return send(res, 403, moderation.banBody(ban));   // the shape the client's login error handler parses (app-banned)
+    }
     db.accounts[accountId] ??= {
       id: accountId, 'account-id': accountId, alias: `player-${accountId.slice(-4)}`,
       'display-name': `player-${accountId.slice(-4)}`, created: new Date().toISOString(),
@@ -457,7 +473,25 @@ function handleApi(req, url, body, res) {
     const acct = accountView(db.accounts[id] ?? { id, 'account-id': id });
     return send(res, 200, { ...acct, version: 1, data: acct });
   }
-  if (p.startsWith('/api/account/')) return send(res, 200, wrap({}));   // tos, language, report, identity, accept-ban
+  // moderation: native client report (POST /api/account/<id>/report) and the mod/API report route
+  if (req.method === 'POST' && (r = m(/^\/api\/account\/([^/]+)\/app-meta\/([^/]+)\/report$/))) {   // the id is the TARGET, Token auth is the reporter
+    const out = moderation.handleReport(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
+  if (req.method === 'POST' && (r = m(/^\/api\/account\/([^/]+)\/report$/))) {
+    const out = moderation.handleReport(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
+  if (req.method === 'POST' && p === '/api/reports') {
+    const out = moderation.handleReportApi(req, body, authToken(req));
+    return send(res, out.status, out.body);
+  }
+  if (req.method === 'POST' && (r = m(/^\/api\/reports\/([^/]+)\/evidence$/))) {   // moderation: attach a clip link afterwards
+    const out = moderation.handleEvidence(req, decodeURIComponent(r[1]), body, authToken(req));
+    return send(res, out.status, out.body);
+  }
+  // tos, language, identity, and app-meta/<app>/accept-ban (the client's ban acknowledgement; nothing to record): 200 empty
+  if (p.startsWith('/api/account/')) return send(res, 200, wrap({}));
 
   // Inventory: everyone owns every cosmetic (ids from data/cosmetics.json, see docs/INVENTORY_FORMAT.md).
   if (m(/^\/api\/app\/[^/]+\/inventory\//) || m(/^\/api\/app\/[^/]+\/reconcile\//)) {
@@ -577,6 +611,7 @@ const server = http.createServer((req, res) => {
       else if (url.pathname.startsWith('/embed/') && req.method === 'GET') return serveEmbed(url, res);   // hero-tv
       else if ((url.pathname === '/' || url.pathname === '/watch') && req.method === 'GET') return servePage(res, 'watch.html', {});   // hero-tv
       else if (url.pathname.startsWith('/api/stream/') && req.method === 'GET') result = handleStreamApi(url, res);   // hero-tv
+      else if ((url.pathname === '/admin' || url.pathname.startsWith('/admin/')) && moderation.handleHttp(req, url, body, res)) return;   // moderation: no http.jsonl entry (cookies)
       else result = handleApi(req, url, body, res);
       if (!result) {
         handled = false;
@@ -686,6 +721,13 @@ const stream = createStream({
   onSessionEnd: (match) => fame.recordMatch(match),
 });
 
+// moderation: reports, bans, host blocks, /admin panel (server/admin.js)
+const moderation = createModeration({
+  db, saveDb, log, secret: SECRET, jwtAccount,
+  displayName: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
+  progression, matchmakers: { classic: mmClassic, main: mm }, env: process.env,
+});
+
 function wsAccount(req, token) {   // hero-tv: optional token (stream sockets from our embed pages)
   const tok = token || String(req.headers['authorization'] || '').replace(/^Token\s+/i, '').trim();
   const claims = tok && readJwt(tok);
@@ -711,6 +753,12 @@ server.on('upgrade', (req, socket) => {
     log('ws.jsonl', { event: 'rejected', path: req.url, reason: 'missing or invalid token', headers: req.headers });
     console.log(`ws rejected ${req.url} (401)`);
     socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  if (accountId && moderation.isBanned(accountId)) {   // moderation
+    log('ws.jsonl', { event: 'rejected', path: req.url, reason: 'banned', account: accountId });
+    console.log(`ws rejected ${req.url} (403 banned ${accountId})`);
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
     return;
   }
   const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
