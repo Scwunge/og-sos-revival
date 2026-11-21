@@ -50,6 +50,13 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 - Endpoint override and token capture: `docs/client-mod-test-run.log`.
 - Not verified: the game connecting to the lobby's UDP game host after `session-started` (no game host ran in this test), an https backend (the override writes `http://` and `StreamSSL=False`), and a real controller through the proxy.
 
+## Unreleased cosmetics (optional)
+
+`UnlockUnreleasedCosmetics=1` in `sos_client.ini` (default on) hooks the game's cosmetic availability check (RVA 0x166970) and reports the Ronin set (`CA_MaleRonin_*`, 8 parts) and `CA_MaleCynic_FacialHair_A` as available by temporarily treating them as released. It matches those asset names only; everything else goes through the original check. Set it to 0 to turn it off.
+
+- Verified: the Ronin row appears in the Harness slot of the topknot character and can be equipped: `docs/client-mod-ronin-listed.png`, `docs/client-mod-ronin-equipped.png`. These assets are unfinished (placeholder "P" icon), so the model shows no visible Ronin mesh.
+- Not done on purpose: paid-DLC ownership (Founders items) is not faked.
+
 ## How Steam launches the game
 
 - Steam's `appinfo.vdf` for app 802240 has one launch option: `SOS\Binaries\Win64\SOS-Win64-Shipping.exe`. `SOS_BE.exe` and `BattlEye\` ship in `Win64` but are never started.

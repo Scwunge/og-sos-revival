@@ -98,7 +98,8 @@ static struct {
     int game_log;                /* 1: mirror UE_LOG lines to sos_client_game_<pid>.log */
     int overlay;                 /* 1: draw the server browser overlay */
     int auto_play;               /* 1: queue for a match right after a server is selected */
-} cfg = { 1, 0, 0, 1, 1 };
+    int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
+} cfg = { 1, 0, 0, 1, 1, 1 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_ini[MAX_PATH];
@@ -182,6 +183,7 @@ static void load_config(HMODULE self)
     cfg.game_log           = GetPrivateProfileIntW(L"Client", L"GameLog", 0, g_ini);
     cfg.overlay            = GetPrivateProfileIntW(L"Client", L"Overlay", 1, g_ini);
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
+    cfg.unlock_unreleased  = GetPrivateProfileIntW(L"Client", L"UnlockUnreleasedCosmetics", 1, g_ini);
 
     wchar_t be[256];
     GetPrivateProfileStringW(L"Client", L"Backend", L"sos.joltora.com:7781", be, 256, g_ini);
@@ -2332,6 +2334,54 @@ static void h_process_event(void *self, void *fn, void *parms)
     o_pe(self, fn, parms);
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* Unreleased cosmetics: Ronin set + one Cynic beard                         */
+/* ------------------------------------------------------------------------ */
+/* CustomizationLibrary per-item availability check (0x140166970):
+   bool (void *ctx, const TSubclassOf *asset). *asset is the asset's UClass; the class default
+   object is at class+0x100 and its EAssetStatus byte at +0x3C1 (3 = Released). The check lets only
+   Released items through. For a short allow-list of asset classes the status byte is set to 3 just
+   for the duration of the call and restored afterwards. Everything else is untouched.
+   Entitlement (Steam DLC) and role checks still run unchanged. */
+#define RVA_AVAIL_CHECK 0x0166970
+typedef uint8_t (*AvailFn)(void *ctx, void *asset);
+static AvailFn o_avail;
+static struct { int32_t idx; int allow; } g_avail_cache[2048];
+static int g_avail_cache_n;
+
+static int avail_allowed(const uint8_t *cls)
+{
+    int32_t idx = *(const int32_t *)(cls + 0x18);
+    for (int i = 0; i < g_avail_cache_n; i++)
+        if (g_avail_cache[i].idx == idx) return g_avail_cache[i].allow;
+    wchar_t nm[96];
+    nm[0] = 0;
+    fname_str(cls + 0x18, nm, 96);
+    int allow = !wcsncmp(nm, L"CA_MaleRonin_", 13) || !wcsncmp(nm, L"CA_MaleCynic_FacialHair_A", 25);
+    if (allow) slog("unreleased cosmetics: allowing %ls", nm);
+    if (g_avail_cache_n < 2048) { g_avail_cache[g_avail_cache_n].idx = idx; g_avail_cache[g_avail_cache_n].allow = allow; g_avail_cache_n++; }
+    return allow;
+}
+
+static uint8_t h_avail(void *ctx, void *asset)
+{
+    uint8_t *cls = asset && plausible_ptr(asset) ? *(uint8_t **)asset : NULL;
+    if (cls && plausible_ptr(cls) && avail_allowed(cls)) {
+        uint8_t *cdo = *(uint8_t **)(cls + 0x100);
+        if (plausible_ptr(cdo)) {
+            uint8_t old = cdo[0x3C1];
+            if (old == 1 || old == 2) {
+                cdo[0x3C1] = 3;
+                uint8_t r = o_avail(ctx, asset);
+                cdo[0x3C1] = old;
+                return r;
+            }
+        }
+    }
+    return o_avail(ctx, asset);
+}
+
 /* Replace "call [rip+disp]" (FF 15 disp32) at the given RVA with "call thunk; nop",
    if it really targets the expected IAT slot. The thunk jumps to `hook`. */
 static int patch_call_site(uint8_t **cursor, uint32_t rva, void **slot, void *hook, const char *what)
@@ -2435,6 +2485,14 @@ static void install(void)
         static const uint8_t p_ws[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18 };
         o_ws_connect = (WsConnectFn)hook_entry(&cursor, RVA_WS_CONNECT, p_ws, 15, (void *)h_ws_connect,
                                                "OutpostWebSocket connect");
+    }
+
+    if (cfg.unlock_unreleased) {
+        /* mov [rsp+10h],rbx; mov [rsp+18h],rbp */
+        static const uint8_t p_av[10] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
+        o_avail = (AvailFn)hook_entry(&cursor, RVA_AVAIL_CHECK, p_av, 10, (void *)h_avail,
+                                      "CustomizationLibrary availability check");
+        if (!o_avail) slog("unreleased cosmetics unavailable");
     }
 
     if (cfg.auto_play) {
