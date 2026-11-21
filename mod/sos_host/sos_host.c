@@ -67,8 +67,11 @@ static struct {
     int block_eliminate;      /* 1: skip UTeamManager::EliminatePlayer (test switch) */
     int max_client_rate;      /* >0: UNetDriver MaxClientRate/MaxInternetClientRate after Listen */
     int replicate_actors;     /* 1: run our own actor replication pass (client builds lack it) */
-    int replicate_startup;    /* 1: also replicate actors placed in the map (bNetStartup) */
-} cfg = { 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0 };
+    int replicate_startup;    /* 1: also replicate actors placed in the map (bNetStartup); 2: only near each joiner */
+    int startup_radius;       /* cm, for ReplicateStartupActors=2 */
+    int ack_moves;            /* 1: answer each joiner ServerMove with ClientAckGoodMove */
+    int skip_login_check;     /* 1: RestartPlayer treats every player as logged in (test switch) */
+} cfg = { 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 15000, 1, 0 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_log_path[MAX_PATH];
@@ -122,6 +125,14 @@ static void load_config(HMODULE self)
     cfg.max_client_rate  = GetPrivateProfileIntW(L"Host", L"MaxClientRate", cfg.max_client_rate, ini);
     cfg.replicate_actors = GetPrivateProfileIntW(L"Host", L"ReplicateActors", cfg.replicate_actors, ini);
     cfg.replicate_startup = GetPrivateProfileIntW(L"Host", L"ReplicateStartupActors", cfg.replicate_startup, ini);
+    cfg.startup_radius = GetPrivateProfileIntW(L"Host", L"StartupActorRadius", 15000, ini);
+    {   /* Env override, for launchers that rewrite the ini. */
+        char ev[16];
+        if (GetEnvironmentVariableA("SOS_HOST_REPLICATE_STARTUP", ev, sizeof ev) > 0)
+            cfg.replicate_startup = atoi(ev);
+    }
+    cfg.ack_moves        = GetPrivateProfileIntW(L"Host", L"AckMoves", cfg.ack_moves, ini);
+    cfg.skip_login_check = GetPrivateProfileIntW(L"Host", L"SkipLoginCheck", cfg.skip_login_check, ini);
 
     wchar_t log_name[MAX_PATH];
     GetPrivateProfileStringW(L"Host", L"LogFile", L"sos_host.log", log_name, MAX_PATH, ini);
@@ -170,6 +181,17 @@ typedef struct {
     uint32_t set_channel_actor; /* void UActorChannel::SetChannelActor(ch, AActor*) */
     uint32_t replicate_actor;   /* bool UActorChannel::ReplicateActor(ch) */
     uint32_t is_pending_kill;   /* bool UObjectBaseUtility::IsPendingKill(obj) */
+    /* Move acks (Classic only; 0 = not mapped) */
+    uint32_t exec_server_move;  /* UCharacterMovementComponent::execServerMove(cmc, FFrame&, void*) */
+    uint32_t exec_server_move_dual;   /* execServerMoveDual */
+    uint32_t exec_server_move_hybrid; /* execServerMoveDualHybridRootMotion */
+    uint32_t step_compiled_in;  /* FFrame::StepCompiledIn(FFrame*, void* Result, UProperty*) */
+    uint32_t ack_good_move;     /* UCharacterMovementComponent::ClientAckGoodMove(cmc, float TimeStamp) RPC sender */
+    uint32_t adjust_position;   /* CMC::ClientAdjustPosition(cmc, ts, FVector* Loc, FVector* Vel, Base, FName Bone, bHasBase, bRelative, uint8 Mode) sender */
+    uint32_t move_mode_shift;   /* uint8/int GroundShift used by PackNetworkMovementMode */
+    uint32_t move_mode_custom;  /* uint8 custom-mode base used by PackNetworkMovementMode */
+    uint32_t login_check;       /* JNE (75 xx) after IsLoggedIn in the RestartPlayer override; 0 = not mapped */
+    uint32_t gmalloc;           /* FMalloc* GMalloc (vtable: +0x10 Malloc(size, align), +0x20 Free) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -181,6 +203,7 @@ static const GameBuild k_builds[] = {
         0x04a9f30, 0x04de7a0,
         0x01cd360, 0x01c7370, 0x14e9160, 0x14e8d20, 0x01f0600,
         0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -190,6 +213,8 @@ static const GameBuild k_builds[] = {
         0x044a500, 0x047e090,
         0x0185c30, 0, 0x1482e90, 0x1482a50, 0,
         0x11f5460, 0x0ac6ce0, 0x053ecd0, 0x11dba20, 0x1080c10, 0x107dbe0, 0x01672f0,
+        0x161e450, 0x161e770, 0x161ebd0, 0x0537810, 0x14824b0, 0x14824f0, 0x2b5a6ec, 0x2b5a7d8,
+        0x0185ca0, 0x29e7560,
     },
 };
 
@@ -217,6 +242,7 @@ static const GameBuild *g_build;
 static uint8_t *g_base;
 
 #define AT(rva) ((void *)(g_base + (rva)))
+#define VCALL(obj, off) (*(void **)(*(uint8_t **)(obj) + (off)))
 
 /* ------------------------------------------------------------------------ */
 /* UWorld::Listen replacement                                                */
@@ -325,6 +351,65 @@ static uint8_t HostListen(uint8_t *world, uint8_t *url)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Test joiner: travel to a host once the frontend login is done             */
+/* ------------------------------------------------------------------------ */
+/* For unattended tests only. With the environment variable SOS_HOST_AUTOJOIN
+   set (for example 127.0.0.1:7777?AuthToken=<jwt>), a client that boots into
+   the frontend logs in to the backend as usual and then travels to that URL
+   by itself, as if PLAY had found the session. A direct URL on the command
+   line skips the login, so the host keeps that player in LoginPending.
+   The travel is requested like UEngine::SetClientTravel does it: the first
+   world context gets TravelURL (an FString from GMalloc, which the engine
+   frees after Browse) and TravelType 0 (TRAVEL_Absolute). */
+
+#define ENGINE_WORLDLIST   0xB78  /* FWorldContext** (count at +0xB80) */
+#define CTX_TRAVELURL      0xD0   /* FString */
+#define CTX_TRAVELTYPE     0xE0   /* uint8 */
+
+typedef void *(*MallocFn)(void *gmalloc, size_t size, uint32_t align);
+static wchar_t g_autojoin[1024];
+static volatile LONG g_autojoin_state;   /* 0 idle, 1 armed, 2 fired */
+
+static DWORD WINAPI autojoin_thread(LPVOID arg)
+{
+    (void)arg;
+    Sleep(3000);
+    void *engine = *(void **)AT(g_build->gengine);
+    void *gmalloc = *(void **)AT(g_build->gmalloc);
+    if (!engine || !gmalloc) { hlog("AutoJoin: engine not ready"); return 0; }
+    uint8_t **ctxs = *(uint8_t ***)((uint8_t *)engine + ENGINE_WORLDLIST);
+    int n = *(int32_t *)((uint8_t *)engine + ENGINE_WORLDLIST + 8);
+    if (!ctxs || n < 1 || !ctxs[0]) { hlog("AutoJoin: no world context"); return 0; }
+    uint8_t *ctx = ctxs[0];
+    FString *travel = (FString *)(ctx + CTX_TRAVELURL);
+    if (travel->num > 1) { hlog("AutoJoin: a travel is already pending"); return 0; }
+    int len = (int)wcslen(g_autojoin) + 1;
+    wchar_t *buf = ((MallocFn)VCALL(gmalloc, 0x10))(gmalloc, len * sizeof(wchar_t), 0);
+    if (!buf) return 0;
+    memcpy(buf, g_autojoin, len * sizeof(wchar_t));
+    ctx[CTX_TRAVELTYPE] = 0;
+    travel->data = buf;
+    travel->max = len;
+    MemoryBarrier();
+    travel->num = len;   /* last: the engine tick tests Num */
+    hlog("AutoJoin: travel to %.*ls... requested", 40, g_autojoin);
+    return 0;
+}
+
+static void autojoin_on_log(const wchar_t *msg)
+{
+    if (g_autojoin_state != 1) return;
+    if (!wcsstr(msg, L"\"LoadingLoginEnd\"")) return;
+    /* {"Type":"LoadingLoginEnd","PlayerId":"<steam id>",...}; an empty PlayerId means no login. */
+    if (wcsstr(msg, L"\"PlayerId\":\"\"") || wcsstr(msg, L"\"Success\":\"false\"")) {
+        hlog("AutoJoin: login failed, not travelling"); g_autojoin_state = 2; return;
+    }
+    if (InterlockedCompareExchange(&g_autojoin_state, 2, 1) != 1) return;
+    HANDLE t = CreateThread(NULL, 0, autojoin_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
+/* ------------------------------------------------------------------------ */
 /* UE_LOG mirror                                                             */
 /* ------------------------------------------------------------------------ */
 /* The shipping client writes no SOS.log in these runs, so the DLL copies every
@@ -354,6 +439,7 @@ void log_capture(uint64_t *frame)
     int n = _vsnwprintf(msg, 2047, fmt, (va_list)(frame + 6));
     if (n < 0) n = 2047;
     msg[n] = 0;
+    autojoin_on_log(msg);
 
     wchar_t cat[64] = L"?";
     if (category) {
@@ -506,6 +592,8 @@ static uint64_t h_eliminate(void *tm, uint8_t *ps)
 #define ACTOR_OWNER       0x90
 #define ACTOR_NETUPDATETIME 0x12C /* float; unused by the stripped engine, used here as the schedule */
 #define ACTOR_NETUPDATEFREQ 0x130 /* float */
+#define ACTOR_ROOTCOMP    0x160   /* USceneComponent* RootComponent */
+#define ACTOR_COMPLOC     0x120   /* ComponentToWorld translation */
 #define CH_REPFLAGS       0x88    /* 8 = bIsReplicatingActor */
 #define CHTYPE_ACTOR      2
 
@@ -526,7 +614,6 @@ static float g_next_pass;
 static unsigned g_opened, g_sent, g_passes;
 static DWORD g_last_report;
 
-#define VCALL(obj, off) (*(void **)(*(uint8_t **)(obj) + (off)))
 
 static uint8_t *find_actor_channel(uint8_t *conn, uint8_t *actor)
 {
@@ -569,6 +656,17 @@ static int relevant_to(uint8_t *actor, uint8_t *pc)
         top = owner;
     }
     return top == pc || actor == *(uint8_t **)(pc + PC_PAWN);
+}
+
+/* 1 = actor's root is within r cm of loc (or either has no location). */
+static int near_loc(uint8_t *actor, const float *loc, float r)
+{
+    if (!loc) return 1;
+    uint8_t *root = *(uint8_t **)(actor + ACTOR_ROOTCOMP);
+    if (!root) return 1;
+    const float *p = (const float *)(root + ACTOR_COMPLOC);
+    float dx = p[0] - loc[0], dy = p[1] - loc[1], dz = p[2] - loc[2];
+    return dx * dx + dy * dy + dz * dz <= r * r;
 }
 
 static void replicate_actors(uint8_t *drv)
@@ -631,10 +729,22 @@ static void replicate_actors(uint8_t *drv)
         for (int k = 0; k < 3 && ok; k++)
             if (own[k] && (own[k][ACTOR_FLAGS2] & 4) && !pending_kill(own[k]))
                 ok = replicate_to(drv, conn, own[k], &opens_left);
+        const float *ploc = NULL;
+        if (cfg.replicate_startup == 2 && own[1]) {
+            uint8_t *root = *(uint8_t **)(own[1] + ACTOR_ROOTCOMP);
+            if (root) ploc = (const float *)(root + ACTOR_COMPLOC);
+        }
+        float radius = (float)cfg.startup_radius;
         int i = 0;
         for (; ok && i < ndue; i++) {
             uint8_t *a = g_due[i];
             if (a == own[0] || a == own[1] || a == own[2] || !relevant_to(a, pc)) continue;
+            if (cfg.replicate_startup == 2 && (a[ACTOR_FLAGS] & 4)) {
+                /* No pawn yet: hold map actors back. Not yet near: skip; a channel
+                   that is already open keeps getting updates. */
+                if (!ploc) continue;
+                if (!near_loc(a, ploc, radius) && !find_actor_channel(conn, a)) continue;
+            }
             if (!replicate_to(drv, conn, a, &opens_left)) { ok = 0; break; }
         }
         if (!ok && i < done_upto) done_upto = i;
@@ -659,6 +769,143 @@ static void h_tick_flush(uint8_t *drv, float dt)
 {
     if (cfg.replicate_actors) replicate_actors(drv);
     o_tick_flush(drv, dt);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Move acks                                                                 */
+/* ------------------------------------------------------------------------ */
+
+/* The shipping clients are also built without
+   UCharacterMovementComponent::SendClientAdjustment, so a host never answers a
+   joiner's ServerMove. The joiner keeps every move it sent, hits "Hit limit of
+   96 saved moves" and stops moving. The ServerMove RPCs still run on the host
+   (they move the pawn there), so we hook their native exec thunks: before the
+   original runs, read the move's TimeStamp from the RPC parameters the same
+   way the thunk does (FFrame::StepCompiledIn over PropertyChainForCompiledIn,
+   then put the chain back), and after it runs send ClientAckGoodMove for that
+   TimeStamp. ServerMove: TimeStamp is parameter 1. ServerMoveDual and
+   ServerMoveDualHybridRootMotion: parameter 5 is the newer move's TimeStamp
+   (TimeStamp0, InAccel0, PendingFlags, View0, TimeStamp, ...); acking it also
+   acks the older one. The joiner is never corrected: it trusts its own
+   position. */
+
+#define FRAME_CODE       0x20    /* uint8* Code (0 for a native call) */
+#define FRAME_PROPCHAIN  0x80    /* UField* PropertyChainForCompiledIn */
+#define PROP_NEXT        0x28    /* UField::Next */
+
+typedef void (*ExecFn)(void *ctx, uint8_t *stack, void *result);
+typedef void (*StepFn)(uint8_t *stack, void *result, void *prop);
+typedef void (*AckGoodMoveFn)(void *cmc, float ts);
+static ExecFn o_exec_move, o_exec_dual, o_exec_hybrid;
+static unsigned g_moves_acked;
+static DWORD g_last_ack_report;
+
+/* Copy the first `size` bytes of the n-th (1-based) RPC parameter; 0 if not readable. */
+static int peek_param(uint8_t *stack, int n, void *out, size_t size)
+{
+    if (*(void **)(stack + FRAME_CODE)) return 0;
+    void *saved = *(void **)(stack + FRAME_PROPCHAIN);
+    uint8_t scratch[64];
+    int ok = 1;
+    for (int i = 1; i <= n; i++) {
+        void *prop = *(void **)(stack + FRAME_PROPCHAIN);
+        if (!prop) { ok = 0; break; }
+        *(void **)(stack + FRAME_PROPCHAIN) = *(void **)((uint8_t *)prop + PROP_NEXT);
+        memset(scratch, 0, sizeof scratch);
+        ((StepFn)AT(g_build->step_compiled_in))(stack, scratch, prop);
+    }
+    *(void **)(stack + FRAME_PROPCHAIN) = saved;
+    if (ok) memcpy(out, scratch, size);
+    return ok;
+}
+
+#define CMC_UPDATEDCOMP   0xC8    /* USceneComponent* UpdatedComponent */
+#define CMC_MOVEMODE      0x180   /* uint8 MovementMode, +0x181 CustomMovementMode */
+#define CMC_GROUNDMODE    0x372   /* uint8 GroundMovementMode */
+#define COMP_LOCATION     0x120   /* ComponentToWorld translation */
+#define ADJUST_DIST       100.0f  /* cm the joiner may be off before it is corrected */
+#define ADJUST_INTERVAL   0.25f   /* s between corrections of one joiner */
+
+typedef void (*AdjustFn)(void *cmc, float ts, const float *loc, const float *vel, void *base,
+                         uint64_t bone, uint8_t has_base, uint8_t relative, uint8_t mode);
+static unsigned g_moves_adjusted;
+static struct { void *cmc; float ts; } g_last_adjust[32];
+
+static uint8_t packed_move_mode(uint8_t *cmc)
+{
+    uint8_t mode = cmc[CMC_MOVEMODE];
+    if (mode == 6) /* MOVE_Custom */
+        return (uint8_t)(cmc[CMC_MOVEMODE + 1] + *(uint8_t *)AT(g_build->move_mode_custom));
+    return (uint8_t)(mode | ((cmc[CMC_GROUNDMODE] != 1) << *(uint8_t *)AT(g_build->move_mode_shift)));
+}
+
+/* After a ServerMove ran: ack it, or, when the host's position for this pawn is
+   far from where the joiner says it is (a teleport such as the start of the
+   match, a blocked move), send the host's position with ClientAdjustPosition. */
+static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const float *client_loc)
+{
+    if (!cfg.ack_moves || !ok || !(ts > 0.0f)) return;
+    if (((IsPendingKillFn)AT(g_build->is_pending_kill))(cmc)) return;
+    uint8_t *comp = *(uint8_t **)(cmc + CMC_UPDATEDCOMP);
+    if (have_loc && comp && g_build->adjust_position) {
+        const float *loc = (const float *)(comp + COMP_LOCATION);
+        float dx = loc[0] - client_loc[0], dy = loc[1] - client_loc[1], dz = loc[2] - client_loc[2];
+        if (dx * dx + dy * dy + dz * dz > ADJUST_DIST * ADJUST_DIST) {
+            int slot = -1, free_slot = -1;
+            for (int i = 0; i < 32; i++) {
+                if (g_last_adjust[i].cmc == cmc) slot = i;
+                else if (!g_last_adjust[i].cmc && free_slot < 0) free_slot = i;
+            }
+            if (slot < 0) slot = free_slot >= 0 ? free_slot : (int)(((uintptr_t)cmc >> 4) & 31);
+            if (g_last_adjust[slot].cmc == cmc && ts > g_last_adjust[slot].ts
+                && ts - g_last_adjust[slot].ts < ADJUST_INTERVAL)
+                return;                     /* a correction is on its way */
+            g_last_adjust[slot].cmc = cmc;
+            g_last_adjust[slot].ts = ts;
+            static const float zero[3] = { 0, 0, 0 };
+            ((AdjustFn)AT(g_build->adjust_position))(cmc, ts, loc, zero, NULL, 0, 0, 0, packed_move_mode(cmc));
+            g_moves_adjusted++;
+            hlog("AdjustPosition: joiner at (%.0f %.0f %.0f), host has (%.0f %.0f %.0f); corrected (%u so far)",
+                 client_loc[0], client_loc[1], client_loc[2], loc[0], loc[1], loc[2], g_moves_adjusted);
+            return;
+        }
+    }
+    ((AckGoodMoveFn)AT(g_build->ack_good_move))(cmc, ts);
+    g_moves_acked++;
+    DWORD t = GetTickCount();
+    if (t - g_last_ack_report >= 10000) {
+        g_last_ack_report = t;
+        hlog("AckMoves: %u moves acked, %u corrected so far (last TimeStamp %.3f)", g_moves_acked, g_moves_adjusted, ts);
+    }
+}
+
+/* ServerMove(TimeStamp, InAccel, ClientLoc, ...);
+   ServerMoveDual(...)(TimeStamp0, InAccel0, PendingFlags, View0, TimeStamp, InAccel, ClientLoc, ...). */
+static void h_exec_move(void *cmc, uint8_t *stack, void *result)
+{
+    float ts = 0, loc[3];
+    int ok = peek_param(stack, 1, &ts, sizeof ts);
+    int have_loc = peek_param(stack, 3, loc, sizeof loc);
+    o_exec_move(cmc, stack, result);
+    answer_move(cmc, ok, ts, have_loc, loc);
+}
+
+static void h_exec_dual(void *cmc, uint8_t *stack, void *result)
+{
+    float ts = 0, loc[3];
+    int ok = peek_param(stack, 5, &ts, sizeof ts);
+    int have_loc = peek_param(stack, 7, loc, sizeof loc);
+    o_exec_dual(cmc, stack, result);
+    answer_move(cmc, ok, ts, have_loc, loc);
+}
+
+static void h_exec_hybrid(void *cmc, uint8_t *stack, void *result)
+{
+    float ts = 0, loc[3];
+    int ok = peek_param(stack, 5, &ts, sizeof ts);
+    int have_loc = peek_param(stack, 7, loc, sizeof loc);
+    o_exec_hybrid(cmc, stack, result);
+    answer_move(cmc, ok, ts, have_loc, loc);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -774,6 +1021,16 @@ static void install(void)
 
     uint8_t *near_page = alloc_near(g_base, 4096);
 
+    if (g_build->gmalloc && GetEnvironmentVariableW(L"SOS_HOST_AUTOJOIN", g_autojoin, 1024) > 0
+        && g_autojoin[1023] == 0) {
+        if (cfg.game_log) {
+            g_autojoin_state = 1;
+            hlog("AutoJoin armed: will travel after the frontend login");
+        } else {
+            hlog("AutoJoin needs GameLog=1; ignored");
+        }
+    }
+
     if (cfg.game_log && near_page) {
         static const uint8_t prologue[5] = { 0x40, 0x53, 0x55, 0x56, 0x57 };
         uint8_t *fn = g_base + g_build->log_fn;
@@ -851,6 +1108,29 @@ static void install(void)
         }
         hlog("ReplicateActors=%d ReplicateStartupActors=%d", cfg.replicate_actors && o_tick_flush,
              cfg.replicate_startup);
+        if (cfg.ack_moves && g_build->exec_server_move) {
+            /* mov [rsp+18h],rbx; push rbp; push rsi; push rdi; lea rbp,[rsp-47h] */
+            static const uint8_t p_exec[13] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57,
+                                                0x48, 0x8D, 0x6C, 0x24, 0xB9 };
+            o_exec_move = (ExecFn)hook_entry(&cursor, g_build->exec_server_move, p_exec, 13,
+                                             (void *)h_exec_move, "CMC::execServerMove");
+            o_exec_dual = (ExecFn)hook_entry(&cursor, g_build->exec_server_move_dual, p_exec, 13,
+                                             (void *)h_exec_dual, "CMC::execServerMoveDual");
+            o_exec_hybrid = (ExecFn)hook_entry(&cursor, g_build->exec_server_move_hybrid, p_exec, 13,
+                                               (void *)h_exec_hybrid, "CMC::execServerMoveDualHybridRootMotion");
+        }
+        hlog("AckMoves=%d", cfg.ack_moves && o_exec_move && o_exec_dual);
+        if (cfg.skip_login_check && g_build->login_check) {
+            /* RestartPlayer: IsLoggedIn(gm, pc); test al,al; jne <spawn> -> jmp <spawn>.
+               Otherwise a player with no backend login (a direct-URL joiner, the host's
+               own player) is sent ClientGotoState(LoginPending) and never spawns. */
+            uint8_t *site = g_base + g_build->login_check;
+            uint8_t jmp = 0xEB;
+            if (site[0] == 0x75 && site[-2] == 0x84 && site[-1] == 0xC0 && write_code(site, &jmp, 1))
+                hlog("SkipLoginCheck: RestartPlayer login check bypassed at +%07x", g_build->login_check);
+            else
+                hlog("SkipLoginCheck: login check not found at +%07x; left as is", g_build->login_check);
+        }
     }
 
     if (cfg.unfilter_cmdline) {
