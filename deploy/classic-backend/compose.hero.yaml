@@ -1,0 +1,32 @@
+# hero-tv test backend (HERO_TV.md 8.4): its own compose project, image tag and volumes, port 7783 only.
+# Separate project name, so nothing here can recreate or stop the prod `ogsos` project (backend on 7781, hosts).
+#   docker build -t ogsos-backend:hero -f deploy/classic-backend/Dockerfile <hero-tv stage dir>
+#   docker compose -f deploy/classic-backend/compose.hero.yaml up -d --no-build
+#   docker compose -f deploy/classic-backend/compose.hero.yaml down      (keeps volumes; add -v to wipe test state)
+name: ogsos-hero
+
+services:
+  backend-hero:
+    image: ogsos-backend:hero
+    restart: "no"
+    env_file:
+      - path: .env.hero
+        required: false
+    ports:
+      - "${BIND_IP:-0.0.0.0}:7783:7781"
+    volumes:
+      - state-hero:/state
+      - logs-hero:/logs
+    mem_limit: 1g
+    cpus: 0.5
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  state-hero:
+  logs-hero:
