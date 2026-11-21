@@ -43,6 +43,7 @@
 /* xinput1_3.dll forwarding                                                  */
 /* ------------------------------------------------------------------------ */
 
+#ifndef SOS_CORE
 #define XI_NAMED(X) \
     X(XInputGetState) X(XInputSetState) X(XInputGetCapabilities) X(XInputEnable) \
     X(XInputGetDSoundAudioDeviceGuids) X(XInputGetBatteryInformation) X(XInputGetKeystroke)
@@ -88,6 +89,13 @@ static void load_real_xinput(HMODULE self)
     RESOLVE_ORD(p_xi_103, 103)
 }
 
+#else
+/* Core build (sos_client_core.dll): the stable loader (xinput1_3.dll) owns the XInput forwarding and hands over
+   the real XInputGetState pointer in sos_core_start(). */
+static void *p_XInputGetState;
+static HMODULE g_real_xinput;
+#endif
+
 /* ------------------------------------------------------------------------ */
 /* Config and logging                                                        */
 /* ------------------------------------------------------------------------ */
@@ -106,6 +114,7 @@ static struct {
 
 static struct { wchar_t name[64], val[48]; } g_cv[32];   /* [Cvars] section of the ini */
 static int g_ncv;
+static int g_auto_update = 1;      /* AutoUpdate in the ini (core build) */
 static float g_vfov, g_vzfov;        /* VerticalFOV / VerticalZoomFOV from the ini, 0 = leave */
 static volatile LONG g_map_gen;      /* bumped on every LoadMap */
 static wchar_t g_dump_pat[64];       /* DumpObjects=: log objects whose name contains this, once (development aid) */
@@ -194,6 +203,9 @@ static void load_config(HMODULE self)
     cfg.overlay            = GetPrivateProfileIntW(L"Client", L"Overlay", 1, g_ini);
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
     cfg.hide_shutdown      = GetPrivateProfileIntW(L"Client", L"HideShutdownNotice", 1, g_ini);
+#ifdef SOS_CORE
+    g_auto_update          = GetPrivateProfileIntW(L"Client", L"AutoUpdate", 1, g_ini);
+#endif
     GetPrivateProfileStringW(L"Client", L"BuildLabel", L"OG SOS Revival", g_build_label, 96, g_ini);
     {
         static wchar_t sec[4096];
@@ -1310,6 +1322,10 @@ static void ensure_worker(void)
     if (t) CloseHandle(t);
     else slog("could not start the worker thread");
 }
+
+#ifdef SOS_CORE
+#include "core_update.inc"
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* UI layout and hit testing                                                 */
@@ -2851,13 +2867,42 @@ static void install(void)
         int pads = 0;
         for (DWORD i = 0; i < 4; i++) {
             uint8_t st[16];
-            if (((DWORD (WINAPI *)(DWORD, void *))p_XInputGetState)(i, st) == 0) pads++;
+            if (p_XInputGetState && ((DWORD (WINAPI *)(DWORD, void *))p_XInputGetState)(i, st) == 0) pads++;
         }
         slog("xinput: real XInput %s, %d gamepad(s) connected", g_real_xinput ? "loaded" : "NOT loaded (stub)", pads);
     }
     slog("ready");
 }
 
+#ifdef SOS_CORE
+#ifndef SOS_CORE_VERSION
+#define SOS_CORE_VERSION 1
+#endif
+__declspec(dllexport) const unsigned long sos_core_version = SOS_CORE_VERSION;
+
+/* Called by the loader (from its DllMain, before the game has read any config) with the real XInputGetState. */
+__declspec(dllexport) int sos_core_start(HMODULE self, void *real_xinput_get_state)
+{
+    InitializeCriticalSection(&g_log_lock);
+    InitializeCriticalSection(&g_ui_lock);
+    InitializeCriticalSection(&g_tok_lock);
+    InitializeCriticalSection(&g_game_lock);
+    InitializeCriticalSection(&g_trk_lock);
+    p_XInputGetState = real_xinput_get_state;
+    g_real_xinput = real_xinput_get_state ? self : NULL;   /* only used for the log line */
+    load_config(self);
+    install();
+    upd_start();   /* independent of the game build: a fix for a patched game must still arrive */
+    return 1;
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+{
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(inst);
+    return TRUE;
+}
+#else
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -2874,3 +2919,4 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+#endif
