@@ -903,6 +903,18 @@ static void replicate_actors(uint8_t *drv)
             uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
             if (p && is_character(p)) tick_pose_always(p);
         }
+        /* PossessedBy on this host leaves the pawn's Owner null (a dedicated
+           server sets it to the controller). Owner replicates, and the joiner
+           uses it for bOwnerNoSee/bOnlyOwnerSee: with no owner it draws its own
+           third-person body around the first-person camera ("camera inside
+           my head") and hides its first-person arms. */
+        {
+            uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
+            if (p && !*(uint8_t **)(p + ACTOR_OWNER)) {
+                *(uint8_t **)(p + ACTOR_OWNER) = pc;
+                hlog("Pawn %p: Owner set to its controller %p", (void *)p, (void *)pc);
+            }
+        }
         /* The joiner's own controller, pawn and player state first. */
         uint8_t *own[3] = { pc, *(uint8_t **)(pc + PC_PAWN), *(uint8_t **)(pc + PC_PLAYERSTATE) };
         int ok = 1;
