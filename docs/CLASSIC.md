@@ -131,17 +131,15 @@ Outfit and gesture availability is decided in C++ by `CustomizationLibrary::Filt
   - Founders Pack shirts: 784710, 784730, 784750, 784760, 784820.
   - Gestures: Bow 811670, BrushItOff 784780, Dance02 784800, HandToFace 784790, SlowClap 784770.
   - The name plate (PlayerNameWidget) checks DLC 812320 and 784810.
-- **Entitlement string `alpha-beta`** on the alpha/beta shirts.
-- **App roles** for role-gated gestures.
+- **App role `alpha-beta`** (asset property `AppRole`) on the Alpha/Beta shirts; the backend grants it (docs/CLASSIC_CONTENT.md). No gesture is role-gated.
 
 How the check works (Confirmed, Ghidra):
 
 - The per-item check FUN_140166970 needs all three of these:
   - asset status byte (+0x3C1) is 3, or 1 under an extra condition;
   - `IsEntitlementAvailable(Entitlement)`;
-  - `Entitlement` role empty or `IsPlayerInAppRole`.
+  - `AppRole` empty or `IsPlayerInAppRole(AppRole)`.
 - `IsEntitlementAvailable` (FUN_140166d90) returns **true when the string is empty or not numeric** (FUN_140386590 is `FString::IsNumeric`). Otherwise it calls `_wtoi64` and asks the Steam subsystem whether that DLC is installed.
-- So the **`alpha-beta` shirts are already available to everyone** because the string is not numeric.
 - Only the numeric Steam DLC ids are locked.
 - `IsDLCInstalled` (FUN_140166cd0, used by PlayerNameWidget) works the same way, except that an empty or non-numeric string gives false.
 
