@@ -104,6 +104,10 @@ static struct {
     int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
 } cfg = { 1, 0, 0, 1, 1, 1, 0, 1, 1 };
 
+static struct { wchar_t name[64], val[48]; } g_cv[32];   /* [Cvars] section of the ini */
+static int g_ncv;
+static float g_vfov, g_vzfov;        /* VerticalFOV / VerticalZoomFOV from the ini, 0 = leave */
+static volatile LONG g_map_gen;      /* bumped on every LoadMap */
 static wchar_t g_dump_pat[64];       /* DumpObjects=: log objects whose name contains this, once (development aid) */
 static wchar_t g_build_label[96];   /* replacement for the BuildVersionText label; empty = leave it */
 
@@ -191,6 +195,25 @@ static void load_config(HMODULE self)
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
     cfg.hide_shutdown      = GetPrivateProfileIntW(L"Client", L"HideShutdownNotice", 1, g_ini);
     GetPrivateProfileStringW(L"Client", L"BuildLabel", L"OG SOS Revival", g_build_label, 96, g_ini);
+    {
+        static wchar_t sec[4096];
+        DWORD n = GetPrivateProfileSectionW(L"Cvars", sec, 4096, g_ini);
+        for (wchar_t *s = sec; n && *s && g_ncv < 32; s += wcslen(s) + 1) {
+            wchar_t *eq = wcschr(s, L'=');
+            if (!eq || eq == s || s[0] == L';') continue;
+            size_t nl = (size_t)(eq - s);
+            if (nl >= 64 || wcslen(eq + 1) >= 48 || !eq[1]) continue;
+            wcsncpy(g_cv[g_ncv].name, s, nl);
+            g_cv[g_ncv].name[nl] = 0;
+            wcscpy(g_cv[g_ncv].val, eq + 1);
+            g_ncv++;
+        }
+        wchar_t fv[32];
+        GetPrivateProfileStringW(L"Client", L"VerticalFOV", L"0", fv, 32, g_ini);
+        g_vfov = (float)wcstod(fv, NULL);
+        GetPrivateProfileStringW(L"Client", L"VerticalZoomFOV", L"0", fv, 32, g_ini);
+        g_vzfov = (float)wcstod(fv, NULL);
+    }
     GetPrivateProfileStringW(L"Client", L"DumpObjects", L"", g_dump_pat, 64, g_ini);
     cfg.borderless         = GetPrivateProfileIntW(L"Client", L"Borderless", 0, g_ini);
     cfg.unlock_dlc         = GetPrivateProfileIntW(L"Client", L"UnlockDlcCosmetics", 1, g_ini);
@@ -711,6 +734,7 @@ static void map_loaded(const wchar_t *url)
     if (!menu && !cfg.show_everywhere) U.open = 0;
     U.dirty = 1;
     LeaveCriticalSection(&g_ui_lock);
+    InterlockedIncrement(&g_map_gen);
     slog("LoadMap: %ls (main menu: %d%s)", m, menu, was != menu ? ", changed" : "");
 }
 
@@ -2544,11 +2568,89 @@ static void text_tick(void *fn)
     }
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* Console variables and FOV                                                 */
+/* ------------------------------------------------------------------------ */
+/* [Cvars] in the ini: "name=value" lines applied with IConsoleVariable::Set(value, SetByConsole) found
+   through IConsoleManager::FindConsoleVariable (vtable slot 17; Set is slot 11 of the variable's vtable).
+   This skips the console text path, whose Cheat check would refuse some variables. Applied once per
+   map load on the game thread, a few seconds after the load. VerticalFOV / VerticalZoomFOV call the
+   game's own exec functions of the same names on the player controller. */
+#define RVA_CONSOLE_MGR 0x29D1E50u
+
+static int g_cv_gen = -1;
+static ULONGLONG g_cv_due;
+static void *g_fov_done[8];
+static int g_nfov_done;
+static FNameI g_n_pc, g_n_vfov, g_n_vzfov;
+
+static void cvars_apply(void)
+{
+    void **pm = (void **)AT(RVA_CONSOLE_MGR);
+    void *mgr = *pm;
+    if (!plausible_ptr(mgr)) { slog("cvars: console manager not ready"); return; }
+    void **mvt = *(void ***)mgr;
+    if (!plausible_ptr(mvt)) return;
+    for (int i = 0; i < g_ncv; i++) {
+        void *cv = ((void *(*)(void *, const wchar_t *))mvt[17])(mgr, g_cv[i].name);
+        if (!plausible_ptr(cv)) { slog("cvars: %ls does not exist", g_cv[i].name); continue; }
+        void **cvt = *(void ***)cv;
+        if (!plausible_ptr(cvt)) continue;
+        ((void (*)(void *, const wchar_t *, uint32_t))cvt[11])(cv, g_cv[i].val, 0x09000000u);
+        slog("cvars: %ls = %ls (reads back %g)", g_cv[i].name, g_cv[i].val, (double)((float (*)(void *))cvt[13])(cv));
+    }
+}
+
+static void fov_apply(void)
+{
+    uint8_t *objs = *(uint8_t **)AT(RVA_GUOBJ_OBJECTS);
+    int32_t num = *(int32_t *)AT(RVA_GUOBJ_NUM);
+    if (!plausible_ptr(objs) || num <= 0 || num > 8 * 1024 * 1024) return;
+    FNameCtorFn mk = (FNameCtorFn)AT(RVA_FNAME_CTOR);
+    if (!g_n_pc.idx) mk(&g_n_pc, L"SurvivalPlayerController_C", 0);
+    if (!g_n_vfov.idx) mk(&g_n_vfov, L"VerticalFOV", 0);
+    if (!g_n_vzfov.idx) mk(&g_n_vzfov, L"VerticalZoomFOV", 0);
+    if (!g_n_pc.idx || !g_n_vfov.idx) return;
+    for (int32_t i = 0; i < num; i++) {
+        uint8_t *item = objs + (size_t)i * 16;
+        uint8_t *obj = *(uint8_t **)item;
+        if (!obj || (*(int32_t *)(item + 8) & 0x20000000)) continue;
+        if (((const FNameI *)(obj + 0x18))->idx != g_n_pc.idx) continue;
+        if (*(const uint32_t *)(obj + 8) & 0x10) continue;
+        if (in_list(g_fov_done, g_nfov_done, obj)) continue;
+        void *cls = *(void **)(obj + 0x10);
+        if (!plausible_ptr(cls)) continue;
+        struct { float v; float pad[7]; } parms;
+        void *fn = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(cls, g_n_vfov, 1);
+        if (g_vfov > 0 && fn) { memset(&parms, 0, sizeof parms); parms.v = g_vfov; o_pe(obj, fn, &parms); slog("fov: VerticalFOV %.1f on %p", g_vfov, (void *)obj); }
+        fn = g_n_vzfov.idx ? ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(cls, g_n_vzfov, 1) : NULL;
+        if (g_vzfov > 0 && fn) { memset(&parms, 0, sizeof parms); parms.v = g_vzfov; o_pe(obj, fn, &parms); slog("fov: VerticalZoomFOV %.1f on %p", g_vzfov, (void *)obj); }
+        if (g_nfov_done < 8) g_fov_done[g_nfov_done++] = obj;
+    }
+}
+
+static void game_tick(void)
+{
+    if (!g_ncv && g_vfov <= 0 && g_vzfov <= 0) return;
+    if (GetCurrentThreadId() != *(DWORD *)AT(RVA_GAME_THREAD_ID)) return;
+    ULONGLONG now = GetTickCount64();
+    LONG gen = g_map_gen;
+    if (gen != g_cv_gen) { g_cv_gen = gen; g_cv_due = now + 4000; g_nfov_done = 0; }
+    if (g_cv_due && now >= g_cv_due) {
+        g_cv_due = 0;
+        if (g_ncv) cvars_apply();
+    }
+    static ULONGLONG next_fov;
+    if ((g_vfov > 0 || g_vzfov > 0) && now >= next_fov) { next_fov = now + 2000; fov_apply(); }
+}
+
 static void h_process_event(void *self, void *fn, void *parms)
 {
     if (g_play_flag) play_tick(self);
     o_pe(self, fn, parms);
     if (g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0]) text_tick(fn);
+    if (g_ncv || g_vfov > 0 || g_vzfov > 0) game_tick();
 }
 
 
@@ -2727,7 +2829,7 @@ static void install(void)
         if (!o_avail) slog("unreleased cosmetics unavailable");
     }
 
-    if (cfg.auto_play || g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0]) {
+    if (cfg.auto_play || g_build_label[0] || cfg.hide_shutdown || g_dump_pat[0] || g_ncv || g_vfov > 0 || g_vzfov > 0) {
         /* push rbp; push rsi; push rdi; push r12; push r13; push r14; push r15 (REX on rbp) */
         static const uint8_t p_pe[12] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
         o_pe = (ProcessEventFn)hook_entry(&cursor, RVA_PROCESS_EVENT, p_pe, 12, (void *)h_process_event,
