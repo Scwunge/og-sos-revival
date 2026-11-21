@@ -2,7 +2,7 @@
 //
 //   node tools/host_classic.js [--public-host <IPv4>] [--port 7781] [--game-port 7777]
 //        [--min-players N] [--countdown S] [--steam-id <id64>] [--sos-host-dir <dir>]
-//        [--game "<Classic install folder>"] [--no-game-log] [--dry-run]
+//        [--game "<Classic install folder>"] [--no-game-log] [--host-ini Key=Value ...] [--dry-run]
 //        [--name "<server name, max 48>"] [--region <text, max 16>]   (listed in the backend's GET /servers; re-sent every 60 s)
 //   node tools/host_classic.js --cleanup     remove installed files / restore Engine.ini after a crash
 //
@@ -36,11 +36,13 @@ const APP_ID = APPS.classic.id; // 802240
 const BACKUP_TAG = '.hostclassic-backup-';
 const STATE_FILE = path.join(os.tmpdir(), 'ogsos_host_classic_state.json');
 
-// Enforced [Host] keys (everything else in sos_host.ini is kept as shipped).
+// Enforced [Host] keys (everything else in sos_host.ini is kept as shipped, e.g. ReplicateStartupActors).
+// --host-ini Key=Value (repeatable) overrides or adds any key.
 const HOST_INI_KEYS = {
   EnableListen: '1', UnfilterCommandLine: '1', SteamSockets: '0', FixJoinState: '1',
-  MaxClientRate: '100000', ReplicateActors: '1', ReplicateStartupActors: '0', GameLog: '1',
+  MaxClientRate: '100000', ReplicateActors: '1', GameLog: '1',
 };
+const hostIniKeys = (o) => ({ ...HOST_INI_KEYS, ...(o.noGameLog ? { GameLog: '0' } : {}), ...(o.hostIni || {}) });
 
 // ---------- pure helpers (unit-testable) ----------
 
@@ -132,7 +134,11 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (valued[a]) { if (i + 1 >= argv.length) throw new Error(`${a} needs a value`); o[valued[a]] = argv[++i]; }
-    else if (a === '--exe-arg') { if (i + 1 >= argv.length) throw new Error('--exe-arg needs a value'); o.exeArgs.push(argv[++i]); }
+    else if (a === '--host-ini') {
+      const m = (argv[++i] || '').match(/^(\w+)=([^\r\n]*)$/);
+      if (!m) throw new Error('--host-ini needs Key=Value');
+      (o.hostIni = o.hostIni || {})[m[1]] = m[2];
+    } else if (a === '--exe-arg') { if (i + 1 >= argv.length) throw new Error('--exe-arg needs a value'); o.exeArgs.push(argv[++i]); }
     else if (bool[a]) o[bool[a]] = true;
     else throw new Error(`unknown option ${a}`);
   }
@@ -327,7 +333,7 @@ function installFile(src, dst, { keepOld = false } = {}) {
 }
 
 function installDll(cfg, o, log) {
-  const iniText = setIniKeys(fs.readFileSync(cfg.iniSrc, 'utf8'), 'Host', { ...HOST_INI_KEYS, ...(o.noGameLog ? { GameLog: '0' } : {}) });
+  const iniText = setIniKeys(fs.readFileSync(cfg.iniSrc, 'utf8'), 'Host', hostIniKeys(o));
   const dll = path.join(cfg.win64, 'version.dll');
   const old = installFile(cfg.dllSrc, dll, { keepOld: true });
   if (old) log(`version.dll was locked; moved it to ${path.basename(old)}`);
@@ -408,7 +414,7 @@ function printPlan(cfg, o, session, jwt) {
   const ann = announceBody(o);
   L(ann ? `   announce: POST http://${cfg.backend}/api/session/<id>/announce ${JSON.stringify(ann)} (Authorization: Token <redacted>), then every 60 s` : '   announce: none planned (pass --name / --region to list this server)');
   L(`3. launcher: ${process.execPath} ${launcherArgs(cfg, o).join(' ')}`);
-  L(`4. install into Win64: version.dll, sos_host.ini [Host] ${Object.entries({ ...HOST_INI_KEYS, ...(o.noGameLog ? { GameLog: '0' } : {}) }).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+  L(`4. install into Win64: version.dll, sos_host.ini [Host] ${Object.entries(hostIniKeys(o)).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   L(`   steam_appid.txt (${APP_ID}) ${fs.existsSync(path.join(cfg.win64, 'steam_appid.txt')) ? 'already present, left alone' : 'will be created'}`);
   L(`5. host: ${cfg.exe} ${redactArgs([...cfg.exeArgs, ...buildGameArgs({ jwt, ...session })], secrets).join(' ')}`);
   L(`   cwd ${cfg.win64}; env SteamAppId=${APP_ID} SteamGameId=${APP_ID}`);
@@ -531,7 +537,7 @@ async function main() {
   return exitCode;
 }
 
-module.exports = { parseVdf, mostRecentSteamId, setIniKeys, buildGameArgs, redactArgs, isOurFile, parseArgs, resolveRemoteSession, sessionFromJson, announceBody, startAnnounce, sessionApi, HOST_INI_KEYS, cleanupWin64, installFile };
+module.exports = { parseVdf, mostRecentSteamId, setIniKeys, buildGameArgs, redactArgs, isOurFile, parseArgs, resolveRemoteSession, sessionFromJson, announceBody, startAnnounce, sessionApi, HOST_INI_KEYS, hostIniKeys, cleanupWin64, installFile };
 
 if (require.main === module) {
   main().then((c) => process.exit(c), (e) => { console.error(`ERROR: ${e.message}`); process.exit(1); });
