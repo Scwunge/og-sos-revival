@@ -266,6 +266,7 @@ async function hostedScenario() {
 
   await check('hosted: cancel-find-session below the minimum cancels the countdown', async () => {
     await post('/reset');
+    await get();   // a reset lobby is offline until the host polls again (HOST_ONLINE_SECONDS gating)
     const x = []; for (let i = 0; i < 3; i++) { x[i] = await open(toks[i]); await find(x[i]); }
     x[2].send('cancel-find-session'); await x[2].take('ack');
     await x[0].never('session-started', CD + 800);
