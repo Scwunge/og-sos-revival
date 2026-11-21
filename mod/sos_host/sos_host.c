@@ -642,7 +642,8 @@ typedef void (*CallPreRepFn)(void *actor, void *drv);
 
 static TickFlushFn o_tick_flush;
 static uint8_t **g_due;
-static uint8_t *g_prepped;    /* per due actor: CallPreReplication done this pass */
+static uint8_t *g_prepped;
+static uint8_t *g_served;     /* per due actor: connections it was offered to this pass */    /* per due actor: CallPreReplication done this pass */
 static int g_due_cap;
 static float g_next_pass;
 static unsigned g_opened, g_sent, g_passes;
@@ -868,15 +869,18 @@ static void replicate_actors(uint8_t *drv)
                 g_due = p;
                 uint8_t *pp = (uint8_t *)realloc(g_prepped, cap);
                 if (!pp) break;
-                g_prepped = pp; g_due_cap = cap;
+                g_prepped = pp;
+                uint8_t *sv = (uint8_t *)realloc(g_served, cap);
+                if (!sv) break;
+                g_served = sv; g_due_cap = cap;
             }
             g_prepped[ndue] = 0;
+            g_served[ndue] = 0;
             g_due[ndue++] = a;
         }
     }
 
-    /* Actors before done_upto were offered to every connection. */
-    int done_upto = ndue;
+    int nserved_conns = 0;   /* connections processed this pass; g_served[i] counts offers */
     for (int c = 0; c < nconns; c++) {
         uint8_t *conn = conns[c];
         if (!conn || *(int32_t *)(conn + CONN_STATE) == 1) continue;
@@ -932,25 +936,37 @@ static void replicate_actors(uint8_t *drv)
         }
         const float *ploc = cfg.replicate_startup == 2 ? ploc_any : NULL;
         float radius = (float)cfg.startup_radius;
-        int i = 0;
-        for (; ok && i < ndue; i++) {
-            uint8_t *a = g_due[i];
-            if (a == own[0] || a == own[1] || a == own[2] || !relevant_to(a, pc)) continue;
-            if (cfg.tick_char_radius > 0 && ploc_any && is_character(a) &&
-                near_loc(a, ploc_any, (float)cfg.tick_char_radius))
-                tick_pose_always(a);
-            if (cfg.replicate_startup == 2 && (a[ACTOR_FLAGS] & 4)) {
-                /* No pawn yet: hold map actors back. Not yet near: skip; a channel
-                   that is already open keeps getting updates. */
-                if (!ploc) continue;
-                if (!near_loc(a, ploc, radius) && !find_actor_channel(conn, a)) continue;
+        /* Two phases: everything dynamic (GameState, players, AI, loot) first,
+           then map-placed actors with a smaller opening budget, so a joiner's
+           first seconds of bandwidth don't go to thousands of crates and
+           obstructions while it waits on its loading screen. */
+        int startup_opens = 16;
+        for (int phase = 0; phase < 2 && ok; phase++) {
+            for (int i = 0; i < ndue; i++) {
+                uint8_t *a = g_due[i];
+                int startup = (a[ACTOR_FLAGS] & 4) != 0;
+                if (startup != phase) continue;
+                if (a == own[0] || a == own[1] || a == own[2] || !relevant_to(a, pc)) { g_served[i]++; continue; }
+                if (cfg.tick_char_radius > 0 && ploc_any && is_character(a) &&
+                    near_loc(a, ploc_any, (float)cfg.tick_char_radius))
+                    tick_pose_always(a);
+                if (cfg.replicate_startup == 2 && startup) {
+                    /* No pawn yet: hold map actors back. Not yet near: skip; a channel
+                       that is already open keeps getting updates. */
+                    if (!ploc) { g_served[i]++; continue; }
+                    if (!near_loc(a, ploc, radius) && !find_actor_channel(conn, a)) { g_served[i]++; continue; }
+                }
+                if (!replicate_to(drv, conn, a, startup ? &startup_opens : &opens_left, &g_prepped[i])) { ok = 0; break; }
+                g_served[i]++;
             }
-            if (!replicate_to(drv, conn, a, &opens_left, &g_prepped[i])) { ok = 0; break; }
         }
-        if (!ok && i < done_upto) done_upto = i;
+        nserved_conns++;
     }
 
-    for (int i = 0; i < done_upto; i++) {
+    int done_upto = 0;
+    for (int i = 0; i < ndue; i++) {
+        if (g_served[i] < nserved_conns) continue;   /* not offered to every connection yet */
+        done_upto++;
         float f = *(float *)(g_due[i] + ACTOR_NETUPDATEFREQ);
         if (!(f >= 1.0f)) f = 1.0f;
         if (f > (float)rate) f = (float)rate;
