@@ -290,7 +290,8 @@ function handleApi(req, url, body, res) {
 
   // Routes the game host (a listen server) calls on its MMS, authorised by `Token <SESSION_TOKEN>`.
   // POST .../start and .../reset are for whoever runs the server (same token; or type `start` in the console).
-  if ((r = m(/^\/api\/session\/([^/]+?)(\/events|\/start|\/reset|\/end|\/announce)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
+  // Also without the /api prefix: the sos_host DLL posts match-end to <backend>/session/<id>/events.
+  if ((r = m(/^\/(?:api\/)?session\/([^/]+?)(\/events|\/start|\/reset|\/end|\/announce)?$/)) && ((r[2] && req.method === 'POST') || (!r[2] && req.method === 'GET'))) {
     const id = decodeURIComponent(r[1]);
     const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
     const found = owner.getHostedSession(id);
