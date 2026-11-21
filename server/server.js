@@ -87,10 +87,15 @@ function readClassicOptions() {
   };
 }
 const CLASSIC = readClassicOptions();
+// Classic cosmetics have no inventory: an outfit part is shown if its Status is Released, its
+// numeric `Entitlement` (a Steam DLC id) is owned, and its `AppRole` is one of the player's roles.
+// `alpha-beta` is the only AppRole on any cosmetic (the two Alpha/Beta T-shirts on all 12
+// characters, docs/CLASSIC_CONTENT.md), so granting it unlocks everything the backend can.
+const CLASSIC_COSMETIC_ROLES = ['alpha-beta'];
 // AppRoles is matched as a space-separated list; `user` keeps the GrantApp step a no-op,
 // `testserver` opens matchmaking even if the KV switch is off.
 function classicRoles(accountId, steamId, asked) {
-  const roles = new Set([...(Array.isArray(asked) ? asked.map(String) : []), 'app-user', 'user', 'testserver', ...CLASSIC.extraRoles]);
+  const roles = new Set([...(Array.isArray(asked) ? asked.map(String) : []), 'app-user', 'user', 'testserver', ...CLASSIC_COSMETIC_ROLES, ...CLASSIC.extraRoles]);
   if (CLASSIC.devAccounts.includes(accountId) || (steamId && CLASSIC.devAccounts.includes(steamId))) roles.add('dev');
   return [...roles];
 }
