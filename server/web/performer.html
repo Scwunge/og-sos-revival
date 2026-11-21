@@ -12,7 +12,7 @@ html, body { margin: 0; background: transparent; font-family: Arial, Helvetica, 
   background: rgba(0,0,0,0.6); border: 2px solid #888; opacity: 1; -webkit-transition: opacity 1s; transition: opacity 1s; }
 </style></head>
 <body>
-<div id="bar"><span id="brand">SOS LIVE</span><span id="count">0 watching</span></div>
+<div id="bar" style="display:none"><span id="brand">SOS LIVE</span><span id="count"></span></div>
 <div id="feed"></div>
 <script>
 var CFG = /*CFG*/null;
@@ -21,7 +21,13 @@ var CFG = /*CFG*/null;
   var NAMES = { laughter: 'LAUGH', anger: 'ANGER', applause: 'CLAP', shock: 'SHOCK', love: 'LOVE' };
   if (CFG.skipBrand) document.getElementById('brand').style.display = 'none';
   if (CFG.hideViewCount) document.getElementById('count').style.display = 'none';
-  if (CFG.skipBrand && CFG.hideViewCount) document.getElementById('bar').style.display = 'none';
+  // Nothing mid-screen until someone is actually watching: the bar stays hidden while the count is 0.
+  function showCount(n) {
+    var bar = document.getElementById('bar');
+    if (CFG.hideViewCount || !(n > 0)) { bar.style.display = 'none'; return; }
+    document.getElementById('count').textContent = n + ' watching';
+    bar.style.display = 'inline-block';
+  }
   var feed = document.getElementById('feed');
 
   function toast(s, n) {
@@ -44,7 +50,7 @@ var CFG = /*CFG*/null;
       var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
       var d = m.data || {};
       if (m.type !== 'message' || !d.message) return;
-      if (d.topic === 'viewers') document.getElementById('count').textContent = d.message.count + ' watching';
+      if (d.topic === 'viewers') showCount(d.message.count);
       else if (d.topic === 'feedback-batch') { var c = d.message.counts || {}; for (var s in c) if (c.hasOwnProperty(s)) toast(s, c[s]); }
     };
     ws.onclose = function () { setTimeout(connect, 3000); };
