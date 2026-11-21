@@ -192,6 +192,7 @@ typedef struct {
     uint32_t move_mode_custom;  /* uint8 custom-mode base used by PackNetworkMovementMode */
     uint32_t login_check;       /* JNE (75 xx) after IsLoggedIn in the RestartPlayer override; 0 = not mapped */
     uint32_t gmalloc;           /* FMalloc* GMalloc (vtable: +0x10 Malloc(size, align), +0x20 Free) */
+    uint32_t call_prereplication; /* void AActor::CallPreReplication(AActor*, UNetDriver*) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -204,6 +205,7 @@ static const GameBuild k_builds[] = {
         0x01cd360, 0x01c7370, 0x14e9160, 0x14e8d20, 0x01f0600,
         0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -215,6 +217,7 @@ static const GameBuild k_builds[] = {
         0x11f5460, 0x0ac6ce0, 0x053ecd0, 0x11dba20, 0x1080c10, 0x107dbe0, 0x01672f0,
         0x161e450, 0x161e770, 0x161ebd0, 0x0537810, 0x14824b0, 0x14824f0, 0x2b5a6ec, 0x2b5a7d8,
         0x0185ca0, 0x29e7560,
+        0x0eb1400,
     },
 };
 
@@ -577,12 +580,14 @@ static uint64_t h_eliminate(void *tm, uint8_t *ps)
 #define DRV_CLIENTCONNS   0x78    /* TArray<UNetConnection*> ClientConnections */
 #define DRV_WORLD         0xA0    /* UWorld* */
 #define DRV_NAME          0xE0    /* FName NetDriverName */
+#define DRV_REPFRAME      0x280   /* uint32 ReplicationFrame: property changelists are only recompared when it moves */
 #define DRV_MAXTICKRATE   0x48    /* int32 NetServerMaxTickRate */
 #define DRV_VT_LEVELINIT  0x300   /* bool IsLevelInitializedForActor(actor, conn) */
 #define WORLD_LEVELS      0x108   /* TArray<ULevel*> */
 #define WORLD_TIMESECONDS 0x878   /* float */
 #define LEVEL_ACTORS      0xA0    /* TArray<AActor*> */
-#define CONN_OWNINGACTOR  0x30
+#define CONN_OWNINGACTOR  0x30    /* UPlayer::PlayerController */
+#define CONN_VIEWTARGET   0x88    /* AActor* ViewTarget; multicast RPCs skip connections where it is null */
 #define CONN_STATE        0x124   /* 1 = closed */
 #define CONN_ACTORCHANNELS 0x51490 /* TMap<FWeakObjectPtr, UActorChannel*> elements */
 #define CONN_VT_ISNETREADY 0x240  /* int IsNetReady(bool bSaturate) */
@@ -594,6 +599,9 @@ static uint64_t h_eliminate(void *tm, uint8_t *ps)
 #define ACTOR_NETUPDATEFREQ 0x130 /* float */
 #define ACTOR_ROOTCOMP    0x160   /* USceneComponent* RootComponent */
 #define ACTOR_COMPLOC     0x120   /* ComponentToWorld translation */
+#define CHAR_MESH         0x3E0   /* USkeletalMeshComponent* ACharacter::Mesh */
+#define OBJ_OUTER         0x20
+#define MESH_UPDATEFLAG   0x704   /* uint8 MeshComponentUpdateFlag: 0 AlwaysTickPoseAndRefreshBones, 1 OnlyTickPoseWhenRendered */
 #define CH_REPFLAGS       0x88    /* 8 = bIsReplicatingActor */
 #define CHTYPE_ACTOR      2
 
@@ -606,9 +614,11 @@ typedef uint8_t (*ReplicateActorFn)(void *ch);
 typedef uint8_t (*IsPendingKillFn)(void *obj);
 typedef uint8_t (*LevelInitFn)(void *drv, void *actor, void *conn);
 typedef int (*IsNetReadyFn)(void *conn, int saturate);
+typedef void (*CallPreRepFn)(void *actor, void *drv);
 
 static TickFlushFn o_tick_flush;
 static uint8_t **g_due;
+static uint8_t *g_prepped;    /* per due actor: CallPreReplication done this pass */
 static int g_due_cap;
 static float g_next_pass;
 static unsigned g_opened, g_sent, g_passes;
@@ -627,7 +637,15 @@ static uint8_t *find_actor_channel(uint8_t *conn, uint8_t *actor)
 }
 
 /* 1 = handled (or nothing to do), 0 = connection saturated, stop for now. */
-static int replicate_to(uint8_t *drv, uint8_t *conn, uint8_t *actor, int *opens_left)
+static void prep_actor(uint8_t *drv, uint8_t *actor, uint8_t *done)
+{
+    if (done && *done) return;
+    if (g_build->call_prereplication)
+        ((CallPreRepFn)AT(g_build->call_prereplication))(actor, drv);
+    if (done) *done = 1;
+}
+
+static int replicate_to(uint8_t *drv, uint8_t *conn, uint8_t *actor, int *opens_left, uint8_t *done)
 {
     if (!((IsNetReadyFn)VCALL(conn, CONN_VT_ISNETREADY))(conn, 0)) return 0;
     uint8_t *ch = find_actor_channel(conn, actor);
@@ -641,6 +659,7 @@ static int replicate_to(uint8_t *drv, uint8_t *conn, uint8_t *actor, int *opens_
         g_opened++;
     }
     if (ch[CH_REPFLAGS] & 8) return 1;
+    prep_actor(drv, actor, done);
     ((ReplicateActorFn)AT(g_build->replicate_actor))(ch);
     g_sent++;
     return 1;
@@ -649,13 +668,14 @@ static int replicate_to(uint8_t *drv, uint8_t *conn, uint8_t *actor, int *opens_
 static int relevant_to(uint8_t *actor, uint8_t *pc)
 {
     if (!(actor[ACTOR_FLAGS] & 8)) return 1;           /* not owner-only */
-    uint8_t *top = actor;
-    for (int i = 0; i < 16; i++) {
-        uint8_t *owner = *(uint8_t **)(top + ACTOR_OWNER);
-        if (!owner) break;
-        top = owner;
+    /* The engine's pawns have no Owner here (PossessedBy leaves it null), so an
+       item owned by the joiner's pawn counts as the joiner's too. */
+    uint8_t *pawn = *(uint8_t **)(pc + PC_PAWN);
+    for (uint8_t *a = actor; a; a = *(uint8_t **)(a + ACTOR_OWNER)) {
+        if (a == pc || (pawn && a == pawn)) return 1;
+        if (a != actor && a == *(uint8_t **)(a + ACTOR_OWNER)) break;
     }
-    return top == pc || actor == *(uint8_t **)(pc + PC_PAWN);
+    return 0;
 }
 
 /* 1 = actor's root is within r cm of loc (or either has no location). */
@@ -684,6 +704,10 @@ static void replicate_actors(uint8_t *drv)
     if (now < g_next_pass && now + 5.0f > g_next_pass) return;
     g_next_pass = now + 1.0f / rate;
     g_passes++;
+    /* Stock ServerReplicateActors starts with ReplicationFrame++. Without it
+       FReplicationChangelistMgr::Update reuses the first compare forever, so
+       only an actor's initial state is ever sent. */
+    (*(uint32_t *)(drv + DRV_REPFRAME))++;
 
     uint64_t drv_name = *(uint64_t *)(drv + DRV_NAME);
     IsPendingKillFn pending_kill = (IsPendingKillFn)AT(g_build->is_pending_kill);
@@ -709,8 +733,12 @@ static void replicate_actors(uint8_t *drv)
                 int cap = g_due_cap ? g_due_cap * 2 : 4096;
                 uint8_t **p = (uint8_t **)realloc(g_due, cap * sizeof *p);
                 if (!p) break;
-                g_due = p; g_due_cap = cap;
+                g_due = p;
+                uint8_t *pp = (uint8_t *)realloc(g_prepped, cap);
+                if (!pp) break;
+                g_prepped = pp; g_due_cap = cap;
             }
+            g_prepped[ndue] = 0;
             g_due[ndue++] = a;
         }
     }
@@ -723,12 +751,28 @@ static void replicate_actors(uint8_t *drv)
         uint8_t *pc = *(uint8_t **)(conn + CONN_OWNINGACTOR);
         if (!pc) continue;
         int opens_left = 64;
+        /* Stock ServerReplicateActors sets this every frame; the multicast path in
+           UIpNetDriver::ProcessRemoteFunction skips connections without one. */
+        {
+            uint8_t *vt_pawn = *(uint8_t **)(pc + PC_PAWN);
+            *(uint8_t **)(conn + CONN_VIEWTARGET) = vt_pawn ? vt_pawn : pc;
+        }
+        /* A listen host never renders the joiner's character, so with the
+           default OnlyTickPoseWhenRendered its montages don't tick here: no
+           AnimNotifies (eat, use, melee hit windows) and no root motion. A
+           dedicated server ticks every pose; do the same for joiner pawns. */
+        {
+            uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
+            uint8_t *mesh = p ? *(uint8_t **)(p + CHAR_MESH) : NULL;
+            if (mesh && *(uint8_t **)(mesh + OBJ_OUTER) == p && mesh[MESH_UPDATEFLAG] == 1)
+                mesh[MESH_UPDATEFLAG] = 0;
+        }
         /* The joiner's own controller, pawn and player state first. */
         uint8_t *own[3] = { pc, *(uint8_t **)(pc + PC_PAWN), *(uint8_t **)(pc + PC_PLAYERSTATE) };
         int ok = 1;
         for (int k = 0; k < 3 && ok; k++)
             if (own[k] && (own[k][ACTOR_FLAGS2] & 4) && !pending_kill(own[k]))
-                ok = replicate_to(drv, conn, own[k], &opens_left);
+                ok = replicate_to(drv, conn, own[k], &opens_left, NULL);
         const float *ploc = NULL;
         if (cfg.replicate_startup == 2 && own[1]) {
             uint8_t *root = *(uint8_t **)(own[1] + ACTOR_ROOTCOMP);
@@ -745,7 +789,7 @@ static void replicate_actors(uint8_t *drv)
                 if (!ploc) continue;
                 if (!near_loc(a, ploc, radius) && !find_actor_channel(conn, a)) continue;
             }
-            if (!replicate_to(drv, conn, a, &opens_left)) { ok = 0; break; }
+            if (!replicate_to(drv, conn, a, &opens_left, &g_prepped[i])) { ok = 0; break; }
         }
         if (!ok && i < done_upto) done_upto = i;
     }
