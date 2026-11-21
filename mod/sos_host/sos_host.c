@@ -209,6 +209,7 @@ typedef struct {
     uint32_t call_prereplication; /* void AActor::CallPreReplication(AActor*, UNetDriver*) */
     uint32_t stream_status_rpc; /* PC::ClientUpdateLevelStreamingStatus(pc, FName, bLoaded, bVisible, bBlock, int LOD) sender */
     uint32_t ls_package_name;   /* FName* ULevelStreaming::GetWorldAssetPackageFName(ls, FName* out) */
+    uint32_t notify_destroyed;  /* void UNetDriver::NotifyActorDestroyed(drv, actor, bool bIsSeamlessTravel); server part stripped */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -221,7 +222,7 @@ static const GameBuild k_builds[] = {
         0x01cd360, 0x01c7370, 0x14e9160, 0x14e8d20, 0x01f0600,
         0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0,
+        0, 0, 0, 0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -233,7 +234,7 @@ static const GameBuild k_builds[] = {
         0x11f5460, 0x0ac6ce0, 0x053ecd0, 0x11dba20, 0x1080c10, 0x107dbe0, 0x01672f0,
         0x161e450, 0x161e770, 0x161ebd0, 0x0537810, 0x14824b0, 0x14824f0, 0x2b5a6ec, 0x2b5a7d8,
         0x0185ca0, 0x29e7560,
-        0x0eb1400, 0x1483480, 0x118a410,
+        0x0eb1400, 0x1483480, 0x118a410, 0x11ea410,
     },
 };
 
@@ -639,6 +640,7 @@ static int g_due_cap;
 static float g_next_pass;
 static unsigned g_opened, g_sent, g_passes;
 static int64_t g_pass_ticks;   /* QPC ticks spent in replicate_actors */
+static unsigned g_destroy_closed, g_destroy_startup;
 static DWORD g_last_report;
 
 
@@ -931,9 +933,10 @@ static void replicate_actors(uint8_t *drv)
     if (t - g_last_report >= 10000) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
-        hlog("ReplicateActors: %d connection(s), %d due, %d fully served, %u channels opened, %u updates sent, %u passes, %.0f ms in passes over %.1f s",
+        hlog("ReplicateActors: %d connection(s), %d due, %d fully served, %u channels opened, %u updates sent, %u passes, %.0f ms in passes over %.1f s, %u destroy closes (%u startup)",
              nconns, ndue, done_upto, g_opened, g_sent, g_passes,
-             g_pass_ticks * 1000.0 / f.QuadPart, (t - g_last_report) / 1000.0);
+             g_pass_ticks * 1000.0 / f.QuadPart, (t - g_last_report) / 1000.0,
+             g_destroy_closed, g_destroy_startup);
         g_pass_ticks = 0;
         g_last_report = t;
     }
@@ -968,6 +971,56 @@ static void cap_frame(void)
             Sleep((DWORD)(hns / 10000));
     }
     next.QuadPart += period;
+}
+
+/* Destroyed actors. The client build's UNetDriver::NotifyActorDestroyed only
+   drops the property tracker: the server part (close each connection's
+   channel, remember destroyed startup actors) is compiled out, so joiners
+   keep ghosts of everything the host destroys (picked-up items, broken
+   obstructions, used loot). Here, while the actor is still valid:
+   - a connection with a channel for it gets the channel closed, which makes
+     the client destroy its copy;
+   - a map-placed (bNetStartup) actor the connection never received gets a
+     channel opened, its first bunch sent (the client resolves its stable
+     name to its own copy of the map actor) and closed at once.
+   Not covered: joiners that connect after the destroy (the stock engine
+   keeps a DestroyedStartupOrDormantActors list for them). */
+#define CH_FLAGS          0x30    /* 2 = Closing */
+#define CH_VT_CLOSE       0x1F0   /* UChannel::Close (0x141063820 in Classic) */
+typedef void (*NotifyDestroyedFn)(uint8_t *drv, uint8_t *actor, int seamless);
+typedef void (*ChanCloseFn)(void *ch);
+static NotifyDestroyedFn o_notify_destroyed;
+
+static void h_notify_destroyed(uint8_t *drv, uint8_t *actor, int seamless)
+{
+    if (cfg.replicate_actors && actor && !seamless && !*(void **)(drv + DRV_SERVERCONN) &&
+        (actor[ACTOR_FLAGS2] & 4)) {
+        uint8_t *world = *(uint8_t **)(drv + DRV_WORLD);
+        uint8_t **conns = *(uint8_t ***)(drv + DRV_CLIENTCONNS);
+        int nconns = *(int32_t *)(drv + DRV_CLIENTCONNS + 8);
+        int startup = (actor[ACTOR_FLAGS] & 4) && cfg.replicate_startup;
+        if (world && *(uint8_t **)(world + UWORLD_NETDRIVER) == drv && conns &&
+            *(uint64_t *)(actor + ACTOR_NETDRIVER) == *(uint64_t *)(drv + DRV_NAME)) {
+            for (int c = 0; c < nconns; c++) {
+                uint8_t *conn = conns[c];
+                if (!conn || *(int32_t *)(conn + CONN_STATE) == 1) continue;
+                uint8_t *pc = *(uint8_t **)(conn + CONN_OWNINGACTOR);
+                uint8_t *ch = find_actor_channel(conn, actor);
+                if (!ch && startup && pc && *(uint8_t **)(pc + PC_PAWN)) {
+                    if (!((LevelInitFn)VCALL(drv, DRV_VT_LEVELINIT))(drv, actor, conn)) continue;
+                    ch = ((CreateChannelFn)AT(g_build->create_channel))(conn, CHTYPE_ACTOR, 1, -1);
+                    if (!ch) continue;
+                    ((SetChannelActorFn)AT(g_build->set_channel_actor))(ch, actor);
+                    ((ReplicateActorFn)AT(g_build->replicate_actor))(ch);
+                    g_destroy_startup++;
+                }
+                if (!ch || (*(uint32_t *)(ch + CH_FLAGS) & 2)) continue;
+                ((ChanCloseFn)VCALL(ch, CH_VT_CLOSE))(ch);
+                g_destroy_closed++;
+            }
+        }
+    }
+    o_notify_destroyed(drv, actor, seamless);
 }
 
 static void h_tick_flush(uint8_t *drv, float dt)
@@ -1321,6 +1374,11 @@ static void install(void)
                                                  0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20 };
             o_tick_flush = (TickFlushFn)hook_entry(&cursor, g_build->tick_flush, p_flush, 15,
                                                    (void *)h_tick_flush, "UNetDriver::TickFlush");
+        }
+        if (o_tick_flush && cfg.replicate_actors && g_build->notify_destroyed) {
+            static const uint8_t p_destroyed[9] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0xD9 };
+            o_notify_destroyed = (NotifyDestroyedFn)hook_entry(&cursor, g_build->notify_destroyed, p_destroyed, 9,
+                                                               (void *)h_notify_destroyed, "UNetDriver::NotifyActorDestroyed");
         }
         hlog("ReplicateActors=%d ReplicateStartupActors=%d TickCharacterRadius=%d MaxFPS=%d",
              cfg.replicate_actors && o_tick_flush, cfg.replicate_startup, cfg.tick_char_radius,
