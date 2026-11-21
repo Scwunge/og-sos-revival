@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, readSessionJwt, DEFAULTS } = require('./matchmaking');
+const { refreshPersona } = require('./persona');
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -347,6 +348,8 @@ function handleApi(req, url, body, res) {
       identities: steamId ? [{ provider: 'steam', 'provider-data': steamId }] : [],
     };
     db.accounts[accountId]['last-access'] = new Date().toISOString();
+    // Steam persona as the in-game name (the client joins with ?Name=<display-name>); see server/persona.js.
+    if (steamId) refreshPersona(db.accounts[accountId], steamId, { save: saveDb });
     const appId = String(j['app-id'] || req.headers['app-id'] || 'sos');
     const roles = isClassic(appId) ? classicRoles(accountId, steamId, j.roles) : (j.roles || ['app-user']);
     const jwt = makeJwt(accountId, steamId, roles, appId);
