@@ -1,0 +1,41 @@
+[05:06:10.695][37040] sos_client loaded into SOS: Classic at 00007FF64A750000 (backend 127.0.0.1:7790, OverrideEndpoints=1, Overlay=1, ShowButtonEverywhere=0)
+[05:06:10.697][37040] FConfigCacheIni::GetString hooked at +0407720
+[05:06:10.697][37040] FMsg::Logf_Internal hooked at +044a500
+[05:06:10.697][37040] WinInet IAT slots: send=00007FF64C671D98 (rva 1f21d98) open=00007FF64C671DA0 read=00007FF64C671DC8 addhdr=0000000000000000 (expected send rva 1f21d98)
+[05:06:10.697][37040] IAT hook: HttpSendRequestW
+[05:06:10.698][37040] call site hooked: HttpSendRequestW at +0aaac43
+[05:06:10.698][37040] call site hooked: HttpOpenRequestW at +0aaaae5
+[05:06:10.700][37040] call site hooked: InternetReadFile at +0aa66d4
+[05:06:10.701][37040] OutpostWebSocket connect hooked at +0e17f90
+[05:06:10.701][37040] UObject::ProcessEvent hooked at +05364c0
+[05:06:10.701][37040] FD3D11Viewport inner present hooked at +073b930
+[05:06:10.701][37040] ready
+[05:06:11.278][37040] config override [OutpostIdentity] Endpoint = http://127.0.0.1:7790
+[05:06:11.304][37040] config override [OutpostMatchmakingClient] MatchmakingEndpoint = 127.0.0.1
+[05:06:11.305][37040] config override [OutpostMatchmakingClient] MatchmakingPort = 7790
+[05:06:11.305][37040] config override [OutpostMatchmakingClient] MatchmakingSSL = False
+[05:06:11.305][37040] config override [OutpostMatchmakingClient] MatchmakingApi = http://127.0.0.1:7790/api
+[05:06:13.806][37040] window subclassed (hwnd 00000000004A0808)
+[05:06:14.081][37040] config override [OutpostLogReceiver] Endpoint = http://127.0.0.1:7790
+[05:06:14.086][37040] config override [OutpostAppPersistence] Endpoint = http://127.0.0.1:7790
+[05:06:14.086][37040] config override [OutpostStreamClient] StreamEndpoint = 127.0.0.1
+[05:06:14.087][37040] config override [OutpostStreamClient] StreamPort = 7790
+[05:06:14.087][37040] config override [OutpostStreamClient] StreamSSL = False
+[05:06:14.088][37040] config override [OutpostStreamClient] StreamPath = /ws/stream
+[05:06:14.088][37040] config override [OutpostStreams] EmbedEndpoint = http://127.0.0.1:7790
+[05:06:14.089][37040] config override [OutpostLeaderboards] Endpoint = http://127.0.0.1:7790
+[05:06:14.089][37040] config override [OutpostKeyValueStore] EndpointServer = http://127.0.0.1:7790/kv/
+[05:06:14.090][37040] config override [OutpostKeyValueStore] EndpointClient = http://127.0.0.1:7790/kv/
+[05:06:28.496][37040] LoadMap: MainMenu2 (main menu: 1, changed)
+[05:06:28.513][37040] overlay: D3D11 pipeline ready
+[05:06:38.984][37040] ws connect 127.0.0.1:7790/ws extra length 533, has a JWT
+[05:06:38.984][37040] auth token captured from matchmaking connect (length 401)
+[05:07:04.342][37040] join-hint aaaaaaaa-0000-4000-8000-000000000002 -> HTTP 200
+[05:07:04.343][37040] trigger_play: requested for "Local Test B"
+[05:07:04.343][37040] play: class FName FrontendActionBar_C = (111551,0)
+[05:07:04.351][37040] play: bar candidate 000001EEF4FC5000 index 153529 object "ActionBar" outer "WidgetTree" flags 00280008
+[05:07:04.351][37040] play: bar candidate 000001EE8BA74800 index 158210 object "ActionBar" outer "WidgetTree" flags 00280008
+[05:07:04.357][37040] play: 2 bar instance(s); using the newest 000001EE8BA74800
+[05:07:04.357][37040] play: bar 000001EE8BA74800 fn 000001EEDF8B2DC0 In Queue=-1 PleaseWaitRefCount=-1
+[05:07:04.357][37040] play: calling original ProcessEvent(bar, PLAY click handler)
+[05:07:04.359][37040] play: PLAY click handler returned

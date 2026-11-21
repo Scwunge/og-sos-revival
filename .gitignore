@@ -8,3 +8,5 @@ dist/
 deploy/classic-backend/host.env
 deploy/classic-backend/.env.test
 deploy/classic-backend/pool/*.env
+
+mod/sos_client/build/
