@@ -4,6 +4,26 @@
 #   docker compose logs -f backend
 name: ogsos
 
+# Shared settings of every Classic game host container (see the host / host1..3 services).
+x-classic-host: &classic-host
+  build:
+    context: ../classic-host
+  image: ogsos-classic-host:local
+  restart: unless-stopped
+  mem_limit: 4g
+  cpus: 2.0
+  pids_limit: 512
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 20s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   backend:
     build:
@@ -33,6 +53,80 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Classic game host under Wine (deploy/classic-host): one game per container, one container per lobby.
+  # Game files are private bind mounts, never part of the image (docs/LINUX_HOST.md). Profiles keep a
+  # plain `docker compose up -d` from touching them.
+  #   single test host:  docker compose --profile host up -d --no-deps host
+  #   lobby pool:        deploy/classic-host/make_pool_slot.sh <n> for each slot, then
+  #                      docker compose --profile pool up -d --no-deps host1 host2 host3
+  host:
+    <<: *classic-host
+    profiles: ["host"]
+    env_file: host.env
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${OGSOS_HOST_UDP_PORT:-7777}:7777/udp"
+    volumes:
+      - /srv/ogsos/classic:/game
+      - /srv/ogsos/host/prefix:/home/ubuntu/prefix
+      - /srv/ogsos/host/logs:/home/ubuntu/logs
+
+  # Pool slots. Each has its own session (pool/host<n>.env, matching one HOSTS entry in the backend's env),
+  # its own UDP port, Wine prefix and logs, and a hard-linked copy of the game tree (so per-slot logs and
+  # sos_host.ini never collide, at no extra disk).
+  host1:
+    <<: *classic-host
+    profiles: ["pool"]
+    env_file: pool/host1.env
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${OGSOS_POOL1_PORT:-7777}:7777/udp"
+    volumes:
+      - /srv/ogsos/pool/1/game:/game
+      - /srv/ogsos/pool/1/prefix:/home/ubuntu/prefix
+      - /srv/ogsos/pool/1/logs:/home/ubuntu/logs
+  host2:
+    <<: *classic-host
+    profiles: ["pool"]
+    env_file: pool/host2.env
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${OGSOS_POOL2_PORT:-7778}:7777/udp"
+    volumes:
+      - /srv/ogsos/pool/2/game:/game
+      - /srv/ogsos/pool/2/prefix:/home/ubuntu/prefix
+      - /srv/ogsos/pool/2/logs:/home/ubuntu/logs
+  host3:
+    <<: *classic-host
+    profiles: ["pool"]
+    env_file: pool/host3.env
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${OGSOS_POOL3_PORT:-7779}:7777/udp"
+    volumes:
+      - /srv/ogsos/pool/3/game:/game
+      - /srv/ogsos/pool/3/prefix:/home/ubuntu/prefix
+      - /srv/ogsos/pool/3/logs:/home/ubuntu/logs
+
+  # Side backend for testing a new host before cut-over (own session, own state). Profile "test".
+  backend-test:
+    profiles: ["test"]
+    image: ogsos-backend:local
+    restart: "no"
+    env_file: .env.test
+    ports:
+      - "${BIND_IP:-0.0.0.0}:7782:7781"
+    volumes:
+      - state-test:/state
+      - logs-test:/logs
+    mem_limit: 1g
+    cpus: 0.5
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   state:
   logs:
+  state-test:
+  logs-test:

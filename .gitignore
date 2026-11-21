@@ -5,3 +5,5 @@ secret.key
 __pycache__/
 deploy/classic-backend/.env
 dist/
+deploy/classic-backend/host.env
+deploy/classic-backend/.env.test
