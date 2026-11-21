@@ -81,9 +81,12 @@ static struct {
     wchar_t session[128];     /* backend session id of this match */
     wchar_t token[512];       /* optional "Authorization: Token <this>" for backend calls */
     int mirror_streaming;     /* 1: send the host's streaming-level states to joiners (kept joiners on the loading screen) */
+    int correct_moves;        /* 1: correct a joiner the host has far from its own position */
+    int correct_dist;         /* cm the joiner may be off before it is corrected */
 } cfg = {
     .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
     .replicate_actors = 1, .startup_radius = 15000, .ack_moves = 1,
+    .correct_moves = 1, .correct_dist = 300,
     .tick_char_radius = 15000, .conn_net_speed = 400000, .set_pawn_owner = 1,
 };
 
@@ -116,6 +119,23 @@ static void hlog(const char *fmt, ...)
         CloseHandle(f);
     }
     LeaveCriticalSection(&g_log_lock);
+}
+
+/* Copy the value of a "-KEY=value" command-line switch (case-insensitive key,
+   value ends at a space or quote). Leaves out untouched if the switch is absent. */
+static void cmdline_value(const wchar_t *key, wchar_t *out, int cap)
+{
+    const wchar_t *cl = GetCommandLineW();
+    size_t kl = wcslen(key);
+    for (const wchar_t *p = cl; *p; p++) {
+        if (_wcsnicmp(p, key, kl) != 0) continue;
+        if (p != cl && p[-1] != L' ' && p[-1] != L'"' && p[-1] != L'\t') continue;
+        p += kl;
+        int n = 0;
+        while (p[n] && p[n] != L' ' && p[n] != L'"' && p[n] != L'\t' && n < cap - 1) n++;
+        if (n > 0) { memcpy(out, p, n * sizeof(wchar_t)); out[n] = 0; }
+        return;
+    }
 }
 
 static void load_config(HMODULE self)
@@ -156,6 +176,11 @@ static void load_config(HMODULE self)
     GetEnvironmentVariableW(L"SOS_HOST_SESSION", cfg.session, 128);
     GetPrivateProfileStringW(L"Host", L"SessionToken", L"", cfg.token, 512, ini);
     GetEnvironmentVariableW(L"SOS_HOST_TOKEN", cfg.token, 512);
+    /* Fallback: the supervisor always passes -SESSION_ID= / -SESSION_TOKEN=. */
+    if (!cfg.session[0]) cmdline_value(L"-SESSION_ID=", cfg.session, 128);
+    if (!cfg.token[0])   cmdline_value(L"-SESSION_TOKEN=", cfg.token, 512);
+    cfg.correct_moves    = GetPrivateProfileIntW(L"Host", L"CorrectMoves", cfg.correct_moves, ini);
+    cfg.correct_dist     = GetPrivateProfileIntW(L"Host", L"CorrectDistance", cfg.correct_dist, ini);
     cfg.set_pawn_owner   = GetPrivateProfileIntW(L"Host", L"SetPawnOwner", cfg.set_pawn_owner, ini);
     cfg.mirror_streaming = GetPrivateProfileIntW(L"Host", L"MirrorStreamingLevels", cfg.mirror_streaming, ini);
     {
@@ -1239,8 +1264,9 @@ static void backend_session_event(const char *json)
    TimeStamp. ServerMove: TimeStamp is parameter 1. ServerMoveDual and
    ServerMoveDualHybridRootMotion: parameter 5 is the newer move's TimeStamp
    (TimeStamp0, InAccel0, PendingFlags, View0, TimeStamp, ...); acking it also
-   acks the older one. The joiner is never corrected: it trusts its own
-   position. */
+   acks the older one. The joiner is trusted with its position unless the host
+   has it more than CorrectDistance away (FALL_DIST while falling), e.g. after
+   a teleport; then it gets ClientAdjustPosition instead of the ack. */
 
 #define FRAME_CODE       0x20    /* uint8* Code (0 for a native call) */
 #define FRAME_PROPCHAIN  0x80    /* UField* PropertyChainForCompiledIn */
@@ -1275,9 +1301,33 @@ static int peek_param(uint8_t *stack, int n, void *out, size_t size)
 #define CMC_UPDATEDCOMP   0xC8    /* USceneComponent* UpdatedComponent */
 #define CMC_MOVEMODE      0x180   /* uint8 MovementMode, +0x181 CustomMovementMode */
 #define CMC_GROUNDMODE    0x372   /* uint8 GroundMovementMode */
+#define COMP_ROTATION     0x110   /* ComponentToWorld rotation (FQuat x y z w) */
 #define COMP_LOCATION     0x120   /* ComponentToWorld translation */
-#define ADJUST_DIST       100.0f  /* cm the joiner may be off before it is corrected */
+#define COMP_SCALE        0x130   /* ComponentToWorld scale */
 #define ADJUST_INTERVAL   0.25f   /* s between corrections of one joiner */
+#define FALL_DIST         1000.0f /* cm; while falling only a gap this big is corrected */
+#define MOVE_FALLING      3
+
+/* World position of a point given relative to a movement base component. */
+static void base_to_world(const uint8_t *base, const float *rel, float *out)
+{
+    const float *q = (const float *)(base + COMP_ROTATION);
+    const float *t = (const float *)(base + COMP_LOCATION);
+    const float *s = (const float *)(base + COMP_SCALE);
+    float v[3] = { rel[0] * s[0], rel[1] * s[1], rel[2] * s[2] };
+    /* v' = v + 2w(q x v) + 2 q x (q x v) */
+    float cx = q[1] * v[2] - q[2] * v[1], cy = q[2] * v[0] - q[0] * v[2], cz = q[0] * v[1] - q[1] * v[0];
+    float c2x = q[1] * cz - q[2] * cy, c2y = q[2] * cx - q[0] * cz, c2z = q[0] * cy - q[1] * cx;
+    out[0] = v[0] + 2 * (q[3] * cx + c2x) + t[0];
+    out[1] = v[1] + 2 * (q[3] * cy + c2y) + t[1];
+    out[2] = v[2] + 2 * (q[3] * cz + c2z) + t[2];
+}
+
+static float dist2(const float *a, const float *b)
+{
+    float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return dx * dx + dy * dy + dz * dz;
+}
 
 typedef void (*AdjustFn)(void *cmc, float ts, const float *loc, const float *vel, void *base,
                          uint64_t bone, uint8_t has_base, uint8_t relative, uint8_t mode);
@@ -1295,15 +1345,25 @@ static uint8_t packed_move_mode(uint8_t *cmc)
 /* After a ServerMove ran: ack it, or, when the host's position for this pawn is
    far from where the joiner says it is (a teleport such as the start of the
    match, a blocked move), send the host's position with ClientAdjustPosition. */
-static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const float *client_loc)
+static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const float *client_loc, uint8_t *base)
 {
     if (!cfg.ack_moves || !ok || !(ts > 0.0f)) return;
     if (((IsPendingKillFn)AT(g_build->is_pending_kill))(cmc)) return;
     uint8_t *comp = *(uint8_t **)(cmc + CMC_UPDATEDCOMP);
-    if (have_loc && comp && g_build->adjust_position) {
+    if (cfg.correct_moves && have_loc && comp && g_build->adjust_position) {
         const float *loc = (const float *)(comp + COMP_LOCATION);
-        float dx = loc[0] - client_loc[0], dy = loc[1] - client_loc[1], dz = loc[2] - client_loc[2];
-        if (dx * dx + dy * dy + dz * dz > ADJUST_DIST * ADJUST_DIST) {
+        /* On a movable base the joiner sends its location relative to the base;
+           on a static one it sends world. Take whichever is nearer. */
+        float d2 = dist2(loc, client_loc), world[3];
+        if (base && !((IsPendingKillFn)AT(g_build->is_pending_kill))(base)) {
+            base_to_world(base, client_loc, world);
+            float d2b = dist2(loc, world);
+            if (d2b < d2) d2 = d2b;
+        }
+        /* While falling the host's simulation runs ahead of the joiner's, and a
+           correction (sent with zero velocity) costs the joiner its momentum. */
+        float lim = cmc[CMC_MOVEMODE] == MOVE_FALLING ? FALL_DIST : (float)cfg.correct_dist;
+        if (d2 > lim * lim) {
             int slot = -1, free_slot = -1;
             for (int i = 0; i < 32; i++) {
                 if (g_last_adjust[i].cmc == cmc) slot = i;
@@ -1318,8 +1378,9 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
             static const float zero[3] = { 0, 0, 0 };
             ((AdjustFn)AT(g_build->adjust_position))(cmc, ts, loc, zero, NULL, 0, 0, 0, packed_move_mode(cmc));
             g_moves_adjusted++;
-            hlog("AdjustPosition: joiner at (%.0f %.0f %.0f), host has (%.0f %.0f %.0f); corrected (%u so far)",
-                 client_loc[0], client_loc[1], client_loc[2], loc[0], loc[1], loc[2], g_moves_adjusted);
+            hlog("AdjustPosition: joiner at (%.0f %.0f %.0f)%s, host has (%.0f %.0f %.0f) mode %u; corrected (%u so far)",
+                 client_loc[0], client_loc[1], client_loc[2], base ? " on a base" : "",
+                 loc[0], loc[1], loc[2], cmc[CMC_MOVEMODE], g_moves_adjusted);
             return;
         }
     }
@@ -1339,8 +1400,10 @@ static void h_exec_move(void *cmc, uint8_t *stack, void *result)
     float ts = 0, loc[3];
     int ok = peek_param(stack, 1, &ts, sizeof ts);
     int have_loc = peek_param(stack, 3, loc, sizeof loc);
+    uint8_t *base = NULL;
+    if (!peek_param(stack, 7, &base, sizeof base)) base = NULL;   /* ClientMovementBase */
     o_exec_move(cmc, stack, result);
-    answer_move(cmc, ok, ts, have_loc, loc);
+    answer_move(cmc, ok, ts, have_loc, loc, base);
 }
 
 static void h_exec_dual(void *cmc, uint8_t *stack, void *result)
@@ -1348,8 +1411,10 @@ static void h_exec_dual(void *cmc, uint8_t *stack, void *result)
     float ts = 0, loc[3];
     int ok = peek_param(stack, 5, &ts, sizeof ts);
     int have_loc = peek_param(stack, 7, loc, sizeof loc);
+    uint8_t *base = NULL;
+    if (!peek_param(stack, 11, &base, sizeof base)) base = NULL;  /* ClientMovementBase */
     o_exec_dual(cmc, stack, result);
-    answer_move(cmc, ok, ts, have_loc, loc);
+    answer_move(cmc, ok, ts, have_loc, loc, base);
 }
 
 static void h_exec_hybrid(void *cmc, uint8_t *stack, void *result)
@@ -1357,8 +1422,10 @@ static void h_exec_hybrid(void *cmc, uint8_t *stack, void *result)
     float ts = 0, loc[3];
     int ok = peek_param(stack, 5, &ts, sizeof ts);
     int have_loc = peek_param(stack, 7, loc, sizeof loc);
+    uint8_t *base = NULL;
+    if (!peek_param(stack, 11, &base, sizeof base)) base = NULL;  /* ClientMovementBase */
     o_exec_hybrid(cmc, stack, result);
-    answer_move(cmc, ok, ts, have_loc, loc);
+    answer_move(cmc, ok, ts, have_loc, loc, base);
 }
 
 /* ------------------------------------------------------------------------ */
