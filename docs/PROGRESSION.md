@@ -246,3 +246,13 @@ Cannot work / not available:
 - Whether the host sends `/api/log` analytics (PlayerLevelUp etc.) in a real match; none seen.
 - Formats of `UE_CLIENT_FAME_WEIGHTINGS` / `_FAME_REQUIRED_DELTA` and the original K / step / required-games values.
 - Exact CAS semantics of the real backend (409 on stale `version` assumed; first-GET `version` of a new account assumed 1).
+
+## 7. Our backend (implemented)
+
+`server/progression.js`, wired in `server/server.js` (Classic app `sostest` only; other apps keep the old behaviour):
+- **Blob** `GET/POST /api/account/<id>/app/sostest`: stored verbatim in `db.appData["<id>/sostest"] = {version, data}` (same key as before, so older blobs load). GET needs the host's session token or any player JWT; POST is **host-only** (`Token <SESSION_TOKEN>` of a configured lobby), because logins don't verify the Steam ticket yet. A stale `version` gets 409 with the stored blob; otherwise version + 1. Max 256 KiB. Refusals log `app-data-refused` in `http.jsonl`.
+- **Leaderboards** `/api/leaderboard/sostest/<board>[/<member>]`: score table per board in `db.leaderboards["sostest/<board>"]`; POST host-only (`OGSOS_LEADERBOARD_OPEN=1` lifts that on a test backend), `[]` -> 200 `[]`; GET `?start&limit` and `/<member>?surrounding=N`; rows `{member, rank (1-based), score, uname}`. At most 300 boards (oldest dropped; daily `trending_*` boards pile up).
+- **Match stats** from the sos_host DLL's `match-end` event (`POST /api/session/<id>/events`, fields in the DLL agreement: `matchId`, `players[{playerId, kills, deaths, damageDealt, escaped, placement, survivalSec, relics, fame, ...}]`): deduped by `matchId`, only ids with an account, values clamped, missing stats not counted. `db.matches` keeps the last 500; `db.playerStats[<id>]` the totals. Public reads: `GET /api/stats/player/<id>`, `GET /api/stats/matches?limit=N`.
+- **Fame hook point**: `fameHooks` in `server/server.js` (null by default). The hero.tv work sets it to its `createFame(...)` instance; then `applyToBlob` runs on blob GET/POST, `isFameBoard`/`fameLeaderboard`/`fameAround` answer fame board GETs (falling back to the host-posted scores when they return `[]`), and `fameForMatch(sessionId)` is stored with each match.
+- Tests: `node tools/progression_test.js` (unit), `tools/progression_live_test.js` (end to end over HTTP, test backends only: its match-end ends the lobby).
+
