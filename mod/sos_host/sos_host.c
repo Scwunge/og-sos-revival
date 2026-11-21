@@ -636,6 +636,7 @@ static uint8_t *g_prepped;    /* per due actor: CallPreReplication done this pas
 static int g_due_cap;
 static float g_next_pass;
 static unsigned g_opened, g_sent, g_passes;
+static int64_t g_pass_ticks;   /* QPC ticks spent in replicate_actors */
 static DWORD g_last_report;
 
 
@@ -863,9 +864,13 @@ static void replicate_actors(uint8_t *drv)
 
     DWORD t = GetTickCount();
     if (t - g_last_report >= 10000) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        hlog("ReplicateActors: %d connection(s), %d due, %d fully served, %u channels opened, %u updates sent, %u passes, %.0f ms in passes over %.1f s",
+             nconns, ndue, done_upto, g_opened, g_sent, g_passes,
+             g_pass_ticks * 1000.0 / f.QuadPart, (t - g_last_report) / 1000.0);
+        g_pass_ticks = 0;
         g_last_report = t;
-        hlog("ReplicateActors: %d connection(s), %d due, %d fully served, %u channels opened, %u updates sent, %u passes",
-             nconns, ndue, done_upto, g_opened, g_sent, g_passes);
     }
 }
 
@@ -902,7 +907,13 @@ static void cap_frame(void)
 
 static void h_tick_flush(uint8_t *drv, float dt)
 {
-    if (cfg.replicate_actors) replicate_actors(drv);
+    if (cfg.replicate_actors) {
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        replicate_actors(drv);
+        QueryPerformanceCounter(&t1);
+        g_pass_ticks += t1.QuadPart - t0.QuadPart;
+    }
     o_tick_flush(drv, dt);
     /* Once per frame: only for the world's game driver, and only when hosting. */
     if (cfg.max_fps > 0 && !*(void **)(drv + DRV_SERVERCONN)) {
