@@ -220,3 +220,44 @@ So Classic does not read the BR inventory format, and no BR item id exists in Cl
   - an override `MaleBikerCustomizations`;
   - test it in a local match with the mod pak on client and host.
   - Only continue if it renders without clipping and the stub classes cook compatibly.
+
+## On-screen texts: the "sostest" label and the boot shutdown notice
+
+Both come from the pak and the exe config, not from the backend. Nothing the backend or KV serves changes either of them today. Derived with `tools/kismet_dis.py` on `FrontendHUD.uasset` and `HUDFunctionLibrary.uasset` (extracted read-only) and the cooked `DefaultEngine.ini`. Not yet tested in a running client.
+
+### 1. The text at the bottom of the screen ("SOSTEST v.…")
+
+- **Widget.** `BuildVersionText`, a TextBlock in `Blueprints/UI/Frontend/MainMenu/FrontendHUD`. `FrontendHUD.UpdateBuildInfoText` sets it with `HUDFunctionLibrary.GetProjectVersionText`. The in-game `InGameHUDWidget` calls the same function.
+- **How the string is built** (`GetProjectVersionText`, Blueprint bytecode):
+  - `WebServicesEnv == "prod"` → `"{HERO_APP_ID} v.{PROJECT_VERSION}"`.
+  - Any other env → `"{HERO_APP_ID} v.{PROJECT_VERSION} {WEB_ENV} {PROJECT_BRANCH} "`.
+  - `HERO_APP_ID` is `ToUpper(OutpostOnlineLibrary.GetHeroAppID())`, so the text is upper-case: `SOSTEST v.<project version>`. The version and branch come from `HelperLibrary.GetProjectVersion/GetProjectBranch` (native; the project version is 5.57767.0 for Classic).
+- **Where `sostest` comes from.** The cooked `DefaultEngine.ini` section `[WebServicesConfig]`: `HeroAppId="sostest"` (`WebServicesEnv="prod"`).
+- **Do not change `HeroAppId` to change this text.** The same value is the `app-id` the client sends in the login and in every request header, which the backend uses to pick Classic (`isClassic`, per-app KV, matchmaker). `HUDFunctionLibrary.IsTestServer` is `GetHeroAppID()=="sostest"` and drives the matchmaking gate in `UpdateTestServerAvailable` (see CLASSIC.md). A user-side `Engine.ini` override of `[WebServicesConfig] HeroAppId` probably works as a mechanism, but it would need the backend to accept a second app id and would change the gate. It is not recommended.
+
+**Options, best first:**
+
+1. **Backend/KV: none exists.** No KV key or reply field feeds this text.
+2. **Client-mod hook (recommended).** After a `FrontendHUD_C` (and `InGameHUDWidget_C`) widget is constructed, find its `BuildVersionText` TextBlock and call its `SetText` with `FText("OG SOS Revival")` (reflection / `ProcessEvent`, no byte patching). Re-apply after `UpdateBuildInfoText` runs again, or hook that function so the original call is skipped.
+3. **Override pak.** A `_P` patch pak with `HUDFunctionLibrary.uasset` whose two Format literals are replaced by `"OG SOS Revival"` padded to the same length. Needs same-length edits (package and export sizes stay valid), and the override order of paks in a 4.12.5 client has not been verified. It is a modified game file, so it is not committed anywhere.
+
+### 2. The boot message ("SOS servers will permanently shut down on Monday, November 12, 2018…")
+
+- **Widget.** `ShutdownOverlay` in `Blueprints/UI/Frontend/MainMenu/FrontendHUD`: an overlay with a title, a body and a button, `ShutdownConfirmation`.
+- **Text.** Literal strings in the asset, not localized (there is no entry in `Game.locres`, which has only the alpha-tester thank-you strings):
+  - title: `Thank you for playing SOS!`
+  - body: `SOS servers will permanently shut down on Monday, November 12, 2018. We want to thank you for being a part of the SOS community and giving our game a chance.`
+  - In the same asset: `Version 1.0000.0`, a design-time placeholder for `BuildVersionText`.
+- **How it is chosen.** Nothing in code shows it: the bytecode only has the dismiss handler. `ShutdownConfirmation.OnClicked` runs `ExecuteUbergraph_FrontendHUD(50)`, which sets `ShutdownOverlay` visibility to Collapsed. So the overlay is shown by the widget's design-time default on every frontend load, with no KV, role or date check. It is unrelated to the KV MOTD (`FrontEndDailyMessage` widget) and to `UE_CLIENT_INACTIVE_SERVER_TEXT` (`FormatInactiveServerText`, used for the server-inactive text).
+- **Backend/KV: none exists.** Neither `UE_CLIENT_MOTD` nor any other key touches it.
+
+**Options, best first:**
+
+1. **Client-mod hook (recommended).** When a `FrontendHUD_C` instance exists, call its generated handler `BndEvt__ShutdownConfirmation_K2Node_ComponentBoundEvent_725_OnClicked__DelegateSignature` through `ProcessEvent`. That is exactly the click, so the overlay collapses and the player never sees it. If the welcome text should show instead, find the two TextBlock children of `ShutdownOverlay` (the text blocks are anonymous in the tree, so walk the overlay's children) and `SetText` them to our title and welcome before the dismiss, or leave the overlay open and only replace the text.
+2. **Override pak.** Patch `FrontendHUD.uasset`: replace the body literal (158 characters) by our welcome text padded with spaces to the same length (and likewise the title), or flip the overlay's default visibility byte. Same caveats as above.
+3. **Backend: not possible.** There is nothing to serve.
+
+### Who should make the change
+
+- **Client-mod session** (`client-mod`): the hook for both texts. It is the only route that needs no game file edits, and it has to find the `FrontendHUD_C` and `InGameHUDWidget_C` instances at menu load. It would also be a good place to put the DLC and Status hook from "Porting BR cosmetics".
+- **Backend sessions: nothing to do.** In particular, do not change the `sostest` app id.
