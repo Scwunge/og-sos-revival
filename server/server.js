@@ -13,6 +13,7 @@ const path = require('path');
 const net = require('net');
 const { loadConfig, createMatchmaker, parseHosts, pickPublicHost, cleanLabel, readSessionJwt, DEFAULTS } = require('./matchmaking');
 const { refreshPersona } = require('./persona');
+const { createProgression } = require('./progression');
 
 const ROOT = path.resolve(__dirname, '..');
 // OGSOS_LOG_DIR / OGSOS_STATE_DIR move the writable files (logs; db.json + secret.key) out of the
@@ -341,6 +342,12 @@ function handleApi(req, url, body, res) {
     if (r[2]) {
       let j = {}; try { j = JSON.parse(body || '{}'); } catch {}
       console.log(`host event for session ${id}: ${j.type}`);
+      if (j.type === 'match-end') {
+        // Per-player stats from the sos_host DLL (before endHosted releases the seats). Only real accounts count.
+        const players = (Array.isArray(j.players) ? j.players : []).filter((pl) => pl && db.accounts[String(pl.playerId)]);
+        const rec = progression.recordMatchEnd(id, { ...j, players }, null);
+        console.log(`match-end stats for session ${id}: ${rec.duplicate ? 'duplicate' : `${rec.accepted} player(s)`} (${rec.matchId})`);
+      }
       if (j.type === 'match-end' || j.type === 'session-end') owner.endHosted(id);
       if (j.type === 'match-start') console.log(`host reported match-start for session ${id}`);
       log('ws.jsonl', { event: 'host-event', session: id, type: j.type, body });
@@ -395,7 +402,12 @@ function handleApi(req, url, body, res) {
     return send(res, 200, wrap({ code: crypto.randomBytes(8).toString('hex') }));
   }
 
-  // Per-game saved data (GetAccountAppData / SetAccountAppData).
+  // Per-game saved data (GetAccountAppData / SetAccountAppData). Classic: server/progression.js (auth, CAS).
+  if ((r = m(/^\/api\/account\/([^/]+)\/app\/([^/]+)$/)) && isClassic(decodeURIComponent(r[2]))) {
+    const out = progression.handleAppData(req.method, decodeURIComponent(r[1]), decodeURIComponent(r[2]), body, authToken(req));
+    if (out.status !== 200) log('http.jsonl', { event: 'app-data-refused', status: out.status, method: req.method, path: p });
+    return send(res, out.status, out.body);
+  }
   if ((r = m(/^\/api\/account\/([^/]+)\/app\/([^/]+)$/))) {
     const key = `${r[1]}/${r[2]}`;
     if (req.method === 'GET') return send(res, 200, wrap(db.appData[key]?.data ?? {}, db.appData[key]?.version ?? 1));
@@ -430,7 +442,22 @@ function handleApi(req, url, body, res) {
   if (m(/^\/api\/app\/[^/]+\/store\//)) return send(res, 200, { 'store-view': [] });
 
   if (p === '/api/log') return send(res, 200, wrap({}));
+  // Classic leaderboards (server/progression.js): the game host POSTs scores, clients read rankings.
+  if ((r = m(/^\/api\/leaderboard\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/)) && isClassic(decodeURIComponent(r[1]))) {
+    const q = url.searchParams;
+    const out = progression.handleLeaderboard(req.method, decodeURIComponent(r[1]), decodeURIComponent(r[2]),
+      r[3] ? decodeURIComponent(r[3]) : null,
+      { start: q.get('start') ?? undefined, limit: q.get('limit') ?? undefined, surrounding: q.get('surrounding') ?? undefined },
+      body, authToken(req));
+    if (out.status !== 200) log('http.jsonl', { event: 'leaderboard-refused', status: out.status, method: req.method, path: p });
+    return send(res, out.status, out.body);
+  }
   if (p.startsWith('/api/leaderboard/')) return send(res, 200, []);
+  // Match stats from our host DLL's match-end (public, read-only).
+  if (req.method === 'GET' && (r = m(/^\/api\/stats\/player\/([^/]+)$/))) {
+    return send(res, 200, progression.playerStats(decodeURIComponent(r[1])) || {});
+  }
+  if (req.method === 'GET' && p === '/api/stats/matches') return send(res, 200, progression.recentMatches(Number(url.searchParams.get('limit')) || 20));
   if (p.startsWith('/api/search/account')) return send(res, 200, wrap(Object.values(db.accounts)));
 
   return null;
@@ -516,6 +543,44 @@ const mmClassic = createMatchmaker({
   config: CLASSIC_CONFIG,
   getUname: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
   log: (m) => { log('ws.jsonl', { event: 'mm-classic', text: m }); console.log(`mm[classic] ${m}`); },
+});
+
+// ---------- progression (docs/PROGRESSION.md, server/progression.js) ----------
+// The Classic game host computes XP, level, stats and ratings itself and saves them in the player blob; this only
+// stores blobs and leaderboards and records our host DLL's match-end stats. Host calls carry `Token <SESSION_TOKEN>`
+// of a configured lobby, players their JWT. Blob writes are host-only: logins don't verify the Steam ticket yet.
+function authToken(req) {
+  return String(req.headers['authorization'] || '').replace(/^(Token|Bearer)\s+/i, '').trim() || null;
+}
+function isHostToken(tok) {
+  if (!tok) return false;
+  const given = Buffer.from(String(tok));
+  for (const owner of [mmClassic, mm]) {
+    for (const h of owner.listHosted()) {
+      const want = Buffer.from(owner.getHostedSession(h.id)?.token || '');
+      if (want.length && given.length === want.length && crypto.timingSafeEqual(given, want)) return true;
+    }
+  }
+  return false;
+}
+function jwtAccount(tok) {
+  const c = tok && readJwt(tok);
+  if (!c || (c.exp && c.exp < Date.now() / 1000)) return null;
+  return String(c['account-id'] || c.id || '') || null;
+}
+// Fame (hero-tv, server/fame.js) plugs in by setting fameHooks to its instance; until then fame boards use the
+// scores the game host posts, and blobs pass through untouched.
+let fameHooks = null;
+const progression = createProgression({
+  db, saveDb, isHostToken, jwtAccount,
+  displayName: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
+  fame: {
+    applyToBlob: (id, d) => (fameHooks?.applyToBlob ? fameHooks.applyToBlob(id, d) : d),
+    isFameBoard: (b) => !!fameHooks?.isFameBoard?.(b),
+    fameLeaderboard: (b, o) => fameHooks?.fameLeaderboard?.(b, o) || [],
+    fameAround: (b, m, n) => fameHooks?.fameAround?.(b, m, n) || [],
+    fameForMatch: (id) => fameHooks?.fameForMatch?.(id) ?? null,
+  },
 });
 
 function wsAccount(req) {
