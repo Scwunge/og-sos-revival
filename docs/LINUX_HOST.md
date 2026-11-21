@@ -1,4 +1,4 @@
-# Classic host on Linux (the Linux VPS): plan
+# Classic host on Linux (the VPS): plan
 
 Status: plan only. Nothing is installed on prod. Every install or change on prod needs the user's OK, which goes through the lead session.
 
