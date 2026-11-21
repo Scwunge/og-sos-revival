@@ -74,10 +74,11 @@ static struct {
     int skip_login_check;     /* 1: RestartPlayer treats every player as logged in (test switch) */
     int tick_char_radius;     /* cm; >0: Characters this near a joiner always tick their pose */
     int max_fps;              /* >0: cap the host's frame rate (sleep in TickFlush) */
+    int conn_net_speed;       /* >0: bytes/s each joiner connection may receive (UPlayer::CurrentNetSpeed) */
 } cfg = {
     .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
     .replicate_actors = 1, .startup_radius = 15000, .ack_moves = 1,
-    .tick_char_radius = 15000,
+    .tick_char_radius = 15000, .conn_net_speed = 400000,
 };
 
 static wchar_t g_dir[MAX_PATH];
@@ -142,6 +143,7 @@ static void load_config(HMODULE self)
     cfg.skip_login_check = GetPrivateProfileIntW(L"Host", L"SkipLoginCheck", cfg.skip_login_check, ini);
     cfg.tick_char_radius = GetPrivateProfileIntW(L"Host", L"TickCharacterRadius", cfg.tick_char_radius, ini);
     cfg.max_fps          = GetPrivateProfileIntW(L"Host", L"MaxFPS", cfg.max_fps, ini);
+    cfg.conn_net_speed   = GetPrivateProfileIntW(L"Host", L"JoinerNetSpeed", cfg.conn_net_speed, ini);
     {
         char ev[16];
         if (GetEnvironmentVariableA("SOS_HOST_MAX_FPS", ev, sizeof ev) > 0)
@@ -604,6 +606,7 @@ static uint64_t h_eliminate(void *tm, uint8_t *ps)
 #define WORLD_TIMESECONDS 0x878   /* float */
 #define LEVEL_ACTORS      0xA0    /* TArray<AActor*> */
 #define CONN_OWNINGACTOR  0x30    /* UPlayer::PlayerController */
+#define CONN_NETSPEED     0x38    /* int32 UPlayer::CurrentNetSpeed, bytes/s */
 #define CONN_VIEWTARGET   0x88    /* AActor* ViewTarget; multicast RPCs skip connections where it is null */
 #define CONN_STATE        0x124   /* 1 = closed */
 #define CONN_ACTORCHANNELS 0x51490 /* TMap<FWeakObjectPtr, UActorChannel*> elements */
@@ -883,6 +886,15 @@ static void replicate_actors(uint8_t *drv)
             *(uint8_t **)(conn + CONN_VIEWTARGET) = vt_pawn ? vt_pawn : pc;
         }
         mirror_streaming(world, conn, pc);
+        /* The client asks for its ConfiguredInternetSpeed (100000) and the host
+           clamps it to MaxClientRate, so a joiner over the internet gets
+           100 KB/s: the first seconds of map actors saturate it and its own
+           pawn's position and corrections are dropped for a minute or more.
+           (A local joiner is LAN-rated and never saw this.) */
+        if (cfg.conn_net_speed > 0 && *(int32_t *)(conn + CONN_NETSPEED) != cfg.conn_net_speed) {
+            hlog("Joiner %p net speed %d -> %d", (void *)pc, *(int32_t *)(conn + CONN_NETSPEED), cfg.conn_net_speed);
+            *(int32_t *)(conn + CONN_NETSPEED) = cfg.conn_net_speed;
+        }
         /* A listen host never renders the joiner's character, so with the
            default OnlyTickPoseWhenRendered its montages don't tick here: no
            AnimNotifies (eat, use, melee hit windows) and no root motion. A
