@@ -897,7 +897,7 @@ static void json_escape(char *out, size_t cap, const wchar_t *in, int n)
 static void ps_player_id(uint8_t *ps, char *out, size_t cap)
 {
     out[0] = 0;
-    uint8_t *id = NULL, raw[24];
+    uint8_t *id = NULL, raw[48];
     if (!safe_read(ps + PS_UNIQUEID, &id, sizeof id) || !safe_read(id, raw, sizeof raw)) {
         static int said;
         if (!said++) hlog("PlayerState %p: no UniqueId object (%p)", (void *)ps, (void *)id);
@@ -909,16 +909,29 @@ static void ps_player_id(uint8_t *ps, char *out, size_t cap)
     {
         static int said;
         if (said++ < 4)
-            hlog("PlayerState %p UniqueId %p: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x",
-                 (void *)ps, (void *)id, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                 raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19]);
+            hlog("PlayerState %p UniqueId %p: %016llx %016llx %016llx %016llx %016llx %016llx",
+                 (void *)ps, (void *)id, ((unsigned long long *)raw)[0], ((unsigned long long *)raw)[1],
+                 ((unsigned long long *)raw)[2], ((unsigned long long *)raw)[3], ((unsigned long long *)raw)[4],
+                 ((unsigned long long *)raw)[5]);
     }
-    uint64_t v; memcpy(&v, raw + 8, 8);
-    if ((v >> 32) == 0x01100001ull) { snprintf(out, cap, "%llu", (unsigned long long)v); return; }
-    FString s; memcpy(&s, raw + 8, sizeof s);             /* FUniqueNetIdString */
-    wchar_t buf[64];
-    if (s.num > 1 && s.num < 64 && safe_read(s.data, buf, s.num * sizeof(wchar_t)))
-        json_escape(out, cap, buf, s.num - 1);
+    /* FUniqueNetId derives from TSharedFromThis: vtable, WeakThis (self pointer
+       and reference controller), then the subclass data at +24 (a Steam id as
+       uint64, or an FString). +8 is kept as a fallback for other layouts. */
+    static const int offs[2] = { 24, 8 };
+    for (int k = 0; k < 2; k++) {
+        uint64_t v; memcpy(&v, raw + offs[k], 8);
+        if ((v >> 32) == 0x01100001ull) { snprintf(out, cap, "%llu", (unsigned long long)v); return; }
+    }
+    for (int k = 0; k < 2; k++) {
+        FString s; memcpy(&s, raw + offs[k], sizeof s);          /* FUniqueNetIdString */
+        wchar_t buf[64];
+        if (s.num > 1 && s.num < 64 && safe_read(s.data, buf, s.num * sizeof(wchar_t))) {
+            json_escape(out, cap, buf, s.num - 1);
+            if (out[0]) return;
+        }
+    }
+    /* Unknown layout: keep the player listed under its match-local id. */
+    snprintf(out, cap, "player-%d", *(int32_t *)(ps + PS_PLAYERID));
 }
 
 static void ps_name(uint8_t *ps, char *out, size_t cap)
@@ -981,11 +994,16 @@ static void track_player(uint8_t *pc, float now, unsigned pass)
             if (!g_pl[i].pc) { slot = i; g_pl[i].pc = pc; break; }
     if (slot < 0) return;
     uint8_t *ps = *(uint8_t **)(pc + PC_PLAYERSTATE);
-    if (ps && (ps != g_pl[slot].ps || !g_pl[slot].id[0])) {
+    /* Re-read while the id is unknown or only the match-local "player-N" one:
+       the replicated UniqueId can arrive after the controller. */
+    if (ps && (ps != g_pl[slot].ps || !g_pl[slot].id[0] || !strncmp(g_pl[slot].id, "player-", 7))) {
+        char old_id[48];
+        memcpy(old_id, g_pl[slot].id, sizeof old_id);
         g_pl[slot].ps = ps;
         ps_player_id(ps, g_pl[slot].id, sizeof g_pl[slot].id);
         ps_name(ps, g_pl[slot].name, sizeof g_pl[slot].name);
-        if (g_pl[slot].id[0]) hlog("Player %s (%s) tracked", g_pl[slot].id, g_pl[slot].name);
+        if (g_pl[slot].id[0] && strcmp(old_id, g_pl[slot].id))
+            hlog("Player %s (%s) tracked", g_pl[slot].id, g_pl[slot].name);
     }
     uint8_t *p = *(uint8_t **)(pc + PC_PAWN);
     int alive = p && !((IsPendingKillFn)AT(g_build->is_pending_kill))(p);
