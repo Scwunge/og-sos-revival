@@ -55,7 +55,14 @@ Local backend on port 7790 (two fake lobbies), game started from a hard-linked c
 `UnlockUnreleasedCosmetics=1` in `sos_client.ini` (default on) hooks the game's cosmetic availability check (RVA 0x166970) and reports the Ronin set (`CA_MaleRonin_*`, 8 parts) and `CA_MaleCynic_FacialHair_A` as available by temporarily treating them as released. It matches those asset names only; everything else goes through the original check. Set it to 0 to turn it off.
 
 - Verified: the Ronin row appears in the Harness slot of the topknot character and can be equipped: `docs/client-mod-ronin-listed.png`, `docs/client-mod-ronin-equipped.png`. These assets are unfinished (placeholder "P" icon), so the model shows no visible Ronin mesh.
-- Not done on purpose: paid-DLC ownership (Founders items) is not faked.
+- Verified: the unreleased Cynic beard is listed in the Face slot: `docs/client-mod-cynic-beard-listed.png`.
+
+## Steam DLC cosmetics (optional)
+
+`UnlockDlcCosmetics=1` in `sos_client.ini` (default on) hooks `IsEntitlementAvailable` (0x140166D90) and `IsDLCInstalled` (0x140166CD0) and makes both answer true, so every Steam-DLC-gated outfit, gesture and the name plate can be selected. Set it to 0 to turn it off. It only changes what the local client shows; it buys nothing and sends nothing to any server.
+
+- Verified (with it on): the Founder's Pack T-Shirts row is listed and a gold shirt equips and renders on the character: `docs/client-mod-dlc-founders-listed.png`, `docs/client-mod-dlc-founders-equipped.png`.
+- Not checked in the game: the gestures and the name plate.
 
 ## How Steam launches the game
 

@@ -98,8 +98,9 @@ static struct {
     int game_log;                /* 1: mirror UE_LOG lines to sos_client_game_<pid>.log */
     int overlay;                 /* 1: draw the server browser overlay */
     int auto_play;               /* 1: queue for a match right after a server is selected */
+    int unlock_dlc;              /* 1: report every Steam DLC / entitlement check as owned (cosmetics only) */
     int unlock_unreleased;       /* 1: let the unreleased Ronin parts and one Cynic beard pass the availability filter */
-} cfg = { 1, 0, 0, 1, 1, 1 };
+} cfg = { 1, 0, 0, 1, 1, 1, 1 };
 
 static wchar_t g_dir[MAX_PATH];
 static wchar_t g_ini[MAX_PATH];
@@ -183,6 +184,7 @@ static void load_config(HMODULE self)
     cfg.game_log           = GetPrivateProfileIntW(L"Client", L"GameLog", 0, g_ini);
     cfg.overlay            = GetPrivateProfileIntW(L"Client", L"Overlay", 1, g_ini);
     cfg.auto_play          = GetPrivateProfileIntW(L"Client", L"AutoPlay", 1, g_ini);
+    cfg.unlock_dlc         = GetPrivateProfileIntW(L"Client", L"UnlockDlcCosmetics", 1, g_ini);
     cfg.unlock_unreleased  = GetPrivateProfileIntW(L"Client", L"UnlockUnreleasedCosmetics", 1, g_ini);
 
     wchar_t be[256];
@@ -2338,6 +2340,14 @@ static void h_process_event(void *self, void *fn, void *parms)
 /* ------------------------------------------------------------------------ */
 /* Unreleased cosmetics: Ronin set + one Cynic beard                         */
 /* ------------------------------------------------------------------------ */
+/* Steam DLC ownership for cosmetics: IsEntitlementAvailable (0x140166D90) and IsDLCInstalled
+   (0x140166CD0) both start with 40 53 48 83 EC 40 and return bool. The stub below answers true
+   without calling the original, so every DLC-gated outfit, gesture and the name plate unlock. */
+#define RVA_ENTITLEMENT 0x0166D90
+#define RVA_DLC_INSTALLED 0x0166CD0
+static uint8_t h_owned(void *a, void *b) { (void)a; (void)b; return 1; }
+
+/* ------------------------------------------------------------------------ */
 /* CustomizationLibrary per-item availability check (0x140166970):
    bool (void *ctx, const TSubclassOf *asset). *asset is the asset's UClass; the class default
    object is at class+0x100 and its EAssetStatus byte at +0x3C1 (3 = Released). The check lets only
@@ -2485,6 +2495,13 @@ static void install(void)
         static const uint8_t p_ws[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18 };
         o_ws_connect = (WsConnectFn)hook_entry(&cursor, RVA_WS_CONNECT, p_ws, 15, (void *)h_ws_connect,
                                                "OutpostWebSocket connect");
+    }
+
+    if (cfg.unlock_dlc) {
+        static const uint8_t p_dlc[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40 };
+        void *a = hook_entry(&cursor, RVA_ENTITLEMENT, p_dlc, 6, (void *)h_owned, "IsEntitlementAvailable");
+        void *b = hook_entry(&cursor, RVA_DLC_INSTALLED, p_dlc, 6, (void *)h_owned, "IsDLCInstalled");
+        if (!a || !b) slog("DLC cosmetics unlock incomplete");
     }
 
     if (cfg.unlock_unreleased) {
