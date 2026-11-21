@@ -563,7 +563,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function createMatch(batch, target) {
     const first = obj(batch[0].opts);
-    const live = target || (hostEntries.length ? pickHosted(batch.reduce((n, e) => n + entryCount(e), 0)) : null);
+    const live = target || (hostEntries.length ? pickHosted(batch.reduce((n, e) => n + entryCount(e), 0), batch.length === 1 ? batch[0] : null) : null);
     if (live) {
       if (!live.players.size) live.opts = { gameMode: str(first['game-mode']), gameModeParams: '', map: str(first.map), language: str(first.language) };
       seat(live, batch);
@@ -580,8 +580,8 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   }
 
   // A matchmade session that is still young and has room takes newly queued players straight away.
-  function findOpenSession(count) {
-    if (hostEntries.length) return pickHosted(count);
+  function findOpenSession(count, entry) {
+    if (hostEntries.length) return pickHosted(count, entry);
     const now = Date.now();
     for (const s of sessions.values()) {
       if (s.matchmade && now - s.createdAt < config.LATE_JOIN_SECONDS * 1000 && s.players.size + count <= config.MAX_PLAYERS) return s;
@@ -598,7 +598,40 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   // Pool choice (online lobbies only): the fullest open lobby (waiting/countdown) that has room, else an idle waiting one,
   // else a started session still inside its late-join window (fullest first).
-  function pickHosted(count) {
+  // Join hints: a player picked a lobby in the client mod's server list (POST /api/servers/<id>/join-hint).
+  // pid -> { id, until }; used by pickHosted for that player's next find-session, then dropped.
+  const JOIN_HINT_MS = 120000;
+  const joinHints = new Map();
+  function setJoinHint(id, playerId) {
+    const h = hostedById.get(String(id));
+    if (!h) return { error: 'not-found' };
+    const s = h.s;
+    if (!hostOnline(s.id)) return { error: 'offline' };
+    if (!hostedOpen(s)) return { error: 'closed', state: s.state };
+    joinHints.set(String(playerId), { id: s.id, until: Date.now() + JOIN_HINT_MS });
+    log(`${playerId} picked hosted session ${s.id}`);
+    return { id: s.id, state: s.state, players: s.players.size, maxPlayers: config.MAX_PLAYERS };
+  }
+  function hintFor(e) {
+    if (!e) return null;
+    for (const c of entryClients(e)) {
+      const hint = joinHints.get(String(c.id));
+      if (!hint) continue;
+      if (hint.until < Date.now()) { joinHints.delete(String(c.id)); continue; }
+      return hint.id;
+    }
+    return null;
+  }
+
+  function pickHosted(count, entry) {
+    const want = hintFor(entry);
+    if (want) {
+      const h = hostedById.get(want);
+      if (h && hostOnline(h.s.id) && hostedOpen(h.s) && h.s.players.size + count <= config.MAX_PLAYERS) {
+        for (const c of entryClients(entry)) joinHints.delete(String(c.id));
+        return h.s;
+      }
+    }
     let best = null, bestRank = -1;
     for (const { s } of hostedById.values()) {
       if (!hostOnline(s.id) || !hostedOpen(s) || s.players.size + count > config.MAX_PLAYERS) continue;
@@ -613,7 +646,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   function pumpHosted() {
     let matched = false;
     for (const e of [...queue]) {
-      const target = pickHosted(entryCount(e));
+      const target = pickHosted(entryCount(e), e);
       if (!target) continue;
       queue = queue.filter((x) => x !== e);
       createMatch([e], target);
@@ -650,7 +683,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   tick.unref();
 
   function enqueue(entry, count) {
-    const open = findOpenSession(count);
+    const open = findOpenSession(count, entry);
     if (open) { if (open.hosted) createMatch([entry], open); else seat(open, [entry]); return; }
     queue.push(entry);
     sendSummary();
@@ -880,7 +913,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
 module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };

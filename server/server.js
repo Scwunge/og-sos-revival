@@ -288,6 +288,22 @@ function handleApi(req, url, body, res) {
     return send(res, 200, { result: true, ...v });
   }
 
+  // Join hint from the client mod's server list: the player's next find-session goes to this lobby if it is
+  // still open (2 min). Authorised by the player's account JWT, like vote-start.
+  if (req.method === 'POST' && (r = m(/^\/api\/servers\/([^/]+)\/join-hint$/))) {
+    const id = decodeURIComponent(r[1]);
+    const owner = mmClassic.getHostedSession(id) ? mmClassic : mm;
+    if (!owner.getHostedSession(id)) return send(res, 404, { error: 'not-found' });
+    const tok = String(req.headers['authorization'] || '').replace(/^(Bearer|Token)\s+/i, '').trim();
+    const claims = tok && readJwt(tok);
+    const pid = claims && !(claims.exp && claims.exp < Date.now() / 1000) ? String(claims['account-id'] || claims.id || '') : '';
+    if (!pid) return send(res, 401, { error: 'unauthorized' });
+    const v = owner.setJoinHint(id, pid);
+    if (v.error === 'not-found') return send(res, 404, { error: v.error });
+    if (v.error) return send(res, 409, { error: v.error, state: v.state });
+    return send(res, 200, { result: true, ...v });
+  }
+
   // Routes the game host (a listen server) calls on its MMS, authorised by `Token <SESSION_TOKEN>`.
   // POST .../start and .../reset are for whoever runs the server (same token; or type `start` in the console).
   // Also without the /api prefix: the sos_host DLL posts match-end to <backend>/session/<id>/events.
