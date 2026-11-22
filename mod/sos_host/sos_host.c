@@ -261,6 +261,8 @@ typedef struct {
     /* Match stats (Classic only; 0 = not mapped) */
     uint32_t gm_killed;         /* void GameMode::Killed(GM*, AController* Killer, AController* Victim, APawn*, UDamageType*) */
     uint32_t escaped_call;      /* E8 call to UEventLogLibrary::LogPlayerEscaped(AShooterCharacter*) in its exec thunk */
+    uint32_t process_event;     /* void UObject::ProcessEvent(obj, UFunction*, void* parms) */
+    uint32_t find_function;     /* UFunction* UClass::FindFunctionByName(cls, FName, bool bIncludeSuper) */
 } GameBuild;
 
 static const GameBuild k_builds[] = {
@@ -274,7 +276,7 @@ static const GameBuild k_builds[] = {
         0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0,
-        0, 0,
+        0, 0, 0, 0,
     },
     {
         "SOS: Classic (802240)", 48156672, 0x5b971052,
@@ -288,6 +290,7 @@ static const GameBuild k_builds[] = {
         0x0185ca0, 0x29e7560,
         0x0eb1400, 0x1483480, 0x118a410, 0x11ea410,
         0x0168bf0, 0x031a990,
+        0x05364c0, 0x04e97d0,
     },
 };
 
@@ -1312,6 +1315,11 @@ static void mirror_streaming(uint8_t *world, uint8_t *conn, uint8_t *pc)
     }
 }
 
+/* Host frame times between replication passes (one per TickFlush), for MoveDiag. */
+static double g_fr_sum, g_fr_max;
+static unsigned g_fr_n;
+static LARGE_INTEGER g_fr_last;
+
 static void replicate_actors(uint8_t *drv)
 {
     if (*(void **)(drv + DRV_SERVERCONN)) return;              /* client */
@@ -1320,6 +1328,15 @@ static void replicate_actors(uint8_t *drv)
     uint8_t *world = *(uint8_t **)(drv + DRV_WORLD);
     if (!world) return;
     if (*(uint8_t **)(world + UWORLD_NETDRIVER) != drv) return;  /* game driver only, not demo */
+    {
+        LARGE_INTEGER nowq, fq;
+        QueryPerformanceCounter(&nowq); QueryPerformanceFrequency(&fq);
+        if (g_fr_last.QuadPart) {
+            double ms = (double)(nowq.QuadPart - g_fr_last.QuadPart) * 1000.0 / (double)fq.QuadPart;
+            if (ms < 5000.0) { g_fr_sum += ms; g_fr_n++; if (ms > g_fr_max) g_fr_max = ms; }
+        }
+        g_fr_last = nowq;
+    }
     if (!conns || nconns <= 0) {
         /* The last joiner left: nobody is connected any more. Mark every
            tracked player disconnected (their snapshots stay for the match-end
@@ -1777,6 +1794,9 @@ static int peek_param(uint8_t *stack, int n, void *out, size_t size)
 #define ADJUST_INTERVAL   0.25f   /* s between corrections of one joiner */
 #define FALL_DIST         1000.0f /* cm; while falling only a gap this big is corrected */
 #define BASE_DIST         2000.0f /* cm; same while the joiner stands on a base */
+#define SYNC_DIST         300.0f   /* cm; beyond this the host pawn is moved to the joiner */
+#define TELEPORT_DIST   25000.0f   /* cm; beyond this the joiner is moved to the host pawn (match start) */
+static unsigned g_host_synced;
 #define LAG_FLOOR        15000.0f /* cm; a host pawn that lags behind its joiner (the host simulates the
                                      moves slower than the client) must not drag the joiner back: only a
                                      teleport-sized gap (match start, 100s of m) is corrected */
@@ -1823,6 +1843,55 @@ static uint8_t packed_move_mode(uint8_t *cmc)
 /* After a ServerMove ran: ack it, or, when the host's position for this pawn is
    far from where the joiner says it is (a teleport such as the start of the
    match, a blocked move), send the host's position with ClientAdjustPosition. */
+typedef void (*ProcessEventFn)(void *self, void *fn, void *parms);
+typedef void *(*FindFunctionFn)(void *cls, FName name, uint8_t include_super);
+
+/* Offset of a named parameter inside a UFunction's parameter block, -1 if absent. */
+static int fn_param_off(uint8_t *fn, const wchar_t *name)
+{
+    FName n;
+    ((FNameCtorFn)AT(g_build->fname_ctor))(&n, name, 0 /* FNAME_Find */);
+    if (!n.v) return -1;
+    int guard = 0;
+    for (uint8_t *f = *(uint8_t **)(fn + STRUCT_CHILDREN); f && guard < 64; f = *(uint8_t **)(f + FIELD_NEXT), guard++)
+        if (*(uint64_t *)(f + OBJ_NAME) == n.v) {
+            int off = *(int32_t *)(f + PROP_OFFSET);
+            return off >= 0 && off < 400 ? off : -1;
+        }
+    return -1;
+}
+
+/* Move a scene component (the pawn's capsule) to a world location with
+   USceneComponent::K2_SetWorldLocation(NewLocation, bSweep=false, <out hit>, bTeleport=true),
+   called by name through ProcessEvent. Game thread only. Returns 0 if unavailable. */
+static int teleport_comp(uint8_t *comp, const float *loc)
+{
+    if (!g_build->process_event || !g_build->find_function || !comp) return 0;
+    static void *fn;
+    static int off_loc = -1, off_sweep = -1, off_tele = -1, tried;
+    if (!tried) {
+        tried = 1;
+        FName n;
+        ((FNameCtorFn)AT(g_build->fname_ctor))(&n, L"K2_SetWorldLocation", 0);
+        if (n.v) fn = ((FindFunctionFn)AT(g_build->find_function))(*(void **)(comp + OBJ_CLASS), n, 1);
+        if (fn) {
+            off_loc = fn_param_off(fn, L"NewLocation");
+            off_sweep = fn_param_off(fn, L"bSweep");
+            off_tele = fn_param_off(fn, L"bTeleport");
+        }
+        hlog("K2_SetWorldLocation: fn %p NewLocation +%d bSweep +%d bTeleport +%d%s", fn, off_loc, off_sweep, off_tele,
+             (fn && off_loc >= 0 && off_tele >= 0) ? "" : " (unavailable, host pawn sync off)");
+    }
+    if (!fn || off_loc < 0 || off_tele < 0) return 0;
+    uint8_t parms[512];
+    memset(parms, 0, sizeof parms);
+    memcpy(parms + off_loc, loc, 12);
+    if (off_sweep >= 0) parms[off_sweep] = 0;
+    parms[off_tele] = 1;
+    ((ProcessEventFn)AT(g_build->process_event))(comp, fn, parms);
+    return 1;
+}
+
 /* A movement base whose rotation is a unit quaternion. Scale and location are
    not checked: terrain and static meshes legitimately have scale 100 or sit at
    the origin. */
@@ -1881,29 +1950,74 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
         /* On a movable base the joiner sends its location relative to the base;
            on a static one it sends world. Take whichever is nearer. */
         float d2 = dist2(loc, client_loc), world[3];
+        const float *cw = client_loc;     /* the joiner's position in world space */
         int base_ok = 0;
         if (base && !((IsPendingKillFn)AT(g_build->is_pending_kill))(base)) {
             if (base_sane(base)) {
                 base_ok = 1;
                 base_to_world(base, client_loc, world);
                 float d2b = dist2(loc, world);
-                if (d2b < d2) d2 = d2b;
+                if (d2b < d2) { d2 = d2b; cw = world; }
             }
         }
         int falling = cmc[CMC_MOVEMODE] == MOVE_FALLING || client_mode_falling(client_mode);
         if (base) log_new_base(base, client_loc);
-        {   /* every 10 s: how far apart the joiner and its host pawn are, and how fast each moves */
+        {   /* every 10 s: how far apart the joiner and its host pawn are, how fast each moves, host frame times */
             static struct { void *cmc; DWORD tick; float cl[3], hl[3]; } samp[8];
-            int si = (int)(((uintptr_t)cmc >> 4) & 7);
+            static int next_slot;
+            int si = -1;
+            for (int i = 0; i < 8; i++) if (samp[i].cmc == cmc) { si = i; break; }
             DWORD tk = GetTickCount();
-            if (samp[si].cmc != cmc) { samp[si].cmc = cmc; samp[si].tick = tk; memcpy(samp[si].cl, client_loc, 12); memcpy(samp[si].hl, loc, 12); }
-            else if (tk - samp[si].tick >= 10000) {
+            if (si < 0) {
+                for (int i = 0; i < 8 && si < 0; i++) if (!samp[i].cmc) si = i;
+                if (si < 0) si = next_slot++ & 7;
+                samp[si].cmc = cmc; samp[si].tick = tk; memcpy(samp[si].cl, client_loc, 12); memcpy(samp[si].hl, loc, 12);
+            } else if (tk - samp[si].tick >= 10000) {
                 float secs = (tk - samp[si].tick) / 1000.0f;
-                hlog("MoveDiag: joiner (%.0f %.0f %.0f)%s host (%.0f %.0f %.0f) gap %.0f cm; client moved %.0f cm/s, host pawn %.0f cm/s, host mode %u",
+                hlog("MoveDiag: joiner (%.0f %.0f %.0f)%s host (%.0f %.0f %.0f) gap %.0f cm; client moved %.0f cm/s, host pawn %.0f cm/s, host mode %u; host frames %u avg %.1f ms max %.1f ms",
                      client_loc[0], client_loc[1], client_loc[2], base ? " rel" : "", loc[0], loc[1], loc[2], sqrtf(d2),
-                     sqrtf(dist2(client_loc, samp[si].cl)) / secs, sqrtf(dist2(loc, samp[si].hl)) / secs, cmc[CMC_MOVEMODE]);
+                     sqrtf(dist2(client_loc, samp[si].cl)) / secs, sqrtf(dist2(loc, samp[si].hl)) / secs, cmc[CMC_MOVEMODE],
+                     g_fr_n, g_fr_n ? g_fr_sum / g_fr_n : 0.0, g_fr_max);
+                g_fr_sum = g_fr_max = 0; g_fr_n = 0;
                 samp[si].tick = tk; memcpy(samp[si].cl, client_loc, 12); memcpy(samp[si].hl, loc, 12);
             }
+        }
+        /* The joiner is trusted with its position. When the host pawn is more than
+           SYNC_DIST from where the joiner says it is, move the host pawn there
+           (the host's simulation runs behind the joiner's, or its pawn got wedged
+           in geometry) instead of dragging the joiner back. Only a teleport-sized
+           gap (match start) goes the other way, to the joiner. A joiner on a base
+           that may move client-side is not synced (its position is unreliable). */
+        int can_sync = g_build->process_event && (!base || (base_ok && !falling));
+        if (can_sync && d2 > SYNC_DIST * SYNC_DIST && d2 <= TELEPORT_DIST * TELEPORT_DIST) {
+            static struct { void *cmc; DWORD tick; DWORD logged; unsigned n; } sy[32];
+            int si = -1;
+            for (int i = 0; i < 32; i++) if (sy[i].cmc == cmc) { si = i; break; }
+            if (si < 0) {
+                for (int i = 0; i < 32 && si < 0; i++) if (!sy[i].cmc) si = i;
+                if (si < 0) si = (int)(((uintptr_t)cmc >> 4) & 31);
+                sy[si].cmc = cmc; sy[si].tick = 0; sy[si].n = 0; sy[si].logged = 0;
+            }
+            DWORD tk = GetTickCount();
+            if (tk - sy[si].tick >= 100) {
+                sy[si].tick = tk;
+                float from[3] = { loc[0], loc[1], loc[2] };
+                float target[3] = { cw[0], cw[1], cw[2] };
+                if (teleport_comp(comp, target)) {
+                    sy[si].n++;
+                    g_host_synced++;
+                    /* The client walks but the host pawn was left falling (wedged): let it walk. */
+                    if (client_mode >= 0 && !client_mode_falling(client_mode) && cmc[CMC_MOVEMODE] == MOVE_FALLING
+                        && client_mode < (int)*(uint8_t *)AT(g_build->move_mode_custom))
+                        cmc[CMC_MOVEMODE] = (uint8_t)(client_mode & ((1 << *(uint8_t *)AT(g_build->move_mode_shift)) - 1));
+                    if (tk - sy[si].logged >= 2000 || sy[si].n == 1) {
+                        sy[si].logged = tk;
+                        hlog("ServerSync: host pawn (%.0f %.0f %.0f) -> joiner (%.0f %.0f %.0f), gap %.0f cm, host mode %u (%u so far)",
+                             from[0], from[1], from[2], target[0], target[1], target[2], sqrtf(d2), cmc[CMC_MOVEMODE], g_host_synced);
+                    }
+                }
+            }
+            goto ack;       /* synced a moment ago, or unavailable: never drag the joiner back */
         }
         /* While falling the host's simulation runs ahead of the joiner's, and a
            correction (sent with zero velocity) costs the joiner its momentum. */
