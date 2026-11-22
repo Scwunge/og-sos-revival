@@ -19,6 +19,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_RAND_S
 #include <windows.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -1803,6 +1804,10 @@ typedef void (*AdjustFn)(void *cmc, float ts, const float *loc, const float *vel
                          uint64_t bone, uint8_t has_base, uint8_t relative, uint8_t mode);
 static unsigned g_moves_adjusted;
 static struct { void *cmc; float ts; } g_last_adjust[32];
+static DWORD g_adjust_win[32];
+static unsigned g_adjust_n[32];
+#define ADJUST_WINDOW_MS  10000
+#define MAX_ADJUST_BURST  6
 
 static uint8_t packed_move_mode(uint8_t *cmc)
 {
@@ -1815,7 +1820,30 @@ static uint8_t packed_move_mode(uint8_t *cmc)
 /* After a ServerMove ran: ack it, or, when the host's position for this pawn is
    far from where the joiner says it is (a teleport such as the start of the
    match, a blocked move), send the host's position with ClientAdjustPosition. */
-static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const float *client_loc, uint8_t *base)
+/* A movement base whose transform can be trusted: scale not zero, rotation a
+   unit quaternion, location not exactly the origin of a never-initialised one. */
+static int base_sane(const uint8_t *base)
+{
+    const float *q = (const float *)(base + COMP_ROTATION);
+    const float *t = (const float *)(base + COMP_LOCATION);
+    const float *s = (const float *)(base + COMP_SCALE);
+    float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if (!(n > 0.9f && n < 1.1f)) return 0;
+    for (int i = 0; i < 3; i++) {
+        if (!(fabsf(s[i]) > 0.01f && fabsf(s[i]) < 100.0f)) return 0;
+        if (!(fabsf(t[i]) < 1.0e7f)) return 0;
+    }
+    return !(t[0] == 0 && t[1] == 0 && t[2] == 0);
+}
+
+static int client_mode_falling(int packed)
+{
+    if (packed < 0) return 0;
+    if (packed >= (int)*(uint8_t *)AT(g_build->move_mode_custom)) return 0;   /* custom mode */
+    return (packed & ((1 << *(uint8_t *)AT(g_build->move_mode_shift)) - 1)) == MOVE_FALLING;
+}
+
+static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const float *client_loc, uint8_t *base, int client_mode)
 {
     if (!cfg.ack_moves || !ok || !(ts > 0.0f)) return;
     if (((IsPendingKillFn)AT(g_build->is_pending_kill))(cmc)) return;
@@ -1825,19 +1853,40 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
         /* On a movable base the joiner sends its location relative to the base;
            on a static one it sends world. Take whichever is nearer. */
         float d2 = dist2(loc, client_loc), world[3];
+        int base_ok = 0;
         if (base && !((IsPendingKillFn)AT(g_build->is_pending_kill))(base)) {
-            base_to_world(base, client_loc, world);
-            float d2b = dist2(loc, world);
-            if (d2b < d2) d2 = d2b;
+            if (base_sane(base)) {
+                base_ok = 1;
+                base_to_world(base, client_loc, world);
+                float d2b = dist2(loc, world);
+                if (d2b < d2) d2 = d2b;
+            }
         }
+        int falling = cmc[CMC_MOVEMODE] == MOVE_FALLING || client_mode_falling(client_mode);
         /* While falling the host's simulation runs ahead of the joiner's, and a
            correction (sent with zero velocity) costs the joiner its momentum. */
-        float lim = cmc[CMC_MOVEMODE] == MOVE_FALLING ? FALL_DIST : (float)cfg.correct_dist;
+        float lim = falling ? FALL_DIST : (float)cfg.correct_dist;
         /* On a base (the drop vehicle, the pregame line-up) the base itself is
            often somewhere else on the host than on the joiner, since the intro
            sequence moves it client-side. Only a teleport-sized gap is corrected. */
         if (base && lim < BASE_DIST) lim = BASE_DIST;
-        if (d2 > lim * lim) {
+        /* Falling or dropping from a vehicle while the client still reports a base:
+           the base (a helicopter, the drop ship) moves client-side, so the host's
+           base transform is unreliable and relative coordinates can't be compared
+           with the host's world position. Let the landing reconcile. A base whose
+           transform fails the sanity check is never trusted either. */
+        int skip = (base && (!base_ok || falling));
+        if (falling && !base) lim = FALL_DIST * 10.0f;       /* 100 m: only a real teleport */
+        if (skip && d2 > lim * lim) {
+            static DWORD last_skip;
+            DWORD tk = GetTickCount();
+            if (tk - last_skip >= 5000) {
+                last_skip = tk;
+                hlog("AdjustPosition skipped: joiner at (%.0f %.0f %.0f) on a base%s, host has (%.0f %.0f %.0f) mode %u",
+                     client_loc[0], client_loc[1], client_loc[2], base_ok ? "" : " (bad transform)",
+                     loc[0], loc[1], loc[2], cmc[CMC_MOVEMODE]);
+            }
+        } else if (d2 > lim * lim) {
             int slot = -1, free_slot = -1;
             for (int i = 0; i < 32; i++) {
                 if (g_last_adjust[i].cmc == cmc) slot = i;
@@ -1847,6 +1896,13 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
             if (g_last_adjust[slot].cmc == cmc && ts > g_last_adjust[slot].ts
                 && ts - g_last_adjust[slot].ts < ADJUST_INTERVAL)
                 return;                     /* a correction is on its way */
+            /* At most MAX_ADJUST_BURST corrections per ADJUST_WINDOW_MS for one joiner. */
+            DWORD nowt = GetTickCount();
+            if (nowt - g_adjust_win[slot] > ADJUST_WINDOW_MS || g_last_adjust[slot].cmc != cmc) {
+                g_adjust_win[slot] = nowt; g_adjust_n[slot] = 0;
+            }
+            if (g_adjust_n[slot] >= MAX_ADJUST_BURST) goto ack;
+            g_adjust_n[slot]++;
             g_last_adjust[slot].cmc = cmc;
             g_last_adjust[slot].ts = ts;
             static const float zero[3] = { 0, 0, 0 };
@@ -1858,6 +1914,7 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
             return;
         }
     }
+ack:
     ((AckGoodMoveFn)AT(g_build->ack_good_move))(cmc, ts);
     g_moves_acked++;
     DWORD t = GetTickCount();
@@ -1876,8 +1933,10 @@ static void h_exec_move(void *cmc, uint8_t *stack, void *result)
     int have_loc = peek_param(stack, 3, loc, sizeof loc);
     uint8_t *base = NULL;
     if (!peek_param(stack, 7, &base, sizeof base)) base = NULL;   /* ClientMovementBase */
+    uint8_t cm = 0;
+    int have_cm = peek_param(stack, 9, &cm, 1);           /* ClientMovementMode */
     o_exec_move(cmc, stack, result);
-    answer_move(cmc, ok, ts, have_loc, loc, base);
+    answer_move(cmc, ok, ts, have_loc, loc, base, have_cm ? cm : -1);
 }
 
 static void h_exec_dual(void *cmc, uint8_t *stack, void *result)
@@ -1887,8 +1946,10 @@ static void h_exec_dual(void *cmc, uint8_t *stack, void *result)
     int have_loc = peek_param(stack, 7, loc, sizeof loc);
     uint8_t *base = NULL;
     if (!peek_param(stack, 11, &base, sizeof base)) base = NULL;  /* ClientMovementBase */
+    uint8_t cm = 0;
+    int have_cm = peek_param(stack, 13, &cm, 1);          /* ClientMovementMode */
     o_exec_dual(cmc, stack, result);
-    answer_move(cmc, ok, ts, have_loc, loc, base);
+    answer_move(cmc, ok, ts, have_loc, loc, base, have_cm ? cm : -1);
 }
 
 static void h_exec_hybrid(void *cmc, uint8_t *stack, void *result)
@@ -1898,8 +1959,10 @@ static void h_exec_hybrid(void *cmc, uint8_t *stack, void *result)
     int have_loc = peek_param(stack, 7, loc, sizeof loc);
     uint8_t *base = NULL;
     if (!peek_param(stack, 11, &base, sizeof base)) base = NULL;  /* ClientMovementBase */
+    uint8_t cm = 0;
+    int have_cm = peek_param(stack, 13, &cm, 1);          /* ClientMovementMode */
     o_exec_hybrid(cmc, stack, result);
-    answer_move(cmc, ok, ts, have_loc, loc, base);
+    answer_move(cmc, ok, ts, have_loc, loc, base, have_cm ? cm : -1);
 }
 
 /* ------------------------------------------------------------------------ */
