@@ -1,6 +1,11 @@
 CHANGELOG
 =========
 
+1.0.1
+-----
+- SPECTATE button in the SERVERS panel: joins the spectator/director URL on the clipboard
+  (<ip>:<port>?SpectatorOnly=1&AuthToken=...). Ini key SpectateUrl= is the fallback.
+
 1.0.0
 -----
 First public release.

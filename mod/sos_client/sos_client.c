@@ -118,6 +118,7 @@ static int g_ncv;
 #ifdef SOS_CORE
 static int g_auto_update = 1;      /* AutoUpdate in the ini (core build) */
 #endif
+static char g_spec_url[1700];       /* SpectateUrl in the ini: fallback join URL for the SPECTATE button */
 static float g_vfov, g_vzfov;        /* VerticalFOV / VerticalZoomFOV from the ini, 0 = leave */
 static volatile LONG g_map_gen;      /* bumped on every LoadMap */
 static wchar_t g_notice_title[160], g_notice_body[640];   /* NoticeTitle / NoticeBody (boot notice replacement text) */
@@ -221,6 +222,16 @@ static void load_config(HMODULE self)
 #ifdef SOS_CORE
     g_auto_update          = GetPrivateProfileIntW(L"Client", L"AutoUpdate", 1, g_ini);
 #endif
+    {
+        wchar_t sw[1700];
+        GetPrivateProfileStringW(L"Client", L"SpectateUrl", L"", sw, 1700, g_ini);
+        g_spec_url[0] = 0;
+        if (sw[0]) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, sw, -1, g_spec_url, (int)sizeof g_spec_url, NULL, NULL);
+            if (n <= 0) g_spec_url[0] = 0;
+        }
+        SecureZeroMemory(sw, sizeof sw);
+    }
     GetPrivateProfileStringW(L"Client", L"BuildLabel", L"OG SOS Revival", g_build_label, 96, g_ini);
     {
         static wchar_t sec[4096];
@@ -526,7 +537,7 @@ typedef struct {
 } RepAcct;
 
 enum { HIT_NONE = 0, HIT_BTN, HIT_REFRESH, HIT_VOTE, HIT_CLOSE, HIT_PANEL,
-       HIT_REPORT, HIT_REASON, HIT_PASTE, HIT_SEND, HIT_ROW = 100 };
+       HIT_REPORT, HIT_REASON, HIT_PASTE, HIT_SEND, HIT_SPEC, HIT_ROW = 100 };
 
 static const char *const k_rep_reason[4] = { "cheating", "harassment", "griefing", "other" };
 static const wchar_t *const k_rep_reason_w[4] = { L"cheating", L"harassment", L"griefing", L"other" };
@@ -553,7 +564,7 @@ static struct {
     char rsel[80];               /* selected account id */
     char rlink[1700];            /* clip link, UTF-8, "" = none */
     wchar_t rlink_w[512];
-    int job_accounts, job_paste, job_send;
+    int job_accounts, job_paste, job_send, job_spec;
 } U;
 
 static CRITICAL_SECTION g_tok_lock;
@@ -1482,6 +1493,67 @@ static void do_paste(void)
     LeaveCriticalSection(&g_ui_lock);
 }
 
+/* ---- SPECTATE: join URL from the clipboard (or SpectateUrl in the ini) -> "open <url>" on the local PlayerController ---- */
+static void spec_request(const char *url);
+
+/* Accepts "<host>:<port>?SpectatorOnly=1&AuthToken=<jwt>" (or DirectorOnly=1, either order, other options allowed),
+   optionally prefixed with "open ". Only URL characters are allowed so nothing can be smuggled into the command. */
+static int spec_valid(const char *in, char *out, int cap)
+{
+    while (*in == ' ' || *in == '\t' || *in == '\r' || *in == '\n') in++;
+    if (!_strnicmp(in, "open", 4) && (in[4] == ' ' || in[4] == '\t')) { in += 4; while (*in == ' ' || *in == '\t') in++; }
+    int n = 0;
+    while (in[n] && in[n] != ' ' && in[n] != '\t' && in[n] != '\r' && in[n] != '\n') n++;
+    const char *e = in + n;
+    const char *q = e;
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q) return 0;                                   /* more than one word */
+    if (n < 12 || n >= cap) return 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (!(isalnum(c) || strchr(".:?&=_-+/%~", c))) return 0;
+    }
+    memcpy(out, in, (size_t)n);
+    out[n] = 0;
+    char *qm = strchr(out, '?');
+    if (!qm) return 0;
+    /* host:port before the '?' */
+    char *colon = NULL;
+    for (char *c = out; c < qm; c++) if (*c == ':') colon = c;
+    if (!colon || colon == out || colon + 1 == qm) return 0;
+    for (char *c = colon + 1; c < qm; c++) if (!isdigit((unsigned char)*c)) return 0;
+    if (strchr(out, '/')) return 0;
+    int mode = 0, tok = 0;
+    for (char *o = qm + 1; *o;) {
+        char *amp = strchr(o, '&');
+        size_t l = amp ? (size_t)(amp - o) : strlen(o);
+        if (l == 15 && !_strnicmp(o, "SpectatorOnly=1", 15)) mode = 1;
+        else if (l == 14 && !_strnicmp(o, "DirectorOnly=1", 14)) mode = 1;
+        else if (l > 10 && !_strnicmp(o, "AuthToken=", 10)) tok = 1;
+        o = amp ? amp + 1 : o + l;
+    }
+    return mode && tok;
+}
+
+static void do_spectate(void)
+{
+    static wchar_t w[2048];
+    static char u8[2048], url[1700];
+    int ok = 0;
+    if (read_clipboard_w(w, 2048) && WideCharToMultiByte(CP_UTF8, 0, w, -1, u8, (int)sizeof u8, NULL, NULL) > 0)
+        ok = spec_valid(u8, url, (int)sizeof url);
+    if (!ok && g_spec_url[0]) ok = spec_valid(g_spec_url, url, (int)sizeof url);
+    SecureZeroMemory(w, sizeof w);
+    SecureZeroMemory(u8, sizeof u8);
+    if (!ok) {
+        ui_set_status(L"No spectate URL: copy <ip>:<port>?SpectatorOnly=1&AuthToken=... first");
+        SecureZeroMemory(url, sizeof url);
+        return;
+    }
+    spec_request(url);
+    SecureZeroMemory(url, sizeof url);
+}
+
 /* JSON string escape; returns the length written or -1 when it does not fit. */
 static int json_esc(const char *in, char *out, int cap)
 {
@@ -1583,7 +1655,7 @@ static DWORD WINAPI worker_main(LPVOID unused)
     ULONGLONG last_poll = 0;
     for (;;) {
         WaitForSingleObject(g_worker_ev, 300);
-        int open, refresh, join, vote, accts, paste, send;
+        int open, refresh, join, vote, accts, paste, send, spec;
         Server js;
         EnterCriticalSection(&g_ui_lock);
         open = U.open;
@@ -1593,15 +1665,17 @@ static DWORD WINAPI worker_main(LPVOID unused)
         accts = U.job_accounts;
         paste = U.job_paste;
         send = U.job_send;
+        spec = U.job_spec;
         js = U.join_srv;
         U.job_refresh = U.job_join = U.job_vote = 0;
-        U.job_accounts = U.job_paste = U.job_send = 0;
+        U.job_accounts = U.job_paste = U.job_send = U.job_spec = 0;
         LeaveCriticalSection(&g_ui_lock);
         if (join) do_join(&js);
         if (vote) do_vote();
         if (accts) do_accounts();
         if (paste) do_paste();
         if (send) do_send();
+        if (spec) do_spectate();
         ULONGLONG now = GetTickCount64();
         if (open && (refresh || now - last_poll >= 3000)) {
             do_poll();
@@ -1631,7 +1705,7 @@ static void ensure_worker(void)
 typedef struct {
     float s;
     RECT btn, panel, header, rows, refresh, vote, close, status;
-    RECT report, send, reason, paste, linkbox, rrows;
+    RECT report, send, reason, paste, linkbox, rrows, spec;
     int row_h, vis_rows, rvis_rows;
 } Layout;
 
@@ -1666,6 +1740,7 @@ static void layout(int W, int H, Layout *L)
     /* report view: a shorter list plus a row of controls under it */
     L->report = rc(L->vote.right + S(16), by, L->vote.right + S(16) + S(130), by + bhh);
     L->send = L->vote;
+    L->spec = rc(L->report.right + S(16), by, L->report.right + S(16) + S(150), by + bhh);
     int rrbot = rbot - S(48);
     L->rrows = rc(px + S(16), rtop, px + pw - S(16), rrbot);
     L->rvis_rows = (rrbot - rtop) / L->row_h;
@@ -1686,6 +1761,7 @@ static int hit_test(const Layout *L, int x, int y)
         if (pt_in(&L->close, x, y)) return HIT_CLOSE;
         if (pt_in(&L->refresh, x, y)) return HIT_REFRESH;
         if (pt_in(&L->report, x, y)) return HIT_REPORT;
+        if (pt_in(&L->spec, x, y)) return HIT_SPEC;
         if (U.report) {
             if (pt_in(&L->send, x, y)) return HIT_SEND;
             if (pt_in(&L->reason, x, y)) return HIT_REASON;
@@ -1988,6 +2064,7 @@ static RECT render_ui(int W, int H, const Layout *L, int btn_visible, int open, 
             draw_button(&L->send, L"Send report", hover == HIT_SEND && rv->send_ok, rv->send_ok, C_ACCENT, C_ACCENT_H);
         else
             draw_button(&L->vote, L"Vote to start", hover == HIT_VOTE && vote_ok, vote_ok, C_ACCENT, C_ACCENT_H);
+        draw_button(&L->spec, L"Spectate", hover == HIT_SPEC, 1, C_BTN, C_BTN_H);
         draw_button(&L->report, L"Report", hover == HIT_REPORT, 1, rv->on ? C_SEL : C_BTN, rv->on ? C_HOVER : C_BTN_H);
         draw_button(&L->close, rv->on ? L"Back" : L"Close", hover == HIT_CLOSE, 1, C_BTN, C_BTN_H);
         used = *p;
@@ -2484,6 +2561,9 @@ static void click_action(int hit)
         } else {
             wcscpy(U.status, U.count ? L"Pick a server to join." : L"No servers found.");
         }
+    } else if (hit == HIT_SPEC) {
+        U.job_spec = 1;
+        wcscpy(U.status, L"Reading clipboard...");
     } else if (hit == HIT_REASON) {
         U.rreason = (U.rreason + 1) & 3;
     } else if (hit == HIT_PASTE) {
@@ -3178,9 +3258,75 @@ static void game_tick(void)
     if ((g_vfov > 0 || g_vzfov > 0) && now >= next_fov) { next_fov = now + 2000; fov_apply(); }
 }
 
+/* ---- SPECTATE: "open <url>" through APlayerController::ConsoleCommand (what typing "open" in the console does) ---- */
+static volatile LONG g_spec_flag;           /* 1 = requested, 2 = waiting for a PlayerController */
+static ULONGLONG g_spec_deadline;
+static wchar_t g_spec_cmd[1800];
+static FNameI g_n_concmd;
+
+static void spec_request(const char *url)
+{
+    if (!o_pe) { ui_set_status(L"Spectate unavailable (ProcessEvent hook missing)"); return; }
+    EnterCriticalSection(&g_ui_lock);
+    _snwprintf(g_spec_cmd, 1799, L"open ");
+    int n = MultiByteToWideChar(CP_UTF8, 0, url, -1, g_spec_cmd + 5, 1790);
+    if (n <= 0) g_spec_cmd[0] = 0;
+    g_spec_cmd[1799] = 0;
+    LeaveCriticalSection(&g_ui_lock);
+    if (!g_spec_cmd[0]) { ui_set_status(L"Spectate URL could not be read"); return; }
+    slog("spectate: requested (url length %d, token not logged)", (int)strlen(url));
+    ui_set_status(L"Joining as spectator...");
+    g_spec_deadline = GetTickCount64() + 15000;
+    InterlockedExchange(&g_spec_flag, 1);
+}
+
+static void spec_tick(void)
+{
+    if (GetCurrentThreadId() != *(DWORD *)AT(RVA_GAME_THREAD_ID)) return;
+    if (GetTickCount64() > g_spec_deadline) {
+        InterlockedExchange(&g_spec_flag, 0);
+        slog("spectate: no PlayerController with ConsoleCommand found");
+        ui_set_status(L"Spectate failed: no player controller found");
+        return;
+    }
+    uint8_t *objs = *(uint8_t **)AT(RVA_GUOBJ_OBJECTS);
+    int32_t num = *(int32_t *)AT(RVA_GUOBJ_NUM);
+    if (!plausible_ptr(objs) || num <= 0 || num > 8 * 1024 * 1024) return;
+    FNameCtorFn mk = (FNameCtorFn)AT(RVA_FNAME_CTOR);
+    if (!g_n_concmd.idx) mk(&g_n_concmd, L"ConsoleCommand", 0);
+    if (!g_n_concmd.idx) return;
+    for (int32_t i = 0; i < num; i++) {
+        uint8_t *item = objs + (size_t)i * 16;
+        uint8_t *obj = *(uint8_t **)item;
+        if (!obj || (*(int32_t *)(item + 8) & 0x20000000)) continue;
+        if (*(const uint32_t *)(obj + 8) & 0x10) continue;            /* class default object */
+        void *cls = *(void **)(obj + 0x10);
+        if (!plausible_ptr(cls)) continue;
+        wchar_t cn[96];
+        fname_str((const uint8_t *)cls + 0x18, cn, 96);
+        if (!wcsstr(cn, L"PlayerController") || wcsncmp(cn, L"SKEL_", 5) == 0 || wcsncmp(cn, L"REINST_", 7) == 0) continue;
+        void *fn = ((FindFunctionFn)AT(RVA_FIND_FUNCTION))(cls, g_n_concmd, 1);
+        if (!plausible_ptr(fn)) continue;
+        /* parms: FString Command @0, bool bWriteToLog @0x10, FString ReturnValue @0x18 */
+        struct { FString cmd; uint8_t log; uint8_t pad[7]; FString ret; } parms;
+        memset(&parms, 0, sizeof parms);
+        parms.cmd.data = g_spec_cmd;
+        parms.cmd.num = (int32_t)wcslen(g_spec_cmd) + 1;
+        parms.cmd.max = parms.cmd.num;
+        parms.log = 0;
+        InterlockedExchange(&g_spec_flag, 0);
+        slog("spectate: ConsoleCommand(open <url>) on %ls %p", cn, (void *)obj);
+        o_pe(obj, fn, &parms);
+        if (parms.ret.data) ((FreeFn)AT(RVA_MEM_FREE))(parms.ret.data);
+        SecureZeroMemory(g_spec_cmd, sizeof g_spec_cmd);
+        return;
+    }
+}
+
 static void h_process_event(void *self, void *fn, void *parms)
 {
     if (g_play_flag) play_tick(self);
+    if (g_spec_flag) spec_tick();
     o_pe(self, fn, parms);
     if (g_build_label[0] || cfg.hide_shutdown || NOTICE_ON || g_dump_pat[0]) text_tick(fn);
     if (g_ncv || g_vfov > 0 || g_vzfov > 0) game_tick();
