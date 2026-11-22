@@ -78,7 +78,7 @@ function wsConnect(token) {
   console.log(`GET /servers: ${list.map((s) => `${s.name}${s.community ? ' [community]' : ''} ${s.state} ${s.players}/${s.maxPlayers}`).join(' | ') || '(empty)'}`);
   const target = WANT ? list.find((s) => s.id === WANT) : list.find((s) => s.community);
   if (!target) throw new Error('target server not in the list');
-  const login = await req('POST', '/api/access-token/steam', { 'steam-app-id': '802240', 'steam-id': '', 'session-auth-token': crypto.randomBytes(8).toString('hex'), 'app-id': 'sostest' });
+  const login = await req('POST', '/api/access-token/steam', { 'steam-app-id': '802240', 'steam-id': '76561190' + String(Date.now()).slice(-9), 'session-auth-token': crypto.randomBytes(8).toString('hex'), 'app-id': 'sostest' });
   const jwt = login.json && login.json['access-token'];
   if (!jwt) throw new Error(`login failed: HTTP ${login.status}`);
   const hint = await req('POST', `/api/servers/${encodeURIComponent(target.id)}/join-hint`, {}, { Authorization: `Bearer ${jwt}` });

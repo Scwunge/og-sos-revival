@@ -14,6 +14,7 @@
 
 'use strict';
 const crypto = require('crypto');
+const { badKey, STEAM_ID_RE } = require('./safe');
 
 const SENTIMENTS = ['anger', 'applause', 'laughter', 'love', 'shock'];
 const FEEDBACK_PER_SEC = 5;        // per connection and sentiment; extra presses are dropped
@@ -22,6 +23,12 @@ const SESSION_GRACE_MS = 120000;   // owner socket gone: keep the session this l
 const VIEW_GRACE_MS = 30000;
 const MAX_SESSIONS = 200;
 const MAX_VIEWS = 4000;
+const MAX_SESSIONS_PER_CONN = 3;   // one socket cannot fill the table (and FIFO-evict other people's sessions)
+const MAX_VIEWS_PER_CONN = 20;
+const MAX_VOTES_PER_CONN = 2;
+// Requests that create or change state need an account (a valid JWT on the socket); anonymous sockets stay read-only
+// (ping, session-view, sub, unsub, vote-status, viewers).
+const AUTH_TYPES = new Set(['session', 'session-end', 'feedback', 'feedback-batch', 'create-vote', 'cast-vote', 'vote']);
 
 // Read a field under any of the usual spellings: 'session-id', sessionId, session_id, SessionId.
 function f(obj, name) {
@@ -43,7 +50,7 @@ function playerId(p) {
 function normPlayers(v) {
   if (v === undefined || v === null) return null;   // "not given" (keep existing) vs [] (clear)
   const arr = Array.isArray(v) ? v : (typeof v === 'object' ? Object.keys(v) : [v]);
-  return [...new Set(arr.map(playerId).filter(Boolean))];
+  return [...new Set(arr.map(playerId).filter((id) => STEAM_ID_RE.test(id)))];   // real SteamID64s only; ids like __proto__ never get in
 }
 function normTopics(d) {
   let t = f(d, 'topics');
@@ -69,6 +76,7 @@ function createStream(opts) {
   const views = new Map();      // view-id -> view
   const votes = new Map();      // vote-id -> vote
   const pending = new Map();    // account -> {sentiment: n}, flushed every second as feedback-batch
+  const fbWindows = new Map();  // ACCOUNT -> { t, n: {sentiment: n} }: the per-second feedback cap is per account, not per socket
   let countsDirty = false;
 
   // ---------- sending ----------
@@ -140,18 +148,19 @@ function createStream(opts) {
 
   // ---------- feedback ----------
   function addFeedback(conn, target, counts) {
-    if (!target) return 0;
+    if (!target || badKey(target) || !conn.account) return 0;
     const now = Date.now();
-    if (!conn.fbWindow || now - conn.fbWindow.t >= 1000) conn.fbWindow = { t: now, n: {} };
+    let win = fbWindows.get(conn.account);
+    if (!win || now - win.t >= 1000) { win = { t: now, n: {} }; fbWindows.set(conn.account, win); }
     let added = 0;
     const p = pending.get(target) || {};
     for (const [k, v] of Object.entries(counts)) {
       const s = normSentiment(k);
       if (!s) continue;
-      const room = FEEDBACK_PER_SEC - (conn.fbWindow.n[s] || 0);
+      const room = FEEDBACK_PER_SEC - (win.n[s] || 0);
       const n = Math.max(0, Math.min(room, Math.floor(Number(v) || 0)));
       if (!n) continue;
-      conn.fbWindow.n[s] = (conn.fbWindow.n[s] || 0) + n;
+      win.n[s] = (win.n[s] || 0) + n;
       p[s] = (p[s] || 0) + n;
       added += n;
     }
@@ -167,7 +176,7 @@ function createStream(opts) {
       // Per-session tally (for Fame at session-end) on every live session the performer is in.
       for (const s of sessions.values()) {
         if (s.ended || !s.players.includes(acc)) continue;
-        const t = s.feedback[acc] || (s.feedback[acc] = {});
+        const t = s.feedback[acc] || (s.feedback[acc] = Object.create(null));
         for (const [k, n] of Object.entries(counts)) t[k] = (t[k] || 0) + n;
       }
       const message = {
@@ -222,7 +231,7 @@ function createStream(opts) {
     return null;
   }
   function newSession(conn, sid, players) {
-    const s = { id: sid || crypto.randomUUID(), connId: conn.id, owner: conn.account || '', players, views: new Set(), feedback: {}, created: Date.now(), ended: false };
+    const s = { id: sid || crypto.randomUUID(), connId: conn.id, owner: conn.account || '', players, views: new Set(), feedback: Object.create(null), created: Date.now(), ended: false };
     sessions.set(s.id, s);
     prune();
     return s;
@@ -288,10 +297,12 @@ function createStream(opts) {
       if (sid) {
         s = findSession(conn, req, sid);
         if (!s) return;
+        if (s.owner && s.owner !== conn.account) return nak(conn, req, 'forbidden');   // only the owner's account re-attaches
         if (players) s.players = players;
         s.connId = conn.id;                 // reconnecting owner re-attaches
         clearTimeout(s.expire);
       } else {
+        if ([...conn.sessions].filter((x) => sessions.has(x)).length >= MAX_SESSIONS_PER_CONN) return nak(conn, req, 'too-many-sessions');
         s = newSession(conn, '', players || []);
       }
       conn.sessions.add(s.id);
@@ -302,6 +313,7 @@ function createStream(opts) {
     'session-end'(conn, req, d) {
       const s = findSession(conn, req, str(f(d, 'session-id')));
       if (!s) return;
+      if (s.connId !== conn.id) return nak(conn, req, 'forbidden');   // only the connection that owns the session may end it
       endSession(s, 'session-end');
       conn.sessions.delete(s.id);
       ack(conn, req, { 'session-id': s.id });
@@ -316,6 +328,7 @@ function createStream(opts) {
       let v = vid && views.get(vid);
       if (v && v.sessionId !== s.id) { deleteView(v); v = null; }
       if (!v) {
+        if ([...conn.views].filter((x) => views.has(x)).length >= MAX_VIEWS_PER_CONN) return nak(conn, req, 'too-many-views');
         v = { id: vid || crypto.randomUUID(), sessionId: s.id, connId: conn.id, viewer: viewer || conn.account || '', players: players || [], created: Date.now() };
         views.set(v.id, v);
         s.views.add(v.id);
@@ -376,6 +389,8 @@ function createStream(opts) {
         ? { id: str(f(o, 'id') ?? i), label: str(f(o, 'label')), description: str(f(o, 'description')), image: str(f(o, 'image')) }
         : { id: str(o), label: str(o), description: '', image: '' }));
       if (!options.length) return nak(conn, req, 'other');
+      let mine = 0; for (const x of votes.values()) if (x.connId === conn.id && !x.final) mine++;
+      if (mine >= MAX_VOTES_PER_CONN) return nak(conn, req, 'too-many-votes');
       const v = {
         id: crypto.randomUUID(), sessionId: s.id, connId: conn.id, config,
         type: str(f(config, 'type') || 'single-mutable').toLowerCase(),
@@ -446,6 +461,7 @@ function createStream(opts) {
     }
     const type = str(req.type);
     const d = req.data && typeof req.data === 'object' ? req.data : req;
+    if (AUTH_TYPES.has(type) && !conn.account) return nak(conn, req, 'unauthorized');
     const h = Object.prototype.hasOwnProperty.call(handlers, type) ? handlers[type] : null;
     if (!h) {
       log({ event: 'stream-unknown', conn: conn.id, type, text: String(text).slice(0, 2000) });
@@ -478,6 +494,7 @@ function createStream(opts) {
       else if (v.changed || (Math.floor((v.endsAt - now) / 1000) % 5 === 0)) { v.changed = false; broadcastVote(v, 'vote-status', voteStatus(v)); }
     }
     flushFeedback();
+    if (fbWindows.size > 500) for (const [k, w] of fbWindows) if (now - w.t > 5000) fbWindows.delete(k);
     if (countsDirty) pushViewerCounts();
   }, 1000);
   tick.unref();

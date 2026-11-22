@@ -265,7 +265,7 @@ function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe,
   }
   const whenIdle = () => Promise.all([...inflight]).then(() => undefined);
 
-  return { register, unregister, status, sweep, isListed, communityInfo, isVerifiedToken, communityIdForToken, whenIdle, _hosts: hosts, _cfg: cfg };
+  return { register, unregister, status, sweep, badName, isListed, communityInfo, isVerifiedToken, communityIdForToken, whenIdle, _hosts: hosts, _cfg: cfg };
 }
 
 module.exports = { createCommunityRegistry, loadCommunityConfig, udpProbe, PROBE_PACKET, isPublicIp };

@@ -15,8 +15,7 @@
 // Routes it calls: /api/leaderboard/<app>/<board>?start=&limit=  and  /api/leaderboard/<app>/<board>/<member>?surrounding=N.
 
 'use strict';
-const fs = require('fs');
-const path = require('path');
+const { badKey } = require('./safe');
 
 const SENTIMENTS = ['anger', 'applause', 'laughter', 'love', 'shock'];
 // FeedbackMatchRankingAlgorithm weight names. love = joy, shock = surprise.
@@ -31,8 +30,8 @@ const MAX_MATCHES_KEPT = 500;
 const BOARDS = { solo: 'fame_solo', duo: 'fame_duo' };
 
 function createFame({ db, saveDb, displayName = (id) => id, log = () => {} }) {
-  const stats = () => db.heroStats || (db.heroStats = {});
-  const matches = () => db.fameMatches || (db.fameMatches = {});
+  const stats = () => db.heroStats || (db.heroStats = Object.create(null));
+  const matches = () => db.fameMatches || (db.fameMatches = Object.create(null));
 
   // ---------- weights ----------
   // env OGSOS_FAME_WEIGHTS (JSON like {"AngerWeight":0.5,"ApplauseWeight":1,...}; lower-case sentiment keys also work),
@@ -63,7 +62,7 @@ function createFame({ db, saveDb, displayName = (id) => id, log = () => {} }) {
     const w = weights();
     const rows = players.map((id) => {
       const counts = {};
-      for (const s of SENTIMENTS) counts[s] = Number(feedback[id]?.[s]) || 0;
+      for (const s of SENTIMENTS) counts[s] = Number((feedback[id] && Object.prototype.hasOwnProperty.call(feedback, id) ? feedback[id] : null)?.[s]) || 0;
       return { id, counts, fameDelta: Math.round(rawFame(counts, w)) };
     });
     const sorted = [...rows].sort((a, b) => b.fameDelta - a.fameDelta);
@@ -73,9 +72,9 @@ function createFame({ db, saveDb, displayName = (id) => id, log = () => {} }) {
 
   // Called by the Stream service when a session ends (server.js, `// hero-tv`).
   function recordMatch({ id: sessionId, players = [], feedback = {} }) {
-    const ids = [...new Set([...players, ...Object.keys(feedback)])];
-    if (!sessionId || !ids.length) return null;
-    const out = { t: new Date().toISOString(), players: {} };
+    const ids = [...new Set([...players, ...Object.keys(feedback)])].filter((id) => !badKey(id));
+    if (!sessionId || badKey(sessionId) || !ids.length) return null;
+    const out = { t: new Date().toISOString(), players: Object.create(null) };
     for (const r of rateMatch(ids, feedback)) {
       const st = stats()[r.id] || (stats()[r.id] = { fame: 0, fameWins: 0, matches: 0, soloFameRating: 0, prevSoloFameRating: 0 });
       for (const s of SENTIMENTS) st[s] = (st[s] || 0) + r.counts[s];
@@ -165,6 +164,7 @@ function createFame({ db, saveDb, displayName = (id) => id, log = () => {} }) {
   // counters. Only an account that already has hero stats is touched unless { create: true }. Returns { old, new } of the
   // fields that changed, or null when there is nothing to edit.
   function adjust(accountId, patch, { create = false } = {}) {
+    if (badKey(accountId)) return null;
     let st = stats()[accountId];
     if (!st) {
       if (!create) return null;

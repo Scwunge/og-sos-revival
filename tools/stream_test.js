@@ -9,8 +9,9 @@
 'use strict';
 const BASE = (process.argv[2] || 'http://127.0.0.1:7783').replace(/\/$/, '');
 const WS = BASE.replace(/^http/, 'ws') + '/ws/stream';
-const tag = Math.random().toString(36).slice(2, 8);
-const P1 = `test-perf-${tag}`, P2 = `test-spec-${tag}`;
+const tag = String(Date.now()).slice(-9);
+// Stream ids must be SteamID64s (server/stream.js drops anything else) and anything that writes needs a logged-in socket.
+const P1 = `76561190${tag}`, P2 = `76561191${tag}`;
 let failed = 0, passed = 0;
 const ok = (cond, what, extra) => { if (cond) { passed++; console.log(`  ok   ${what}`); } else { failed++; console.log(`  FAIL ${what}`, extra !== undefined ? JSON.stringify(extra) : ''); } };
 
@@ -46,8 +47,11 @@ async function http(path, init) {
 (async () => {
   console.log(`stream test against ${WS} (players ${P1}, ${P2})`);
 
+  const tokenFor = async (steamId) => JSON.parse((await http('/api/access-token/steam', { method: 'POST', headers: { 'app-id': 'sostest', 'content-type': 'application/json' },
+    body: JSON.stringify({ 'steam-app-id': '802240', 'steam-id': steamId, 'session-auth-token': 'x', 'app-id': 'sostest' }) })).text)['access-token'];
+  const tHost = await tokenFor(`76561192${tag}`), tSpec = await tokenFor(P2), tWeb = await tokenFor(`76561193${tag}`);
   console.log('connect');
-  const host = await open('host');
+  const host = await open('host', `?token=${encodeURIComponent(tHost)}`);
   ok(await host.wait(T('ready')), 'host gets ready');
   host.send({ type: 'ping' });
   ok(await host.wait(T('pong')), 'ping -> pong');
@@ -72,7 +76,7 @@ async function http(path, init) {
   ok(await perf.wait(T('ack')), 'sub -> ack');
   ok(await perf.wait(topic('viewers', (x) => x.count === 0)), 'performer sees 0 viewers');
 
-  const spec = await open('spectator'); await spec.wait(T('ready'));
+  const spec = await open('spectator', `?token=${encodeURIComponent(tSpec)}`); await spec.wait(T('ready'));
   spec.send({ type: 'session-view', data: { 'session-id': sid, players: [{ id: P1 }], 'viewer-id': P2 } });
   const sv = await spec.wait(T('session-view'));
   const svid = sv && sv.data['view-id'];
@@ -80,7 +84,7 @@ async function http(path, init) {
   ok(await perf.wait(topic('viewers', (x) => x.count === 1)), 'performer viewer count -> 1 (in-game spectator)');
 
   console.log('web spectator + feedback');
-  const web = await open('web', `?client=web&role=feedback&target=${encodeURIComponent(P1)}`); await web.wait(T('ready'));
+  const web = await open('web', `?client=web&role=feedback&target=${encodeURIComponent(P1)}&token=${encodeURIComponent(tWeb)}`); await web.wait(T('ready'));
   web.send({ type: 'sub', data: { target: P1, topics: ['viewers', 'feedback-batch'] } });
   ok(await web.wait(T('ack')), 'web sub -> ack');
   ok(await perf.wait(topic('viewers', (x) => x.count === 2)), 'performer viewer count -> 2 (web spectator)');

@@ -8,6 +8,7 @@ const net = require('net');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const { badKey, nullProto } = require('./safe');
 
 const WEB_DIR = path.join(__dirname, 'web', 'admin');
 const COOKIE = 'ogsos_admin';
@@ -115,15 +116,15 @@ function createModeration(opts = {}) {
   const store = () => {
     const m = db.moderation = isObj(db.moderation) ? db.moderation : {};
     m.reports = Array.isArray(m.reports) ? m.reports : [];
-    m.bans = isObj(m.bans) ? m.bans : {};
+    m.bans = isObj(m.bans) ? nullProto(m.bans) : Object.create(null);   // id-keyed maps are prototype-free
     m.hostBlocks = Array.isArray(m.hostBlocks) ? m.hostBlocks : [];
     m.audit = Array.isArray(m.audit) ? m.audit : [];
     m.seq = Number.isInteger(m.seq) ? m.seq : 0;
-    m.mods = isObj(m.mods) ? m.mods : {};
-    m.notes = isObj(m.notes) ? m.notes : {};
-    m.warnings = isObj(m.warnings) ? m.warnings : {};
-    m.lobbyOptions = isObj(m.lobbyOptions) ? m.lobbyOptions : {};
-    m.kv = isObj(m.kv) ? m.kv : {};
+    m.mods = isObj(m.mods) ? nullProto(m.mods) : Object.create(null);
+    m.notes = isObj(m.notes) ? nullProto(m.notes) : Object.create(null);
+    m.warnings = isObj(m.warnings) ? nullProto(m.warnings) : Object.create(null);
+    m.lobbyOptions = isObj(m.lobbyOptions) ? nullProto(m.lobbyOptions) : Object.create(null);
+    m.kv = isObj(m.kv) ? nullProto(m.kv) : Object.create(null);
     m.kvRev = Number.isInteger(m.kvRev) ? m.kvRev : 0;
     return m;
   };
@@ -442,8 +443,14 @@ function createModeration(opts = {}) {
     const origin = originOf(req);
     const ret = p['openid.return_to'] || '';
     const m = String(p['openid.claimed_id'] || '').match(STEAM_CLAIMED_RE);
+    // The signature must cover everything we rely on (OpenID 2.0 section 11.1), and the assertion must be recent.
+    const signed = new Set(String(p['openid.signed'] || '').split(','));
+    const signedOk = ['claimed_id', 'identity', 'return_to', 'response_nonce', 'op_endpoint'].every((f) => signed.has(f));
+    const nonceAt = Date.parse((String(p['openid.response_nonce'] || '').match(/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)/) || [])[1] || '');
+    const nonceFresh = Number.isFinite(nonceAt) && Math.abs(now() - nonceAt) <= 5 * 60 * 1000;
     if (p['openid.mode'] !== 'id_res' || !(ret === `${origin}/admin/auth` || ret.startsWith(`${origin}/admin/auth?`))
-      || p['openid.op_endpoint'] !== openidUrl() || !m || (p['openid.identity'] && p['openid.identity'] !== p['openid.claimed_id'])) {
+      || p['openid.op_endpoint'] !== openidUrl() || !m || (p['openid.identity'] && p['openid.identity'] !== p['openid.claimed_id'])
+      || !signedOk || !nonceFresh) {
       audit('', '', 'login-failed', '', 'bad assertion');
       return page(res, 400, 'Sign-in failed', 'The Steam response was not valid.');
     }
@@ -1076,7 +1083,7 @@ function createModeration(opts = {}) {
     }
     if (sub === 'bans') {
       const id = scalar(b.steamId);
-      if (!ID_RE.test(id)) return json(res, 400, { error: 'bad-steam-id' });
+      if (!ID_RE.test(id) || badKey(id)) return json(res, 400, { error: 'bad-steam-id' });
       const role = roleOf(id);
       if (role === 'owner' || (role === 'mod' && admin.role !== 'owner')) return json(res, 403, { error: 'cannot-ban-admin' });
       let hours = b.hours === null || b.hours === undefined || b.hours === '' ? 0 : Number(b.hours);
@@ -1094,6 +1101,7 @@ function createModeration(opts = {}) {
     }
     if ((r = sub.match(/^bans\/([^/]+)\/lift$/))) {
       const id = decodeURIComponent(r[1]);
+      if (badKey(id)) return json(res, 400, { error: 'bad-steam-id' });
       const ban = m.bans[id];
       if (!banActive(ban)) return json(res, 404, { error: 'no-active-ban' });
       if (isAdmin(id) && admin.role !== 'owner') return forbidOwnerOnly(res);

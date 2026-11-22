@@ -5,6 +5,8 @@
 //   - match-end records and per-account totals fed by the host DLL's match-end event.
 // See docs/PROGRESSION.md. The blob is stored verbatim: the host computes XP/level, we never interpret it.
 
+const { badKey } = require('./safe');
+
 const APP_ID = 'sostest';
 const MAX_BLOB_BYTES = 256 * 1024;
 const MAX_BOARDS = 300;
@@ -44,14 +46,14 @@ function createProgression(opts = {}) {
   // ---- app data ----
   function handleAppData(method, accountId, appId, bodyText, token) {
     if (appId !== APP_ID) return null;
-    if (!ID_RE.test(String(accountId))) return reply(400, { error: 'bad account id' });
+    if (!ID_RE.test(String(accountId)) || badKey(accountId)) return reply(400, { error: 'bad account id' });
     const hostRes = isHostToken(token);   // true, or the lobby's sessionId (string) when the token is a host's
     const isHost = !!hostRes;
     const hostSession = typeof hostRes === 'string' ? hostRes : null;
     const acct = isHost ? null : jwtAccount(token);
     const unauthorized = reply(401, { version: 1, data: { error: 'unauthorized' } });
     const key = `${accountId}/${appId}`;
-    db.appData = db.appData || {};
+    db.appData = db.appData || Object.create(null);
     const cur = db.appData[key];
     const version = cur && Number.isInteger(cur.version) ? cur.version : 1;
     const stored = cur && isObj(cur.data) ? cur.data : {};
@@ -102,7 +104,7 @@ function createProgression(opts = {}) {
   function handleLeaderboard(method, appId, board, member, query, bodyText, token) {
     if (!BOARD_RE.test(String(board))) return reply(400, { error: 'bad board id' });
     const q = query || {};
-    db.leaderboards = db.leaderboards || {};
+    db.leaderboards = db.leaderboards || Object.create(null);
     const key = `${appId}/${board}`;
 
     if (method === 'POST') {
@@ -112,15 +114,15 @@ function createProgression(opts = {}) {
       try { arr = JSON.parse(bodyText == null ? '' : String(bodyText)); } catch { return reply(400, { error: 'bad json' }); }
       if (!Array.isArray(arr) || arr.length > MAX_POST_ENTRIES) return reply(400, { error: 'bad body' });
       if (!arr.length) return reply(200, []);   // the host posts [] for boards it has no score for
-      const valid = {};
+      const valid = Object.create(null);
       for (const e of arr) {
-        if (!isObj(e) || typeof e.member !== 'string' || !ID_RE.test(e.member)) continue;
+        if (!isObj(e) || typeof e.member !== 'string' || !ID_RE.test(e.member) || badKey(e.member)) continue;
         if (typeof e.score !== 'number' || !Number.isFinite(e.score)) continue;
         valid[e.member] = Math.min(1e9, Math.max(-1e9, Math.round(e.score)));
       }
       const members = Object.keys(valid);
       if (!members.length) return reply(400, { error: 'no valid entries' });
-      const b = db.leaderboards[key] || (db.leaderboards[key] = { updated: '', scores: {} });
+      const b = db.leaderboards[key] || (db.leaderboards[key] = { updated: '', scores: Object.create(null) });
       Object.assign(b.scores, valid);
       b.updated = new Date(now()).toISOString();
       pruneBoards();
@@ -219,7 +221,7 @@ function createProgression(opts = {}) {
 
   const BLOB_MATCH_WINDOW_MS = 60 * 1000;
   const ensureStats = (id) => {
-    db.playerStats = db.playerStats || {};
+    db.playerStats = db.playerStats || Object.create(null);
     return db.playerStats[id] || (db.playerStats[id] = { matches: 0, escapes: 0, kills: 0, deaths: 0, damageDealt: 0, relics: 0, totalSurvivalSec: 0 });
   };
 
@@ -352,8 +354,9 @@ function createProgression(opts = {}) {
       while (db.matches.length > MAX_MATCHES) db.matches.shift();
     }
 
-    db.playerStats = db.playerStats || {};
+    db.playerStats = db.playerStats || Object.create(null);
     for (const p of players) {
+      if (badKey(p.playerId)) continue;
       const s = db.playerStats[p.playerId] || (db.playerStats[p.playerId] = {
         matches: 0, escapes: 0, kills: 0, deaths: 0, damageDealt: 0, relics: 0, totalSurvivalSec: 0,
       });

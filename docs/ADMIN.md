@@ -19,6 +19,7 @@ Add these to the backend `.env` (compose `environment:`):
 | `OGSOS_ADMIN_DEV_LOGIN` | `1` enables `GET /admin/dev-login?steamid=<admin id>` for loopback requests without `X-Forwarded-For`. Tests only. **Never in production.** The backend warns at startup when it is on. |
 | `OGSOS_ADMIN_GAME_WATCH` | `1` enables the client mod's `POST /api/servers/<id>/watch` (game JWT of an admin). **Leave off until game logins verify the Steam ticket** (section 7): today anyone can claim an admin's Steam id at game login. |
 | `OGSOS_STEAM_OPENID` | OpenID endpoint override (tests). Default `https://steamcommunity.com/openid/login`. |
+| `OGSOS_RATE_ADMIN` | Max `/admin/login` + `/admin/auth` requests per client address per 10 minutes (default 20), see docs/SECURITY.md. The OpenID assertion must also sign `claimed_id`, `identity`, `return_to`, `response_nonce`, `op_endpoint`, and its nonce must be at most 5 minutes old. |
 
 Nothing else to configure: no passwords are stored. The cookie key is derived from the backend's existing
 `secret.key` (state dir), so rotating that file signs everyone out (and also invalidates game logins).

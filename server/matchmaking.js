@@ -36,7 +36,8 @@ const DEFAULTS = {
 // Public server-list labels (name/region): a string without control characters, trimmed and cut to max.
 const DEFAULT_SERVER_NAME = 'OG SOS server';
 function cleanLabel(v, max) {
-  return typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim().slice(0, max) : '';
+  // Control characters, zero-width and bidi-override characters are dropped, runs of whitespace collapse to one space.
+  return typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, '').replace(/\s+/g, ' ').trim().slice(0, max) : '';
 }
 
 // Validate a HOSTS value (array or JSON string). Bad entries are warned about and skipped.

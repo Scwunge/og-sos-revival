@@ -10,6 +10,9 @@
 const REFRESH_MS = 24 * 3600 * 1000;
 const TIMEOUT_MS = 4000;
 const inflight = new Map();   // steamId -> Promise<string|null>
+// At most this many Steam lookups run at once (OGSOS_PERSONA_MAX_CONCURRENT); further ones are skipped, the login
+// proceeds with the id/alias like when Steam is slow, and the account is looked up on a later login.
+const MAX_CONCURRENT = Math.max(1, Math.floor(Number(process.env.OGSOS_PERSONA_MAX_CONCURRENT)) || 4);
 
 // Safe for the travel URL (?Name=...) and the scoreboard: no URL option separators, no control chars, max 32.
 function cleanPersona(s) {
@@ -59,6 +62,7 @@ function refreshPersona(account, steamId, { save, waitMs = 0, fetchImpl, now = D
   const at = Date.parse(account['persona-checked'] || '') || 0;
   if (now - at < REFRESH_MS) return Promise.resolve(false);
   let p = inflight.get(steamId);
+  if (!p && inflight.size >= MAX_CONCURRENT) return Promise.resolve(false);
   if (!p) {
     p = fetchPersona(steamId, fetchImpl).finally(() => inflight.delete(steamId));
     inflight.set(steamId, p);
