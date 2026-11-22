@@ -133,7 +133,7 @@ while :; do
   # For the sos_host DLL's match-end event (POST $SOS_HOST_BACKEND/session/<id>/events).
   export SOS_HOST_BACKEND="$BASE/api" SOS_HOST_SESSION="$SESSION_ID" SOS_HOST_TOKEN="$SESSION_TOKEN"
   log "starting game (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
-  ( cd "$WIN64" && exec wine "$EXE" "LaCuna?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
+  ( cd "$WIN64" && exec wine "$EXE" "${GAME_MAP:-LaCuna}?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
       -nullrhi -nosound -unattended -log ${EXTRA_ARGS:-} ) >/dev/null 2>&1 &
   GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=
 
