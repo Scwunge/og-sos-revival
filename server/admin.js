@@ -56,6 +56,9 @@ const KV_ALLOW = {
   UE_CLIENT_SURVIVAL_ELO_K_FACTOR: { min: 1, max: 200, description: 'Survival rating K factor' },
   UE_CLIENT_SURVIVAL_SOLO_ELO_K_FACTOR: { min: 1, max: 200, description: 'Solo survival rating K factor' },
   UE_CLIENT_SURVIVAL_DUO_ELO_K_FACTOR: { min: 1, max: 200, description: 'Duo survival rating K factor' },
+  UE_CLIENT_NIGHT_CHANCE: { min: 0, max: 1, description: 'Chance a match is at night (0-1), read by the host at map load' },
+  UE_CLIENT_STORM_CHANCE: { min: 0, max: 1, description: 'Chance a match has a storm (0-1), read by the host at map load' },
+  UE_CLIENT_ALLOW_NIGHT_RAIN: { description: 'Allow a storm on a night match' },
 };
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

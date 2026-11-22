@@ -15,13 +15,13 @@ project that clashes with the running containers.
 |---|---|---|---|
 | `backend` | `ogsos-backend-1` | TCP 7781 | the lobby/API/web backend (`server/server.js`), image `ogsos-backend:local` |
 | `host1` | `ogsos-host1-1` | UDP 7777 | game host, lobby "OG SOS Classic 1", map LaCuna |
-| `host2` | `ogsos-host2-1` | UDP 7778 | lobby 2, `GAME_MAP=/Game/Maps/Test_Mike/Layouts/Circle01` (test arena) |
-| `host3` | `ogsos-host3-1` | UDP 7779 | lobby 3, `GAME_MAP=/Game/Maps/Test_Will/Crater` (experimental, not match-ready) |
+| `host2` | `ogsos-host2-1` | UDP 7778 | lobby 2, map rotation (see below) |
+| `host3` | `ogsos-host3-1` | UDP 7779 | lobby 3, map rotation (see below) |
 
 Hosts run the game under Wine + Xvfb (`deploy/classic-host/`, image `ogsos-classic-host:local`). Per host, on the VPS:
 `/srv/ogsos/pool/<n>/game` (a copy of the game; **never committed**, holds `version.dll` + `sos_host.ini`),
 `/srv/ogsos/pool/<n>/prefix` (Wine prefix), `/srv/ogsos/pool/<n>/logs`. Per-host settings are in
-`deploy/classic-backend/pool/host<n>.env` (session id/token, `GAME_MAP`, optional `SOS_HOST_MAX_FPS`, `RESTART_HOUR`...).
+`deploy/classic-backend/pool/host<n>.env` (session id/token, `GAME_MAP` or `GAME_MAPS` + `ROTATE_OFFSET` for a rotation, optional `SOS_HOST_MAX_FPS`, `RESTART_HOUR`...).
 Lobby names and the session ids/tokens the backend trusts are `OGSOS_CLASSIC_HOSTS` in `deploy/classic-backend/.env`.
 Backend env (admins, origins, hosts) is `.env`; nothing secret is committed (`.env.example` is the template).
 HTTPS is Caddy in front of the backend (a `reverse_proxy` to TCP 7781; WebSockets pass through), admin panel at `/admin`.
@@ -96,3 +96,12 @@ curl -s https://<your-domain>/servers          # players/state/online per lobby
 node tools/smoke_test.js <vps-address> 7781 3   # from a checkout
 docker exec ogsos-host1-1 tail -n 20 /game/SOS/Binaries/Win64/sos_host.log
 ```
+
+## Map rotation, night and storms
+
+- `GAME_MAPS=LaCuna,/Game/Maps/Test_Mike/Layouts/Circle01` in `pool/host<n>.env` plays the maps in turn, one per game
+  start (each match recycles the game). `ROTATE_OFFSET` picks the first map, so hosts sharing a list start on different
+  maps. Crater is left out on purpose (no loot areas or relics).
+- Night and storm matches are KV: `UE_CLIENT_NIGHT_CHANCE`, `UE_CLIENT_STORM_CHANCE` (0-1) and
+  `UE_CLIENT_ALLOW_NIGHT_RAIN`, in `data/kv-classic/runtime-<live-rev>.json`. Owners can change them live in the admin
+  panel's KV page; the host rolls them when a map loads.

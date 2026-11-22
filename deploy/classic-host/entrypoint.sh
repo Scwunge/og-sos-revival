@@ -125,8 +125,20 @@ done
 # The bind mount makes the prefix dir exist even when empty, so test for a real prefix.
 [ -f "$WINEPREFIX/system.reg" ] || { log "creating Wine prefix"; wineboot -i >/dev/null 2>&1; wineserver -w; }
 
+# Map rotation: GAME_MAPS="LaCuna,/Game/Maps/Test_Mike/Layouts/Circle01" plays each map in turn, one per game start;
+# ROTATE_OFFSET picks where this host starts (so hosts sharing a list play different maps). Without GAME_MAPS, GAME_MAP
+# (default LaCuna) is used every time.
+ROT_I=${ROTATE_OFFSET:-0}
+next_map() {
+  if [ -n "${GAME_MAPS:-}" ]; then
+    local -a maps; IFS=',' read -r -a maps <<< "$GAME_MAPS"
+    GAME_MAP=${maps[$(( ROT_I % ${#maps[@]} ))]}; ROT_I=$(( ROT_I + 1 ))
+  fi
+}
+
 while :; do
   until resolve_backend; do sleep 10; done
+  next_map
   write_ini
   rm -f "$WIN64"/sos_game_*.log "$WIN64/sos_host.log"
   JWT=$(mint_jwt)
@@ -135,7 +147,7 @@ while :; do
   # Host frame cap (the DLL sleeps each frame once hosting; a listen host ticks and acks moves once per frame). 60 halves the
   # move-ack latency of the old 30 and costs about one extra core per host; SOS_HOST_MAX_FPS=30 goes back.
   export SOS_HOST_MAX_FPS="${SOS_HOST_MAX_FPS:-60}"
-  log "starting game (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
+  log "starting game ${GAME_MAP:-LaCuna} (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
   ( cd "$WIN64" && exec wine "$EXE" "${GAME_MAP:-LaCuna}?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
       -nullrhi -nosound -unattended -log ${EXTRA_ARGS:-} ) >/dev/null 2>&1 &
   GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=; BAD_SINCE=; GAME_BHOST=$BHOST
