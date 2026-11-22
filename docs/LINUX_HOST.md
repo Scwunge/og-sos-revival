@@ -1,5 +1,7 @@
 # Classic host on Linux (the VPS): plan
 
+> Current prod layout and the operating rules (compose project `ogsos`, GAME_MAP per host, supervisor behaviour, DLL swap, rollback tags, backups): see [HOSTING.md](HOSTING.md).
+
 Status: plan only. Nothing is installed on prod. Every install or change on prod needs the user's OK, which goes through the lead session.
 
 ## What is already proven (render PC test, 21 Nov 2026)
