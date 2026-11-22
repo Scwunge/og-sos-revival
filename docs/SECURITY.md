@@ -243,3 +243,7 @@ reports and matchmaking act. IP bans: `moderation.ipBanned(ipOrReq)` at login, t
 matchmaking, `session`, `feedback` and votes (`/ws`, `/ws/stream`), and `handleWatchApi` (admin watch link, off by default
 for this reason). The admin panel does not use these tokens: it has its own Steam OpenID login and signed cookie
 (`/admin/login`, `/admin/auth`, `server/admin.js`).
+
+## Probe log
+
+Requests that look like scanning (unhandled paths, known probe paths such as `/.git/`, `wp-`, `.php`, and 400/401/403/405/413/429 responses) are written WITH the client IP and user agent to `probes-YYYY-MM-DD.jsonl` in the log directory. Files older than `OGSOS_PROBE_LOG_DAYS` (default 14) are deleted. This is the only backend log that keeps addresses; `http.jsonl` and the others stay IP-redacted. It is server-side only (not shown in the admin panel), for spotting and banning scanners.

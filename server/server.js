@@ -67,6 +67,31 @@ function log(file, entry) {
   } catch { /* disk full, bad entry: never take the caller down */ }
 }
 
+// Probe log: requests that look like scanning (unhandled paths, known probe paths, 4xx/429) WITH their client IP, one
+// file per UTC day (probes-YYYY-MM-DD.jsonl), files older than OGSOS_PROBE_LOG_DAYS (14) deleted. This is the one log
+// that keeps addresses (owner-only, on the server; see docs/SECURITY.md); http.jsonl stays IP-redacted.
+const PROBE_PATH = /(\/\.(git|svn|hg|env|aws|ssh|DS_Store)|wp-|\.php|\/cgi-bin|phpmyadmin|\/actuator|\/server-status|\/vendor\/|\/backup|\.\.\/|\.\.%2f)/i;
+const PROBE_DAYS = envInt('OGSOS_PROBE_LOG_DAYS', 14);
+let probePruned = 0;
+function logProbe(req, ip, status, handled) {
+  const p = String(req.url || '');
+  if (handled && !PROBE_PATH.test(p) && ![400, 401, 403, 405, 413, 429].includes(status)) return;
+  try {
+    const now = new Date();
+    const day = now.toISOString().slice(0, 10);
+    const ua = String(req.headers['user-agent'] || '').slice(0, 200);
+    fs.appendFileSync(path.join(LOG_DIR, `probes-${day}.jsonl`), JSON.stringify({ t: now.toISOString(), ip, method: String(req.method).slice(0, 16), path: p.slice(0, 300), host: String(req.headers.host || '').slice(0, 100), status, handled, ua }) + '\n');
+    if (Date.now() - probePruned > 3600e3) {
+      probePruned = Date.now();
+      const cutoff = new Date(Date.now() - PROBE_DAYS * 86400e3).toISOString().slice(0, 10);
+      for (const f of fs.readdirSync(LOG_DIR)) {
+        const m = /^probes-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(f);
+        if (m && m[1] < cutoff) try { fs.unlinkSync(path.join(LOG_DIR, f)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* never take the caller down */ }
+}
+
 // ---------- tiny JSON "database" ----------
 // Saves are atomic (db.json.tmp then rename) and debounced (1 s, coalesced); SIGTERM/SIGINT flush. The first save of a
 // process keeps the previous db.json as db.json.bak. A db.json that exists but does not parse is never replaced by an
@@ -846,12 +871,13 @@ function refuse(req, res, status, body, headers = {}) {
 const server = http.createServer((req, res) => {
   try {
     const url = parseReqUrl(req.url);
-    if (!url) { refuse(req, res, 400, wrap({ error: 'bad-url' })); log('http.jsonl', { method: req.method, path: String(req.url).slice(0, 500), status: 400, handled: true }); return; }
+    if (!url) { refuse(req, res, 400, wrap({ error: 'bad-url' })); log('http.jsonl', { method: req.method, path: String(req.url).slice(0, 500), status: 400, handled: true }); logProbe(req, clientIp(req), 400, true); return; }
     const ip = clientIp(req);
     const wait = rateGate(req, url, ip);
     if (wait) {
       refuse(req, res, 429, { error: 'rate-limited' }, { 'Retry-After': String(wait) });
       log('http.jsonl', { method: req.method, path: req.url, ip, status: 429, handled: true });
+      logProbe(req, ip, 429, true);
       return;
     }
     const cap = bodyCap(req);
@@ -861,6 +887,7 @@ const server = http.createServer((req, res) => {
       tooBig = true; chunks.length = 0;
       refuse(req, res, 413, { error: 'too-large' });
       log('http.jsonl', { method: req.method, path: req.url, ip, status: 413, out: 'too-large', handled: true });   // never the body
+      logProbe(req, ip, 413, true);
     };
     if (Number(req.headers['content-length']) > cap) { reject413(); return; }
     req.on('data', (c) => { if (tooBig) return; size += c.length; if (size > cap) reject413(); else chunks.push(c); });
@@ -888,6 +915,7 @@ const server = http.createServer((req, res) => {
       }
       const entry = { method: req.method, path: req.url, host: req.headers.host, ip, headers: req.headers, body, ...result, handled };
       log('http.jsonl', entry);
+      logProbe(req, ip, result.status, handled);
       console.log(`${handled ? '   ' : '?? '}${req.method} ${String(req.url).slice(0, 200)} -> ${result.status}`);
     } catch (e) { failRequest(res, req, e); } });
   } catch (e) { failRequest(res, req, e); }

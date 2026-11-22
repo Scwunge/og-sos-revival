@@ -704,7 +704,8 @@ function wsConnect(b, p, headers = {}) {
     const lit = /(?:\d{1,3}\.){3}\d{1,3}/, v6 = { test: (l) => (l.match(/[0-9a-f:.]{3,}/gi) || []).some((t) => (t.match(/:/g) || []).length >= 2 && net.isIPv6(t)) };
     const bad = [];
     let xffLogged = false;
-    for (const f of fs.readdirSync(F.dir).filter((n) => /\.jsonl(\.1)?$/.test(n))) {
+    // probes-*.jsonl keeps client IPs on purpose (owner-only scan log, docs/SECURITY.md)
+    for (const f of fs.readdirSync(F.dir).filter((n) => /\.jsonl(\.1)?$/.test(n) && !/^probes-/.test(n))) {
       for (const line of fs.readFileSync(path.join(F.dir, f), 'utf8').split('\n')) {
         if (!line) continue;
         if (lit.test(line) || v6.test(line)) bad.push([f, line.slice(0, 160)]);
