@@ -118,6 +118,22 @@ function accountFromAuth(req) {
 // (from the client's error strings: 'Failed to get "data"', 'Failed to get "version"').
 function wrap(data, version = 1) { return { version, data }; }
 
+// Request URLs come straight off the wire: "//", "//host", "%zz" or a bare "*" must never throw out of a handler.
+// Prefixing the origin keeps "//x" a path (new URL('//x', base) would read it as a host). null = unparseable.
+function parseReqUrl(raw) {
+  try { return new URL('http://x' + (String(raw || '').startsWith('/') ? raw : '/' + raw)); } catch { return null; }
+}
+// Last line of defence: a bug in any route answers 500 (or drops the socket) and is logged, the process keeps running.
+function failRequest(res, req, e) {
+  console.error(`!! ${req.method} ${String(req.url).slice(0, 200)} -> 500: ${e && e.stack || e}`);
+  try { log('errors.jsonl', { method: req.method, path: String(req.url).slice(0, 500), error: String(e && e.stack || e).slice(0, 2000) }); } catch { /* disk full etc. */ }
+  try {
+    if (!res.headersSent) return send(res, 500, wrap({ error: 'internal' }));
+    res.destroy();
+  } catch { /* socket already gone */ }
+  return { status: 500 };
+}
+
 function send(res, status, body, type = 'application/json; charset=utf-8') {
   const buf = Buffer.isBuffer(body) ? body
     : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
@@ -617,10 +633,12 @@ const server = http.createServer((req, res) => {
   let size = 0, tooBig = false;
   const limited = req.url.startsWith('/api/community/');
   req.on('data', (c) => { size += c.length; if (limited && size > 4096) { tooBig = true; chunks.length = 0; } else if (!tooBig) chunks.push(c); });
-  req.on('end', () => {
+  req.on('error', () => {});
+  req.on('end', () => { try {
     if (tooBig) { const out = send(res, 413, { error: 'too-large' }); log('http.jsonl', { method: req.method, path: req.url, status: 413, out: out.out, handled: true }); return; }
     const body = Buffer.concat(chunks).toString('utf8');
-    const url = new URL(req.url, 'http://x');
+    const url = parseReqUrl(req.url);
+    if (!url) { const out = send(res, 400, wrap({ error: 'bad-url' })); try { log('http.jsonl', { method: req.method, path: String(req.url).slice(0, 500), status: 400, out: out.out, handled: true }); } catch { /* ignore */ } return; }
     let result;
     let handled = true;
     try {
@@ -637,12 +655,12 @@ const server = http.createServer((req, res) => {
         result = send(res, 200, wrap({}));   // keep the client moving; flag it in the log
       }
     } catch (e) {
-      result = send(res, 500, wrap({ error: String(e) }));
+      result = failRequest(res, req, e);
     }
     const entry = { method: req.method, path: req.url, host: req.headers.host, headers: req.headers, body, ...result, handled };
     log('http.jsonl', entry);
     console.log(`${handled ? '   ' : '?? '}${req.method} ${req.url} -> ${result.status}`);
-  });
+  } catch (e) { failRequest(res, req, e); } });
 });
 
 // ---------- WebSocket (matchmaking at /ws) ----------
@@ -760,13 +778,21 @@ function wsAccount(req, token) {   // hero-tv: optional token (stream sockets fr
 }
 
 server.on('upgrade', (req, socket) => {
-  const key = req.headers['sec-websocket-key'];
-  if (!key) return socket.destroy();
   socket.on('error', () => {});
-  const wsPath = new URL(req.url, 'http://x').pathname;
+  try { handleUpgrade(req, socket); } catch (e) {
+    console.error(`!! upgrade ${String(req.url).slice(0, 200)}: ${e && e.stack || e}`);
+    try { log('errors.jsonl', { upgrade: true, path: String(req.url).slice(0, 500), error: String(e && e.stack || e).slice(0, 2000) }); } catch { /* ignore */ }
+    socket.destroy();
+  }
+});
+function handleUpgrade(req, socket) {
+  const key = req.headers['sec-websocket-key'];
+  const u = parseReqUrl(req.url);
+  if (!key || !u) return socket.destroy();
+  const wsPath = u.pathname;
   const isMm = wsPath === '/ws';
   const isStream = wsPath === '/ws/stream';   // HERO "Stream" service ([OutpostStreamClient], see docs/HERO_TV.md)
-  const wsQuery = new URL(req.url, 'http://x').searchParams;
+  const wsQuery = u.searchParams;
   // hero-tv: stream sockets are never rejected: the game's auth for them is unknown, so the account is a best guess
   // (Authorization header, or ?token= from our embed pages).
   const who = isMm ? wsAccount(req) : isStream ? wsAccount(req, wsQuery.get('token') || '') : null;
@@ -833,7 +859,12 @@ server.on('upgrade', (req, socket) => {
   }
 
   let buf = Buffer.alloc(0);
-  socket.on('data', (d) => {
+  socket.on('data', (d) => { try { onWsData(d); } catch (e) {
+    console.error(`!! ws ${id} frame: ${e && e.stack || e}`);
+    try { log('errors.jsonl', { ws: id, error: String(e && e.stack || e).slice(0, 2000) }); } catch { /* ignore */ }
+    socket.destroy();
+  } });
+  function onWsData(d) {
     buf = Buffer.concat([buf, d]);
     while (buf.length >= 2) {
       const opcode = buf[0] & 0x0f;
@@ -859,7 +890,7 @@ server.on('upgrade', (req, socket) => {
       if (client) mmFor.onMessage(client, text);
       else if (streamConn) stream.message(streamConn, text);   // hero-tv
     }
-  });
+  }
   // The http server leaves upgraded sockets half-open, so a client that just drops the TCP connection
   // (no close frame) would otherwise never reach 'close' and keep its seat in a session.
   socket.on('end', () => socket.end());
@@ -869,7 +900,12 @@ server.on('upgrade', (req, socket) => {
     log('ws.jsonl', { id, event: 'close' });
     console.log(`ws ${id} closed`);
   });
-});
+}
+
+// Never let one bad request or socket take every lobby down: log and keep serving (the container still restarts
+// if the process dies some other way, restart: unless-stopped).
+process.on('uncaughtException', (e) => { console.error(`!! uncaughtException: ${e && e.stack || e}`); try { log('errors.jsonl', { uncaught: true, error: String(e && e.stack || e).slice(0, 2000) }); } catch { /* ignore */ } });
+process.on('unhandledRejection', (e) => { console.error(`!! unhandledRejection: ${e && e.stack || e}`); try { log('errors.jsonl', { unhandledRejection: true, error: String(e && e.stack || e).slice(0, 2000) }); } catch { /* ignore */ } });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`OG SOS Revival backend listening on http://0.0.0.0:${PORT}`);
