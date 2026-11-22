@@ -135,7 +135,7 @@ while :; do
   log "starting game (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
   ( cd "$WIN64" && exec wine "$EXE" "${GAME_MAP:-LaCuna}?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
       -nullrhi -nosound -unattended -log ${EXTRA_ARGS:-} ) >/dev/null 2>&1 &
-  GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=
+  GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=; GAME_BHOST=$BHOST
 
   while kill -0 "$GAME_PID" 2>/dev/null; do
     sleep 15
@@ -147,6 +147,14 @@ while :; do
         case "$(lobby_state)" in started|ended) reset_lobby ;; esac
       elif [ $UP -gt "$LISTEN_TIMEOUT" ]; then REASON="no 'Listening with' after ${UP}s"; break; fi
       continue
+    fi
+    # The backend container got a new IP (it was recreated): the game still talks to the old one and the poll
+    # check below can no longer see it. Recycle once the lobby is idle (empty and waiting, or ended).
+    if resolve_backend >/dev/null 2>&1 && [ "$BHOST" != "$GAME_BHOST" ]; then
+      J=$(lobby_json)
+      if echo "$J" | grep -q '"state":"ended"' || { echo "$J" | grep -q '"state":"waiting"' && echo "$J" | grep -q '"players":0[,}]'; }; then
+        REASON="backend address changed ($GAME_BHOST -> $BHOST)"; break
+      fi
     fi
     # Match over (host event match-end, POST /end, or empty too long): recycle for a fresh map.
     # The post-game show (results, podium, Exit button) needs the host alive: wait until nobody is connected any more
