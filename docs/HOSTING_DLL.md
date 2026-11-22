@@ -37,7 +37,7 @@ Needs MinGW-w64 gcc (the WinLibs build is installed on the dev machine). From `m
 .\build.ps1
 ```
 
-Output: `mod\sos_host\build\version.dll` (about 22 KB, depends only on kernel32 and the UCRT that the game already uses) and a copy of `sos_host.ini`.
+Output: `mod\sos_host\build\version.dll` (about 64 KB, depends only on kernel32 and the UCRT that the game already uses) and a copy of `sos_host.ini`.
 
 ## Install and remove
 
@@ -200,6 +200,47 @@ How they were found (Ghidra, `SOS` and `SOS-Classic` projects):
   - Live result: thousands of moves acked, no "saved moves" warnings. The joiner was moved from the pregame spot onto the island (this was the "dark box"). On a movable base ClientLoc is base-relative (the pregame platform logged `(0 0 2)`), so a few extra corrections happen there.
 - **AutoJoin (`SOS_HOST_AUTOJOIN` env, test joiners).** After `LoadingLoginEnd` with a non-empty PlayerId, it writes the URL into the first world context's TravelURL (+0xD0, GMalloc 0x1429e7560) and TravelType 0. Joiners that travel this way get no matchmaking seat and end in CharacterSelect. A joiner that clicks PLAY in the frontend works.
 - **SkipLoginCheck** (test switch): it patches the `jne` at 0x140185ca0 in the RestartPlayer override. With it on, an unlogged joiner goes to CharacterSelect (FindPlayerStart returns null) instead of LoginPending.
-- **Remote backend.** `tools/host_classic.js --backend 167.114.157.172:7781 --public-host 167.114.157.172` works. The joiner traveled to the relay at `167.114.157.172:7777` and played.
+- **Remote backend.** `tools/host_classic.js --backend <backend-host>:7781 --public-host <public-ip>` works. The joiner traveled to the relay at `<public-ip>:7777` and played.
 - **`ReplicateStartupActors=2`** (new, not tested live yet): map-placed actors are replicated only within `StartupActorRadius` (default 15000 cm) of each joiner's pawn. Once a channel is open it keeps updating. The env var `SOS_HOST_REPLICATE_STARTUP` overrides the ini, because `host_classic.js` forces the ini key to 0.
 - **Joiner reports after the fix:** it can run around the island, but it can't break objects and sees no loot. The intro sequences play only on the host. Suspected cause: crates, breakables and sequence actors are map-placed and were skipped. A static review of what else is stripped is in progress (`host-dll-what-breaks.md` in the session notes).
+
+## Current state, 22 Nov 2026 (SOS: Classic, commit e5ae526 and later)
+
+Treat this section as the source of truth where it differs from the dated sections above.
+
+### Build
+
+From `mod\sos_host` run `.\build.ps1` (MinGW-w64 gcc, links `kernel32` and `winhttp`). Output `build\version.dll` (about 64 KB) plus `sos_host.ini`. Install by copying both next to `SOS-Win64-Shipping.exe` (Classic: the `SOS Test Server` Win64 folder). Never run the game on a machine you are working on without meaning to; a host is a full game process.
+
+### Extra ini keys
+
+- `StatProps` (comma list of ShooterPlayerState property names, for example `Kills,Damage`): copied into each player's entry of the match-end JSON. Empty = none.
+- `TestMatchEndSec`: test switch, ends the match after N seconds counted from the first tracked player.
+- `BackendUrl`, `SessionId`, `SessionToken` (env `SOS_HOST_BACKEND`, `SOS_HOST_SESSION`, `SOS_HOST_TOKEN`; session id and token also from `-SESSION_ID=` / `-SESSION_TOKEN=`): where the match-end event goes.
+- `CorrectMoves` / `CorrectDistance`: see "Movement sync" for how they interact with the newer sync.
+
+### Player identity and match results
+
+- A player's Steam id comes from the PlayerState `UniqueId` (`PS+0x3d8`, a pointer to an `FUniqueNetId`). That object derives from `TSharedFromThis`: vtable `+0`, weak self pointer `+8`, controller `+16`, and the subclass data (the Steam id as uint64, or an FString) at `+24`. The reader checks the value's high word is `0x01100001` and prints the decimal id, falls back to the FString, and finally to `player-<PlayerId>` (`PS+0x3a8`). It keeps re-reading while the id is empty or still `player-...`. Verified on a Linux host: ids come out as real Steam ids.
+- Each player is snapshotted once a second while connected, and again at disconnect, so players who left before the end still appear. When the last joiner disconnects the DLL marks everyone disconnected and keeps the world clock running.
+- At match end (`LogLevel ActivateLevel ... Ben_Layout_02_PostGame`, needs `GameLog=1`, or `TestMatchEndSec`) the DLL POSTs JSON to `<BackendUrl>/session/<id>/events` with `Authorization: Token <SessionToken>`, retrying after 2, 5 and 10 s. The event carries a `players` array. Each entry has `playerId`, `name`, `connected`, `aliveAtEnd`, `deaths`, `escaped`, plus the `StatProps` values.
+- Kill, damage and escape values have not been checked in a real fight yet, and neither have the per-player event posts.
+
+### Post-game idle line and the supervisor
+
+The post-game show (revive, podium, results screen) is server-side Blueprint and takes a while after `ActivateLevel ... PostGame`. The host process must stay up through it. The DLL writes `[sos_host] Players alive=A connected=C` to `sos_host.log` every 10 s, also when nobody is connected (`Players alive=0 connected=0`). A supervisor should end the game from that line (for example `connected=0` for a minute) and not from the lobby going to `ended`, which fires as the match ends and cuts the show short. The old early return in the replication pass with zero connections was fixed, so the idle line and the world clock now keep running.
+
+### Movement sync (client authoritative)
+
+The shipping client has no server movement code, so `AckMoves=1` hooks `ServerMove`, `ServerMoveDual` and `ServerMoveDualHybridRootMotion` (parameters: ServerMove 1 TimeStamp, 3 ClientLoc, 7 ClientMovementBase, 9 ClientMovementMode; Dual and Hybrid 5, 7, 11, 13) and acks every move. The joiner is trusted with its position:
+
+- Gap between the host pawn and the joiner of more than `SYNC_DIST` (300 cm) and up to `TELEPORT_DIST` (25000 cm): the host pawn is moved to the joiner with `K2_SetWorldLocation(NewLocation, bSweep=false, bTeleport=true)` called through `ProcessEvent` (looked up once by name), at most once per 100 ms per player. If the joiner is walking and the host pawn was left falling, the host mode is set to walking. The joiner is never corrected for these gaps. Log lines: `K2_SetWorldLocation: fn ... (unavailable, host pawn sync off)` once, then `ServerSync: host pawn (...) -> joiner (...)`.
+- Gap above `TELEPORT_DIST` (match start, host pawn still at the spawn): the joiner is moved to the host pawn with `ClientAdjustPosition` (zero velocity).
+- Static movement bases (terrain, static meshes): the client sends world coordinates. Moving bases (drop ship, helicopter): relative coordinates, which are converted with the base transform; a base is only trusted if its rotation is a unit quaternion. A joiner standing on a base, or falling, is not synced.
+- Remaining correction thresholds for the old path: `FALL_DIST` 1000 cm while falling, `BASE_DIST` 2000 cm on a base, `LAG_FLOOR` 15000 cm for a host pawn that lags behind (not falling), corrections skipped on an untrusted base (`AdjustPosition skipped`), and at most 6 corrections per 10 s per player (`MAX_ADJUST_BURST`, `ADJUST_WINDOW_MS`).
+- `MoveDiag` (every 10 s per player): `MoveDiag: joiner (x y z) host (x y z) gap N cm; client moved A cm/s, host pawn B cm/s, host mode M; host frames n avg X ms max Y ms`. Use it to tell a slow host pawn from a slow host frame loop. `Base:` lines (first 24 bases seen) log name, class, outer and transform of each movement base.
+- Not tested on a live host yet: the `K2_SetWorldLocation` lookup, the sync, and the cause of the host pawn running slower than the joiner (candidates: slow host frames, sprint speed not applied, geometry wedging).
+
+### Known gaps
+
+Kills, damage and escape stats in a real match, the rest of the post-game show on a live host (revive of a dead joiner, PostGame sublevel streaming), crates and loot for joiners (map-placed actors), and the intro sequences on joiners.
