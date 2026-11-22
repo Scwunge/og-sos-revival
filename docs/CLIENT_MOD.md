@@ -87,8 +87,8 @@ Ranked by value for the revival divided by effort and risk. Feasibility is for t
 |---|---|---|---|---|---|---|
 | 1 | Text replacement ("SOSTEST" to the revival name, boot notices, any UI string) | High (branding, honest notices) | Small once a draw hook exists | Low | Yes: one hook where Slate draws a string (`FSlateDrawElement::MakeText`), replacement table in a text file | Built (BuildLabel, HideShutdownNotice) |
 | 2 | Quality of life: FOV, FPS cap, VSync, borderless window, graphics cvars | High | Small to medium | Low | Borderless: yes (plain Win32). FOV: yes (`APlayerController::FOV` exec function through `ProcessEvent`). cvars: yes if cvar set by name works in shipping (checked below) | Built: Borderless, [Cvars]; VerticalFOV experimental |
-| 3 | Report with a clip link | Medium | Medium | Low | Yes. The native report dialog already works against the moderation backend; the mod only adds the clip link (`POST /api/reports`, then `/evidence`). Needs the target picked from the in-match player list | Design only, needs backend routes and a decision |
-| 4 | Self-update (signed) | Very high (fix and ship without asking players to copy files) | Medium | High if done carelessly | Yes. A loaded DLL can be renamed on Windows, so: tiny stable `xinput1_3.dll` stub plus a replaceable `sos_client_core.dll` | Built and tested (below); not yet in a released install |
+| 3 | Report with a clip link | Medium | Medium | Low | Yes. The native report dialog already works against the moderation backend; the mod only adds the clip link (`POST /api/reports`, then `/evidence`). Needs the target picked from the in-match player list | Built: REPORT panel in the overlay (pick a player from `/api/search/account`, reason, optional pasted clip link, `POST /api/reports` with the game token). Drawing and clicks not yet checked in a live game |
+| 4 | Self-update (signed) | Very high (fix and ship without asking players to copy files) | Medium | High if done carelessly | Yes. A loaded DLL can be renamed on Windows, so: tiny stable `xinput1_3.dll` stub plus a replaceable `sos_client_core.dll` | Built and tested (below); shipped in release 1.0.0 |
 | 5 | Join a friend through Steam (rich presence `connect`, overlay invite, join request callback) | High | Medium | Low | Yes: call `steam_api64` flat API from the mod; the callback feeds the existing join-hint plus auto PLAY. Needs a lobby id in the rich presence | Not built |
 | 6 | Crash report upload | High (we can finally see why it crashed) | Medium | Medium (privacy: opt-in, strip user name and paths) | Yes. The game already writes crash contexts to `%LOCALAPPDATA%\SOS\Saved\Crashes\UE4CC-Windows-*`; upload them on the next start. Needs a backend route | Not built |
 | 7 | Content and asset patching (mount an extra `.pak`) | High long term (fix Blueprint text, loading screens) | Large | High (a pak runs Blueprint code: must be signed like the DLL) | Partly. Mounting a pak at startup is stock `FPakPlatformFile`; but we have no 4.12 cook, so only byte-level edits of existing assets (same-size strings) are realistic; pak version and signing of the game's own paks not yet checked | Design only |
@@ -126,6 +126,33 @@ node tools\mod_update.js sign mod\sos_client\build\sos_client_core.dll 3 dist-mo
 The first install also needs a signed manifest for the shipped core: sign the shipped core the same way and give players `manifest.json` renamed `sos_client_core.manifest` and `manifest.sig` renamed `sos_client_core.sig`. Verified end to end against a local backend: a v1 install staged v2 and applied it on the next launch (loader log: `core updated from v1 to v2`); a manifest with a flipped signature bit was ignored (`update: manifest signature invalid`). Not tested inside the real game (the updater runs the same in any host process).
 
 Limits: the backend speaks plain http, so the signature is the only protection (that is why it is mandatory); the loader itself cannot self-update except by manual replacement; losing the private key means a manual reinstall with a new key (the second key slot allows a planned rotation).
+
+### Release and publishing (how to ship a version)
+
+Everything below runs on the maintainer's machine. The signing key never enters any repo, the VPS or the game PC.
+
+**Signing key.** Created once with `node tools\mod_update.js keygen`. The private key is `%USERPROFILE%\.ogsos\update-signing.key` (back it up offline: losing it means every player must reinstall by hand). The public half is committed in `mod/sos_client/update_pubkey.h` (slot 1 active, slot 2 for a planned rotation). The loader only accepts manifests signed by a key in that file.
+
+**Build a release.** From the repo root:
+
+```powershell
+.\tools\make_mod_release.ps1 -Version 1.0.1 -CoreVersion 2
+```
+
+`-CoreVersion` is the integer the loader compares: it must be higher than the previous release's, or installed copies refuse the update (downgrade protection). `-Version` is only the human label. The script builds the loader and core (`mod/sos_client/build.ps1`), signs the core with the private key, verifies the signature, and writes to `dist\` (gitignored):
+
+- `OG-SOS-Mod-v<Version>.zip`: what players download (Nexus): `xinput1_3.dll`, `sos_client_core.dll`, `sos_client_core.manifest`, `sos_client_core.sig`, `sos_client.ini`, `README.txt`, `CHANGELOG.txt`;
+- `NEXUS_DESCRIPTION.txt`: BBCode page text (source: `mod/sos_client/release/`; edit README, CHANGELOG and this text there, and add a CHANGELOG entry per release);
+- `SHA256SUMS.txt`: hash of every file;
+- `update-server\`: `manifest.json`, `manifest.sig`, `core-<CoreVersion>.dll`, for the backend.
+
+**Publish an update to players already installed.** Copy the three files in `dist\update-server\` into the production backend's `data/mod` folder (or the directory in `OGSOS_MOD_DIR`). The backend route is `GET /mod/*` (`serveMod` in `server/server.js`; read-only, fixed file names, no secrets). Overwrite `manifest.json` and `manifest.sig` last so a client never sees a manifest whose core is missing. Installed clients fetch the manifest 15 s after each game start, verify, stage the core and apply it on the next launch; the old core is kept as `.prev`. Check with `http://<backend>:7781/mod/manifest.json`. The backend must be redeployed once with the `/mod` route before the first update can be served. New players download the zip from Nexus; its `.manifest` and `.sig` are the signed manifest for the shipped core.
+
+**Rules of thumb.** Bump `-CoreVersion` every release. Rebuild the loader only when `update_pubkey.h` changes (the loader cannot update itself; ship a new zip). Keep `UnlockDlcCosmetics=0` in the shipped ini (Nexus rules). Never commit anything from `dist\` or any game file. Test a release in a private copy of the game against a scratch backend (set `Backend=` in the ini) before publishing.
+
+**ini keys (`sos_client.ini`, section `[Client]`, all optional).** `Backend` (host:port of the community backend, default `sos.joltora.com:7781`), `OverrideEndpoints`, `Overlay`, `ShowButtonEverywhere`, `LogFile`, `GameLog`, `AutoPlay`, `UnlockUnreleasedCosmetics`, `UnlockDlcCosmetics` (default 0), `AutoUpdate` (default 1), `Borderless`, `BuildLabel`, `NoticeTitle`, `NoticeBody`, `NoticeTitleColor`, `NoticeBodyColor`, `HideShutdownNotice` (default 0), `VerticalFOV`, `VerticalZoomFOV`, `DumpObjects`; section `[Cvars]` holds `name=value` console variables. Each key has a comment in the shipped ini; details are in "Branding and settings" above.
+
+**Roadmap status and what is held.** Built: text replacement and relaunch notice, borderless and cvars, REPORT panel, signed self-update, Nexus release packaging. Not built: Steam friend join (5), crash report upload (6, needs opt-in and a backend route), content `.pak` patching (7), in-game settings panel (9), console (10), ultrawide (11), keybinds (12). Content patching and crash upload are deliberately on hold. Not yet verified in a live game: report panel drawing and clicks, OK click on the new notice, the in-game HUD label, VerticalFOV, an https backend.
 
 ### Self-update original design notes
 
