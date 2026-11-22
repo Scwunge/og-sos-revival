@@ -132,6 +132,9 @@ while :; do
   JWT=$(mint_jwt)
   # For the sos_host DLL's match-end event (POST $SOS_HOST_BACKEND/session/<id>/events).
   export SOS_HOST_BACKEND="$BASE/api" SOS_HOST_SESSION="$SESSION_ID" SOS_HOST_TOKEN="$SESSION_TOKEN"
+  # Host frame cap (the DLL sleeps each frame once hosting; a listen host ticks and acks moves once per frame). 60 halves the
+  # move-ack latency of the old 30 and costs about one extra core per host; SOS_HOST_MAX_FPS=30 goes back.
+  export SOS_HOST_MAX_FPS="${SOS_HOST_MAX_FPS:-60}"
   log "starting game (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
   ( cd "$WIN64" && exec wine "$EXE" "${GAME_MAP:-LaCuna}?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
       -nullrhi -nosound -unattended -log ${EXTRA_ARGS:-} ) >/dev/null 2>&1 &
