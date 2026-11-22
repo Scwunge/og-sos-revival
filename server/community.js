@@ -12,9 +12,12 @@ const { cleanLabel } = require('./matchmaking');
 // "LogHandshake: SendConnectChallenge"); verified 21 Nov 2026 against a Windows listen host. 25-byte packets get no
 // reply, nor do all-zero or random 26-byte ones. No connection is created by the challenge.
 const PROBE_PACKET = (() => { const b = Buffer.alloc(26); b[0] = 0x01; b[25] = 0x01; return b; })();
+const PROBE_REPLY_BYTES = 32;   // the challenge's size: a datagram of any other size (an echo, a generic UDP responder) does not count
 
-// Resolves true if ANY datagram comes back from host:port within timeoutMs (up to 3 tries, 1 s apart). Never throws.
-function udpProbe(host, port, timeoutMs = 3000) {
+
+// Resolves true if a datagram of replyBytes bytes comes back from exactly host:port within timeoutMs (up to 3 tries, 1 s
+// apart; replyBytes 0 = any size). Never throws.
+function udpProbe(host, port, timeoutMs = 3000, replyBytes = PROBE_REPLY_BYTES) {
   return new Promise((resolve) => {
     let sock = null, done = false, timer = null, tries = null;
     const finish = (v) => {
@@ -27,7 +30,7 @@ function udpProbe(host, port, timeoutMs = 3000) {
     try {
       sock = dgram.createSocket('udp4');
       sock.on('error', () => { /* ICMP unreachable etc: keep waiting for the timeout */ });
-      sock.on('message', (_msg, rinfo) => { if (rinfo.address === host && rinfo.port === port) finish(true); });
+      sock.on('message', (msg, rinfo) => { if (rinfo.address === host && rinfo.port === port && (!replyBytes || msg.length === replyBytes)) finish(true); });
       let n = 0;
       const send = () => { if (n++ < 3) { try { sock.send(PROBE_PACKET, port, host, () => {}); } catch { /* ignore */ } } };
       send();
@@ -52,6 +55,10 @@ function loadCommunityConfig(env = process.env) {
     bans: list(env.OGSOS_COMMUNITY_BANS),
     maxPerIp: int(env.OGSOS_COMMUNITY_MAX_PER_IP, 3),
     maxTotal: int(env.OGSOS_COMMUNITY_MAX_TOTAL, 50),
+    maxPerNet: int(env.OGSOS_COMMUNITY_MAX_PER_NET, 3),           // listed + pending hosts per source /24, on top of maxPerIp
+    maxPending: int(env.OGSOS_COMMUNITY_MAX_PENDING, 20),         // registered hosts that were never listed yet
+    pendingSec: int(env.OGSOS_COMMUNITY_PENDING_SECONDS, 120),    // a host not listed this long after it first registered is dropped
+    probeReplyBytes: int(env.OGSOS_COMMUNITY_PROBE_REPLY_BYTES, PROBE_REPLY_BYTES),   // 0 = any reply size counts
     ratePerIp: int(env.OGSOS_COMMUNITY_RATE_PER_IP, 10),
     firstPollSec: int(env.OGSOS_COMMUNITY_FIRST_POLL_SECONDS, 600),
     expireSec: int(env.OGSOS_COMMUNITY_EXPIRE_SECONDS, 600),
@@ -61,6 +68,7 @@ function loadCommunityConfig(env = process.env) {
   };
 }
 
+const net24 = (ip) => String(ip).split('.').slice(0, 3).join('.');
 const ipToInt = (ip) => ip.split('.').reduce((a, b) => a * 256 + Number(b), 0);
 function inCidr(ip, cidr) {
   const [base, bitsStr] = cidr.split('/');
@@ -85,8 +93,9 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const TOKEN_RE = /^[0-9a-f]{32,128}$/i;
 const reply = (status, body) => ({ status, body });
 
-function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe, log = () => {} }) {
+function createCommunityRegistry({ mm, config, now = Date.now, probe: probeIn, log = () => {} }) {
   const cfg = { ...loadCommunityConfig({}), ...config };
+  const probe = probeIn || ((h, p) => udpProbe(h, p, 3000, cfg.probeReplyBytes));
   const cap = cfg.maxPlayers > 0 ? cfg.maxPlayers : 16;
   const hosts = new Map();      // id -> { id, token, ip, host, port, name, verified, registeredAt, probe, probeAt, probing }
   const rate = new Map();       // ip -> [timestamps]
@@ -187,6 +196,13 @@ function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe,
       let perIp = 0;
       for (const o of hosts.values()) if (o.ip === ip) perIp++;
       if (perIp >= cfg.maxPerIp) return reply(429, { error: 'too-many-for-ip' });
+      // Per source /24 (listed + pending) and a separate cap on hosts that were never listed, so spam from one network or a
+      // flood of unreachable registrations cannot take the slots of working hosts.
+      let perNet = 0, pending = 0;
+      const net = net24(ip);
+      for (const o of hosts.values()) { if (net24(o.ip) === net) perNet++; isListed(o.id); if (!o.everListed) pending++; }
+      if (perNet >= cfg.maxPerNet) return reply(429, { error: 'too-many-for-network' });
+      if (pending >= cfg.maxPending) return reply(503, { error: 'too-many-pending' });
       if (hosts.size >= cfg.maxTotal) return reply(503, { error: 'registry-full' });
       // Re-claim after a backend restart: the game still runs with its old id/token, so an unknown but well-formed
       // id + token pair is accepted as is (never one that collides with a pool or community session).
@@ -196,7 +212,7 @@ function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe,
       const token = reclaim ? renewTok : crypto.randomBytes(24).toString('hex');
       try { mm.addCommunityHost({ host: ip, port, sessionId: id, sessionToken: token, hostIds, name, region, maxPlayers, verified }); }
       catch { return reply(409, { error: 'id-in-use' }); }
-      h = { id, token, ip, host: ip, port, name, verified, registeredAt: t, probe: cfg.probe ? 'pending' : 'off', probeAt: 0, probing: false };
+      h = { id, token, ip, host: ip, port, name, verified, registeredAt: t, pendingSince: t, everListed: false, probe: cfg.probe ? 'pending' : 'off', probeAt: 0, probing: false };
       hosts.set(id, h);
       log(`community host ${reclaim ? 're-claimed' : 'registered'}: ip ${ip} id ${id} name "${name}"${verified ? ' (verified)' : ''}`);
     }
@@ -219,7 +235,9 @@ function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe,
   function isListed(id) {
     const h = hosts.get(String(id));
     if (!h) return false;
-    return mm.lastPollOf(h.id) !== null && mm.hostOnline(h.id) && (h.probe === 'ok' || h.probe === 'off');
+    const listed = mm.lastPollOf(h.id) !== null && mm.hostOnline(h.id) && (h.probe === 'ok' || h.probe === 'off');
+    if (listed) h.everListed = true;   // no longer counts against the pending cap, whatever happens to it later
+    return listed;
   }
 
   // Public status for the host's watchdog scripts (flat, same field semantics as the GET /servers entries).
@@ -248,6 +266,8 @@ function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe,
       if (!cfg.enabled) { remove(h.id, 'disabled'); continue; }
       if (bannedIp(h.ip) || bannedId(h.id)) { remove(h.id, 'banned'); continue; }
       const lp = mm.lastPollOf(h.id);
+      // Pending (never listed) entries expire PENDING_SECONDS after the first registration; renewals do not extend it.
+      if (!isListed(h.id) && !h.everListed && t - h.pendingSince > cfg.pendingSec * 1000) { remove(h.id, 'pending-expired'); continue; }
       if (lp === null && t - h.registeredAt > cfg.firstPollSec * 1000) { remove(h.id, 'never-polled'); continue; }
       if (t - Math.max(lp || 0, h.registeredAt) > cfg.expireSec * 1000) { remove(h.id, 'expired'); continue; }
       if (cfg.probe && !h.probing) {
@@ -268,4 +288,4 @@ function createCommunityRegistry({ mm, config, now = Date.now, probe = udpProbe,
   return { register, unregister, status, sweep, badName, isListed, communityInfo, isVerifiedToken, communityIdForToken, whenIdle, _hosts: hosts, _cfg: cfg };
 }
 
-module.exports = { createCommunityRegistry, loadCommunityConfig, udpProbe, PROBE_PACKET, isPublicIp };
+module.exports = { createCommunityRegistry, loadCommunityConfig, udpProbe, PROBE_PACKET, PROBE_REPLY_BYTES, isPublicIp };

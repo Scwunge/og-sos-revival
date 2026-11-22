@@ -436,6 +436,7 @@ function handleApi(req, url, body, res) {
     if (claims && !(claims.exp && claims.exp < Date.now() / 1000)) pid = String(claims['account-id'] || claims.id || '') || null;
     if (!pid && tok) pid = readSessionJwt({ sessionId: id, sessionToken: found.token }, tok);
     if (!pid) return send(res, 401, { error: 'unauthorized' });
+    moderation.recordIp(pid, clientIp(req));
     const v = owner.voteStartHosted(id, pid);
     if (v.error === 'not-seated') return send(res, 403, { error: 'not-seated' });
     if (v.error === 'closed') return send(res, 409, { error: 'closed', state: v.state });
@@ -455,6 +456,9 @@ function handleApi(req, url, body, res) {
     const claims = tok && readJwt(tok);
     const pid = claims && !(claims.exp && claims.exp < Date.now() / 1000) ? String(claims['account-id'] || claims.id || '') : '';
     if (!pid) return send(res, 401, { error: 'unauthorized' });
+    const ipBan = moderation.ipBanned(clientIp(req));
+    if (ipBan) return send(res, 403, moderation.banBody(ipBan));
+    moderation.recordIp(pid, clientIp(req));
     const v = owner.setJoinHint(id, pid);
     if (v.error === 'not-found') return send(res, 404, { error: v.error });
     if (v.error) return send(res, 409, { error: v.error, state: v.state });
@@ -535,11 +539,12 @@ function handleApi(req, url, body, res) {
     if (!STEAM_ID_RE.test(steamId)) return send(res, 400, { error: 'bad-steam-id' });
     const accountId = steamId;
     // moderation: a banned account gets no token. The exact client ban shape may change after RE.
-    const ban = moderation.isBanned(accountId);
+    const ban = moderation.isBanned(accountId) || moderation.ipBanned(clientIp(req));   // account ban, else a ban on the client address (owner-set, docs/SECURITY.md)
     if (ban) {
       log('http.jsonl', { event: 'login-refused-banned', account: accountId });
       return send(res, 403, moderation.banBody(ban));   // the shape the client's login error handler parses (app-banned)
     }
+    moderation.recordIp(accountId, clientIp(req));   // owner-only IP history
     db.accounts[accountId] ??= {
       id: accountId, 'account-id': accountId, alias: `player-${accountId.slice(-4)}`,
       'display-name': `player-${accountId.slice(-4)}`, created: new Date().toISOString(),
@@ -978,6 +983,8 @@ let fameHooks = null;
 fameHooks = fame;   // hero-tv: server/fame.js plugs in here (docs/PROGRESSION.md section 7)
 const progression = createProgression({
   db, saveDb, isHostToken, jwtAccount,
+  // host write scope: only players seated in that host's session now or within 30 min (docs/SECURITY.md)
+  wasSeated: (sid, pid, ms) => mmClassic.wasSeated(sid, pid, ms) || mm.wasSeated(sid, pid, ms),
   canReadToken: (tok) => !!community.communityIdForToken(tok),
   displayName: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
   fame: {
@@ -1000,6 +1007,7 @@ const stream = createStream({
 // moderation: reports, bans, host blocks, /admin panel (server/admin.js)
 const moderation = createModeration({
   db, saveDb, log, secret: SECRET, jwtAccount,
+  clientIp, trustedProxies: [...TRUSTED_PROXIES],   // owner-only IP tracking and IP bans (server/iptrack.js)
   displayName: (id) => db.accounts[id]?.['display-name'] || db.accounts[id]?.alias || id,
   progression, matchmakers: { classic: mmClassic, main: mm }, env: process.env,
   fame, community, kvDir: KV_DIR_CLASSIC,
@@ -1049,6 +1057,10 @@ function handleUpgrade(req, socket) {
   if (!LIMITS.ws(ip)) { log('ws.jsonl', { event: 'rejected', path: req.url, ip, reason: 'rate-limited' }); return wsReject(socket, '429 Too Many Requests', `Retry-After: ${LIMITS.ws.retryAfter(ip)}\r\n`); }
   if (wsTotal >= WS_MAX_TOTAL) return wsReject(socket, '503 Service Unavailable');
   if ((wsByIp.get(ip) || 0) >= WS_MAX_PER_IP) { log('ws.jsonl', { event: 'rejected', path: req.url, ip, reason: 'too many sockets' }); return wsReject(socket, '429 Too Many Requests'); }
+  if (moderation.ipBanned(ip)) {   // an owner-set IP ban: no matchmaking or stream sockets
+    log('ws.jsonl', { event: 'rejected', path: req.url, reason: 'ip-banned' });
+    return wsReject(socket, '403 Forbidden');
+  }
   const wsQuery = u.searchParams;
   // hero-tv: stream sockets may connect anonymously (read-only use: view/sub/viewers); anything that creates or changes
   // state needs an account (Authorization header, or ?token= from our embed pages), see server/stream.js.
@@ -1067,6 +1079,7 @@ function handleUpgrade(req, socket) {
     socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
     return;
   }
+  if (accountId) moderation.recordIp(accountId, ip);   // owner-only IP history (matchmaking and stream sockets with an account)
   const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   const proto = req.headers['sec-websocket-protocol'];
   wsTotal++; wsByIp.set(ip, (wsByIp.get(ip) || 0) + 1);

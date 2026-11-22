@@ -8,6 +8,47 @@
   const serverName = (s) => (s && typeof s === 'object' ? s.name || '' : (s || ''));
   const confirmP = (msg) => confirm(msg);
 
+  // ---------- Player IP addresses (owner only: the API sends no IP fields to mods, so these never render for them) ----------
+  function ipBanDialog(ip, done) {
+    const reason = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason (required)' });
+    const dur_ = A.durationField();
+    const go = h('button', { class: 'danger' }, 'Ban IP');
+    const { close } = openDialog('Ban IP address', [
+      h('p', {}, 'Players on this address cannot log in, open matchmaking or stream sockets, join lobbies from the server list, or file reports. It can catch other players behind the same router.'),
+      h('div', { class: 'field' }, h('label', {}, 'Address'), h('input', { type: 'text', value: ip, readonly: true })),
+      h('div', { class: 'field' }, h('label', {}, 'Reason'), reason),
+      dur_.node,
+    ], [h('button', { onclick: () => close() }, 'Cancel'), go], { narrow: true });
+    go.addEventListener('click', async () => {
+      const r = reason.value.trim();
+      if (!r) { toast('A reason is required'); return; }
+      let hours;
+      try { hours = dur_.hours(); } catch (e) { toast(e.message); return; }
+      go.disabled = true;
+      const ok = await act(() => api('ip-bans', { ip, reason: r, hours }), 'IP banned');
+      go.disabled = false;
+      if (ok) { close(); if (done) done(); }
+    });
+    reason.focus();
+  }
+  // Who was seen on an address, with links, and a ban button.
+  async function ipDialog(ip) {
+    const d = okData(await act(() => api('ip/' + encodeURIComponent(ip))));
+    if (!d) return;
+    const accs = d.accounts || [];
+    const ban = h('button', { class: 'danger', onclick: () => ipBanDialog(ip) }, 'Ban IP');
+    openDialog('Address ' + ip, [
+      d.banned ? h('div', { class: 'banner bad' }, h('b', {}, 'IP BANNED'), ' ', d.ban && d.ban.reason ? d.ban.reason : '') : null,
+      tableWrap(['Account', 'Steam id', 'First seen', 'Last seen', 'Count'], accs.map((a) => h('tr', {},
+        h('td', {}, idLink(a.id, a.name || a.id)), h('td', {}, mid(a.id)), timeCell(a.first), timeCell(a.last), h('td', { class: 'num', text: String(a.count == null ? '' : a.count) }))), 'No accounts seen on this address'),
+    ], d.banned ? [] : [ban], {});
+  }
+  // An address with a lookup link and an IP ban button next to it.
+  const ipCell = (ip) => h('span', {}, h('a', { href: '#', class: 'mono', title: 'Accounts seen on this address', onclick: (e) => { e.preventDefault(); ipDialog(ip); } }, ip), ' ',
+    h('button', { class: 'sm danger', onclick: () => ipBanDialog(ip) }, 'Ban IP'));
+  const sharedTable = (shared) => tableWrap(['Address', 'Other accounts seen on it (last 90 days)'], (shared || []).map((x) => h('tr', {},
+    h('td', {}, ipCell(x.ip)), h('td', {}, (x.accounts || []).map((a) => [idLink(a.id, a.name || a.id), ' '])))), 'No other accounts share an address');
+
   // ---------- Players list ----------
   A.pages.players = async function () {
     const seq = A.seq();
@@ -180,6 +221,12 @@
           Object.keys(ratings).length ? [h('h3', { class: 'mt' }, 'Ratings'), kvTable(ratings)] : null,
           prof.fame ? [h('h3', { class: 'mt' }, 'Fame'), kvTable(prof.fame)] : null),
         h('div', { class: 'card' }, h('h3', {}, 'Stats summary'), kvTable(d.stats || {}))),
+      d.ips ? h('div', { class: 'cols mt' },
+        h('div', { class: 'card' }, h('h3', {}, 'IP addresses'),
+          d.ips.first ? h('p', { class: 'muted' }, 'First seen on ', h('span', { class: 'mono', text: d.ips.first.ip }), ' ', ago(d.ips.first.at)) : null,
+          tableWrap(['Address', 'First seen', 'Last seen', 'Count'], (d.ips.list || []).map((r) => h('tr', {},
+            h('td', {}, ipCell(r.ip)), timeCell(r.first), timeCell(r.last), h('td', { class: 'num', text: String(r.count == null ? '' : r.count) }))), 'No addresses recorded yet')),
+        h('div', { class: 'card' }, h('h3', {}, 'Accounts sharing an IP'), sharedTable(d.sharedIp))) : null,
       h('h2', { class: 'mt' }, 'Match history'), matches,
       h('div', { class: 'cols mt' },
         h('div', {}, h('h2', {}, 'Reports against'), reportsTable(d.reportsAgainst || [], 'against')),
@@ -374,6 +421,16 @@
         h('div', { class: 'card' }, h('h3', {}, 'Target ', r.target && r.target.name || ''), snap.target ? kvTable(snap.target) : h('p', { class: 'muted' }, 'No snapshot'),
           d.target ? [h('h3', {}, 'Target now'), kvTable(d.target)] : null)));
     if (sess) body.push(h('div', { class: 'card' }, h('h3', {}, 'Session at report time'), kvTable(sess)));
+    if (r.ips) {   // owner only (the API leaves it out for mods)
+      const t = r.ips.target || {}, rp_ = r.ips.reporter || {};
+      body.push(h('h2', {}, 'IP addresses at report time'), h('div', { class: 'cols' },
+        h('div', { class: 'card' }, h('h3', {}, 'Target ', r.target && r.target.name || ''),
+          t.last ? h('p', {}, 'Last: ', ipCell(t.last)) : h('p', { class: 'muted' }, 'No address recorded'),
+          (t.recent || []).length ? tableWrap(['Recent address', 'Last seen'], t.recent.map((x) => h('tr', {}, h('td', {}, ipCell(x.ip)), timeCell(x.last))), '') : null),
+        h('div', { class: 'card' }, h('h3', {}, 'Reporter ', r.reporter && r.reporter.name || ''),
+          rp_.last ? h('p', {}, 'Last: ', ipCell(rp_.last)) : h('p', { class: 'muted' }, 'No address recorded')),
+        h('div', { class: 'card' }, h('h3', {}, 'Accounts sharing the target addresses'), sharedTable(d.sharedIp))));
+    }
     if (snap.lastMatch) body.push(h('h2', {}, 'Target\'s last match at report time'), A.playersTable(snap.lastMatch.players || [], hl));
     show(h('div', { class: 'stack' }, body));
   };
@@ -384,6 +441,8 @@
     const seq = A.seq();
     stopRefresh();
     const r = okData(await act(() => api('bans' + (showAll ? '?all=1' : ''))));
+    if (seq !== A.cur()) return;
+    const ipr = isOwner() ? okData(await act(() => api('ip-bans' + (showAll ? '?all=1' : '')))) : null;
     if (seq !== A.cur()) return;
     const bans = !r ? [] : (Array.isArray(r.bans) ? r.bans : Object.values(r.bans || {}));
     const blocks = !r ? [] : (r.hostBlocks || []);
@@ -428,10 +487,37 @@
       if (await act(() => api('host-blocks', { value: bv.value.trim(), reason: br.value.trim() }), 'Host blocked')) reload();
     });
 
+    // IP bans (owner only)
+    let ipSection = null;
+    if (ipr) {
+      const ipRows = (ipr.bans || []).map((b) => {
+        const active = !b.lifted && (!b.expiresAt || new Date(b.expiresAt).getTime() > now);
+        return h('tr', {}, h('td', {}, mid(b.value)), h('td', { text: b.kind }), h('td', { text: b.reason }), h('td', {}, mid(b.by)), timeCell(b.at),
+          h('td', { class: 'nowrap', text: b.expiresAt ? fmtTime(b.expiresAt) : 'permanent' }),
+          h('td', {}, b.lifted ? h('span', { class: 'muted', text: 'lifted ' + fmtTime(b.lifted.at) }) : (active ? h('span', { class: 'badge bad' }, 'active') : h('span', { class: 'badge' }, 'expired'))),
+          h('td', {}, active ? h('button', { class: 'sm', onclick: async () => { if (confirmP('Lift IP ban ' + b.value + '?') && await act(() => api('ip-bans/' + encodeURIComponent(b.id) + '/lift', {}), 'IP ban lifted')) reload(); } }, 'Lift') : null));
+      });
+      const ipv = h('input', { type: 'text', placeholder: 'IPv4, IPv6 or IPv4 CIDR (/16 - /32)' });
+      const ipr_ = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason' });
+      const ipd = A.durationField();
+      const ipForm = h('form', { class: 'inline-form' }, h('div', { class: 'field' }, h('label', {}, 'Address'), ipv), h('div', { class: 'field' }, h('label', {}, 'Reason'), ipr_), ipd.node,
+        h('button', { class: 'danger', type: 'submit' }, 'Ban IP'));
+      ipForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (!ipv.value.trim() || !ipr_.value.trim()) { toast('Address and reason are required'); return; }
+        let hours; try { hours = ipd.hours(); } catch (er) { toast(er.message); return; }
+        if (await act(() => api('ip-bans', { ip: ipv.value.trim(), reason: ipr_.value.trim(), hours }), 'IP banned')) reload();
+      });
+      ipSection = [h('h1', { class: 'mt' }, 'IP bans'),
+        tableWrap(['Address', 'Kind', 'Reason', 'By', 'Created', 'Expires', 'Status', ''], ipRows, 'No IP bans'),
+        h('div', { class: 'card' }, h('h3', {}, 'New IP ban'), ipForm)];
+    }
+
     show(h('h1', {}, 'Bans'),
       h('div', { class: 'row' }, h('label', { class: 'check' }, showToggle, 'show lifted / expired')),
       tableWrap(['Player', 'Steam id', 'Reason', 'By', 'Created', 'Expires', 'Status', ''], banRows, 'No bans'),
       h('div', { class: 'card' }, h('h3', {}, 'New ban'), banForm),
+      ipSection,
       h('h1', { class: 'mt' }, 'Host blocks'),
       tableWrap(['Value', 'Kind', 'Reason', 'By', 'Created', 'Status', ''], blockRows, 'No host blocks'),
       h('div', { class: 'card' }, h('h3', {}, 'New host block'), blockForm));

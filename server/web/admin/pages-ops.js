@@ -347,7 +347,7 @@
 
   // ---------- Audit ----------
   const KNOWN_ACTIONS = ['ban', 'unban', 'kick', 'warn', 'note', 'adjust', 'reset-stats', 'report-status', 'report-assign', 'report-note', 'host-block', 'host-unblock',
-    'lobby-force-start', 'lobby-countdown', 'lobby-end', 'lobby-reset', 'lobby-lock', 'lobby-unlock', 'lobby-options', 'kv-set', 'kv-clear', 'mod-add', 'mod-remove', 'spectate'];
+    'lobby-force-start', 'lobby-countdown', 'lobby-end', 'lobby-reset', 'lobby-lock', 'lobby-unlock', 'lobby-options', 'kv-set', 'kv-clear', 'mod-add', 'mod-remove', 'spectate', 'ip-ban', 'ip-unban', 'ip-view', 'report-queue-full'];
 
   A.pages.audit = async function () {
     const seq = A.seq();
@@ -364,9 +364,11 @@
     const filters = () => ({ by: by.value, action: action.value, target: target.value.trim() });
     const render = () => {
       clear(out);
-      out.appendChild(tableWrap(['Time', 'Admin', 'Action', 'Target', 'Detail'],
+      const withIp = A.isOwner();   // the API sends the ip field to owners only
+      out.appendChild(tableWrap(['Time', 'Admin', 'Action', 'Target', 'Detail'].concat(withIp ? ['IP'] : []),
         entries.map((a) => h('tr', {}, timeCell(a.at), h('td', {}, a.byName || '', ' ', mid(a.by)), h('td', {}, h('span', { class: 'badge', text: a.action })),
-          h('td', {}, mid(a.target)), h('td', { class: 'excerpt mono', text: typeof a.detail === 'string' ? a.detail : fmtVal(a.detail) }))), 'No matching audit entries'));
+          h('td', {}, mid(a.target)), h('td', { class: 'excerpt mono', text: typeof a.detail === 'string' ? a.detail : fmtVal(a.detail) }),
+          withIp ? h('td', {}, a.ip ? mid(a.ip) : '') : null)), 'No matching audit entries'));
       if (entries.length >= 500) {
         out.appendChild(h('div', { class: 'row mt' }, h('button', { onclick: () => run(true) }, 'Older entries')));
       }

@@ -9,6 +9,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const { badKey, nullProto } = require('./safe');
+const iptrack = require('./iptrack');
 
 const WEB_DIR = path.join(__dirname, 'web', 'admin');
 const COOKIE = 'ogsos_admin';
@@ -105,6 +106,10 @@ function createModeration(opts = {}) {
   const now = opts.now || Date.now;
   const jwtAccount = opts.jwtAccount || (() => null);
   const displayName = opts.displayName || ((id) => String(id));
+  // Client address of a request (server.js clientIp: proxy aware) and the trusted proxy addresses (never a player's IP).
+  const clientIpOf = opts.clientIp || ((req) => String((req && req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/i, ''));
+  const trustedProxies = Array.isArray(opts.trustedProxies) ? opts.trustedProxies : [];
+  const isTrustedProxy = (ip) => trustedProxies.some((t) => iptrack.normalize(t) === iptrack.normalize(ip));
   const matchmakers = opts.matchmakers || {};
   const onHostBlocksChanged = opts.onHostBlocksChanged || null;
   const fame = opts.fame || null;               // server/fame.js instance: heroStats, applyToBlob, adjust
@@ -126,6 +131,7 @@ function createModeration(opts = {}) {
     m.lobbyOptions = isObj(m.lobbyOptions) ? nullProto(m.lobbyOptions) : Object.create(null);
     m.kv = isObj(m.kv) ? nullProto(m.kv) : Object.create(null);
     m.kvRev = Number.isInteger(m.kvRev) ? m.kvRev : 0;
+    m.ipBans = Array.isArray(m.ipBans) ? m.ipBans : [];
     return m;
   };
   store();
@@ -151,13 +157,59 @@ function createModeration(opts = {}) {
   if (env.OGSOS_ADMIN_DEV_LOGIN === '1') console.warn('moderation: OGSOS_ADMIN_DEV_LOGIN=1, /admin/dev-login is enabled for loopback requests. Never set this in production.');
 
   // ---------- audit ----------
-  function audit(by, byName, action, target, detail) {
+  // `ip` (ip-ban / ip-unban / ip-view entries only) lives in its own field: owners see it, the audit API and CSV drop it
+  // for mods, and it is never written to admin.jsonl.
+  function audit(by, byName, action, target, detail, ip) {
     const m = store();
     const e = { at: nowIso(), by: by || '', byName: byName || '', action, target: target === undefined || target === null ? '' : String(target), detail: detail === undefined ? '' : clip(detail, 2000) };
+    if (ip) e.ip = String(ip);
     m.audit.push(e);
     while (m.audit.length > MAX_AUDIT) m.audit.shift();
-    try { log('admin.jsonl', { ...e }); } catch { /* keep serving */ }
+    try { const { ip: _ip, ...loggable } = e; log('admin.jsonl', loggable); } catch { /* keep serving */ }
     return e;
+  }
+  const auditFor = (admin, e) => { if (admin.role === 'owner' || !('ip' in e)) return e; const { ip: _ip, ...rest } = e; return rest; };
+
+  // ---------- player IPs and IP bans (server/iptrack.js, docs/SECURITY.md) ----------
+  const tracker = iptrack.createIpTracker({ db, saveDb: () => save(), now, isTrusted: isTrustedProxy });
+  const retentionDays = () => { const n = Math.floor(Number(env.OGSOS_IP_RETENTION_DAYS)); return Number.isFinite(n) && n >= 1 ? n : 90; };
+  // The stored player IP for a request (never loopback / Docker / private / a trusted proxy), or null.
+  const playerIpOf = (req) => { try { return tracker.eligible(clientIpOf(req)); } catch { return null; } };
+  // Record a player's address (login, matchmaking / stream sockets, join-hint, vote-start, reports). `ipOrReq` is an address or a request.
+  const recordIp = (accountId, ipOrReq) => { try { return tracker.record(accountId, typeof ipOrReq === 'string' ? ipOrReq : clientIpOf(ipOrReq)); } catch { return false; } };
+  const ipBanActive = (b) => !!b && !b.lifted && (b.expiresAt === null || b.expiresAt === undefined || Date.parse(b.expiresAt) > now());
+  // The active IP ban covering an address (or a request's client address), or null. Private addresses are never banned.
+  function ipBanned(ipOrReq) {
+    const ip = typeof ipOrReq === 'string' ? ipOrReq : clientIpOf(ipOrReq);
+    const n = iptrack.normalize(ip);
+    if (!n || iptrack.isPrivate(n)) return null;
+    for (const b of store().ipBans) if (ipBanActive(b) && iptrack.banMatches(b, n)) return b;
+    return null;
+  }
+  // Retention: ips last seen more than retentionDays ago go, unless the ip is in a stored report snapshot or an ip ban record.
+  function pruneIps() {
+    try {
+      const keep = new Set();
+      for (const r of store().reports) {
+        const x = r.ips;
+        if (!x) continue;
+        if (x.reporter && x.reporter.last) keep.add(x.reporter.last);
+        if (x.target) { if (x.target.last) keep.add(x.target.last); for (const e of x.target.recent || []) if (e && e.ip) keep.add(e.ip); }
+      }
+      const bans = store().ipBans;
+      const kept = (ip) => keep.has(ip) || bans.some((b) => iptrack.banMatches(b, ip) || b.value === ip);
+      return tracker.prune(retentionDays() * iptrack.DAY_MS, kept);
+    } catch { return 0; }
+  }
+  const ipViewSeen = new Map();   // "admin|target|ip" -> last ip-view audit time (one entry per admin and target per 10 minutes)
+  function auditIpView(admin, target, ip) {
+    const t = now(), key = `${admin.steamId}|${target}|${ip || ''}`;
+    const prev = ipViewSeen.get(key);
+    if (prev !== undefined && t - prev < 10 * 60 * 1000) return;
+    ipViewSeen.set(key, t);
+    if (ipViewSeen.size > 2000) for (const [k, v] of ipViewSeen) if (t - v >= 10 * 60 * 1000) ipViewSeen.delete(k);
+    audit(admin.steamId, admin.name, 'ip-view', target, '', ip);
+    save();
   }
 
   // ---------- bans ----------
@@ -174,6 +226,7 @@ function createModeration(opts = {}) {
     const body = { error: 'forbidden', metadata: { cause: 'app-banned', ban } };
     return { ...body, version: 1, data: body };
   }
+  const banBodyFor = (b) => banBody(b);
   function filterPlayerMap(session) {
     const m = store();
     if (!session || !isObj(session['player-map']) || !Object.keys(m.bans).length) return session;
@@ -221,14 +274,42 @@ function createModeration(opts = {}) {
   }
 
   // ---------- reports ----------
-  const rate = { byReporter: new Map(), byPair: new Map() };
+  // Per-reporter and per-pair hourly limits. The maps are bounded: windows that ran out are dropped by a sweep
+  // (every 256 calls or when a map gets big) and a hard key cap evicts the oldest key.
+  const rate = { byReporter: new Map(), byPair: new Map(), calls: 0 };
+  const RATE_MAX_KEYS = 20000;
+  function sweepRate(t) {
+    for (const map of [rate.byReporter, rate.byPair]) {
+      for (const [k, a] of map) { const live = a.filter((x) => t - x < HOUR); if (live.length) map.set(k, live); else map.delete(k); }
+      while (map.size > RATE_MAX_KEYS) map.delete(map.keys().next().value);
+    }
+  }
   function rateOk(reporter, target) {
     const t = now();
+    if (++rate.calls % 256 === 0 || rate.byReporter.size > RATE_MAX_KEYS || rate.byPair.size > RATE_MAX_KEYS) sweepRate(t);
     const prune = (map, key) => { const a = (map.get(key) || []).filter((x) => t - x < HOUR); map.set(key, a); return a; };
     const a = prune(rate.byReporter, reporter), b = prune(rate.byPair, `${reporter}>${target}`);
     if (a.length >= 10 || b.length >= 3) return false;
     a.push(t); b.push(t);
     return true;
+  }
+  // Report queue (MAX_REPORTS, OGSOS_MAX_REPORTS): open and investigating reports are never evicted to make room.
+  const maxReports = () => { const n = Math.floor(Number(env.OGSOS_MAX_REPORTS)); return Number.isFinite(n) && n >= 1 ? n : MAX_REPORTS; };
+  const MAX_OPEN_PER_REPORTER = 20, MAX_OPEN_PER_IP = 30;
+  let lastQueueFullAudit = 0;
+  // -> null when there is room (after evicting the oldest resolved/dismissed one if needed), else the refusal reply.
+  function makeRoom(m) {
+    const max = maxReports();
+    while (m.reports.length >= max) {
+      const i = m.reports.findIndex((r) => r.status === 'resolved' || r.status === 'dismissed');
+      if (i < 0) {
+        const t = now();
+        if (t - lastQueueFullAudit >= HOUR) { lastQueueFullAudit = t; audit('', '', 'report-queue-full', '', `${m.reports.length} reports, none resolved or dismissed`); save(); }
+        return { status: 429, body: { error: 'report-queue-full' } };
+      }
+      m.reports.splice(i, 1);
+    }
+    return null;
   }
   const summaryOf = (id) => {
     try { const s = progression && progression.playerSummary(id); return s && Object.keys(s).length ? s : null; } catch { return null; }
@@ -245,13 +326,29 @@ function createModeration(opts = {}) {
     }
     return { sid: seat ? seat.h.id : null, snapshot: { reporter: summaryOf(reporterId), target: summaryOf(targetId), session, lastMatch } };
   }
-  function addReport(source, reporterId, f, rawBody) {
+  // Owner-only address snapshot stored with a report: the target's last / recent (30 days, max 10) addresses, the reporter's last.
+  function ipSnapshot(targetId, reporterIp) {
+    const h = tracker.history(targetId);
+    return { target: { last: h && h.last ? h.last.ip : null, recent: tracker.recent(targetId, 30, 10) }, reporter: { last: reporterIp || null } };
+  }
+  function addReport(source, reporterId, f, rawBody, req) {
     const target = f.target;
     if (!target) return { status: 400, body: { error: 'no-target' } };
     if (!ID_RE.test(target)) return { status: 400, body: { error: 'bad-target' } };
     if (target === reporterId) return { status: 400, body: { error: 'self-report' } };
+    const reporterIp = req ? playerIpOf(req) : null;
+    if (req && ipBanned(req)) return { status: 403, body: banBodyFor(ipBanned(req)) };
     if (!rateOk(reporterId, target)) return { status: 429, body: { error: 'rate-limited' } };
     const m = store();
+    let openBy = 0, openByIp = 0;
+    for (const r of m.reports) {
+      if (r.status !== 'open') continue;
+      if (r.reporter.id === reporterId) openBy++;
+      if (reporterIp && r.ips && r.ips.reporter && r.ips.reporter.last === reporterIp) openByIp++;
+    }
+    if (openBy >= MAX_OPEN_PER_REPORTER || (reporterIp && openByIp >= MAX_OPEN_PER_IP)) return { status: 429, body: { error: 'too-many-open-reports' } };
+    const full = makeRoom(m);
+    if (full) return full;
     const sessionIn = f.sessionId && SESSION_ID_RE.test(f.sessionId) ? f.sessionId : null;
     const snap = snapshotFor(reporterId, target, sessionIn);
     let raw = null;
@@ -267,13 +364,10 @@ function createModeration(opts = {}) {
       sessionId: sessionIn || snap.sid,
       matchId: f.matchId && ID_RE.test(f.matchId) ? f.matchId : null,
       evidenceUrl: /^https?:\/\/\S+$/i.test(f.evidenceUrl || '') ? String(f.evidenceUrl).slice(0, 500) : null,
-      snapshot: snap.snapshot, resolvedBy: null, resolvedAt: null, notes: [], assignee: null, raw,
+      snapshot: snap.snapshot, ips: ipSnapshot(target, reporterIp), resolvedBy: null, resolvedAt: null, notes: [], assignee: null, raw,
     };
     m.reports.push(report);
-    while (m.reports.length > MAX_REPORTS) {
-      const i = m.reports.findIndex((r) => r.status === 'resolved' || r.status === 'dismissed');
-      m.reports.splice(i >= 0 ? i : 0, 1);
-    }
+    if (reporterIp) recordIp(reporterId, reporterIp);
     save();
     try { log('admin.jsonl', { event: 'report', id: report.id, source, reporter: reporterId, target, reason: report.reason }); } catch { /* ignore */ }
     return { status: 200, body: { version: 1, result: true, data: { result: true, id: report.id } }, report };
@@ -294,7 +388,7 @@ function createModeration(opts = {}) {
       sessionId: firstOf(b, ['session-id', 'sessionId', 'session', 'match-id']),
       evidenceUrl: firstOf(b, ['evidence', 'evidenceUrl', 'url', 'clip']),
       gameGuid, evidenceVideoFormat: firstOf(b, ['evidence-video-format']),
-    }, b);
+    }, b, req);
     if (out.status === 200 && out.report) {
       const rp = out.report;
       // The reply the client parses (its typo key "game-session-d" is real; "game-session-id" is added too). The
@@ -324,7 +418,7 @@ function createModeration(opts = {}) {
     return addReport('api', reporter, {
       target: firstOf(b, ['target']), reason: firstOf(b, ['reason']), text: firstOf(b, ['text']),
       sessionId: firstOf(b, ['sessionId']), matchId: firstOf(b, ['matchId']), evidenceUrl: firstOf(b, ['evidenceUrl']),
-    }, b);
+    }, b, req);
   }
   function onMatchEnd(sessionId, matchId) {
     if (!sessionId || !matchId) return 0;
@@ -496,7 +590,8 @@ function createModeration(opts = {}) {
   const matchEntry = (mt, id) => (Array.isArray(mt.players) ? mt.players.find((p) => p.playerId === id) : null);
   const listReportsAgainst = (id) => store().reports.filter((r) => r.target.id === id);
   const listReportsBy = (id) => store().reports.filter((r) => r.reporter.id === id);
-  const stripRaw = ({ raw, ...rest }) => rest;
+  const stripRaw = ({ raw, ips, ...rest }) => rest;   // lists never carry the raw body or the owner-only address snapshot
+  const nameRef = (id) => ({ id, name: nameOf(id) });
   const activeBanFor = (id) => isBanned(id);
   const forbidOwnerOnly = (res) => json(res, 403, { error: 'owner-only' });
 
@@ -679,7 +774,12 @@ function createModeration(opts = {}) {
     if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;   // spreadsheet formula injection
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const toCsv = (rows) => ['at,by,byName,action,target,detail', ...rows.map((e) => [e.at, e.by, e.byName, e.action, e.target, e.detail].map(csvCell).join(','))].join('\r\n') + '\r\n';
+  // The ip column exists for owners only (ip-ban / ip-unban / ip-view entries); mods get the old six columns.
+  const toCsv = (rows, withIp) => [`at,by,byName,action,target,detail${withIp ? ',ip' : ''}`, ...rows.map((e) => [e.at, e.by, e.byName, e.action, e.target, e.detail].concat(withIp ? [e.ip || ''] : []).map(csvCell).join(','))].join('\r\n') + '\r\n';
+
+  // Other accounts seen on any of this player's addresses in the last 90 days: [{ ip, accounts: [{ id, name }] }] (max 20 addresses).
+  const sharedFor = (id) => tracker.sharedWith(id, { sinceMs: 90 * iptrack.DAY_MS, maxIps: 20 })
+    .map((x) => ({ ip: x.ip, accounts: x.accounts.map((a) => nameRef(a.id)) }));
 
   function apiGet(admin, sub, url, res) {
     const m = store();
@@ -763,7 +863,7 @@ function createModeration(opts = {}) {
       }
       const seat = seatOf(id);
       const history = m.audit.filter((e) => (e.action === 'ban' || e.action === 'unban') && e.target === id).reverse();
-      return json(res, 200, {
+      const out = {
         account: { id, name: String(a['display-name'] || a.alias || id), created: a.created || null, lastAccess: a['last-access'] || null },
         stats: summaryOf(id) || {}, matches: mine, profile: profileOf(id),
         notes: [...(m.notes[id] || [])].reverse(), warnings: [...(m.warnings[id] || [])].reverse(),
@@ -771,7 +871,14 @@ function createModeration(opts = {}) {
         reportsAgainst: listReportsAgainst(id).reverse().map(stripRaw), reportsBy: listReportsBy(id).reverse().map(stripRaw),
         ban: activeBanFor(id), banHistory: history,
         current: seat ? { game: seat.game, sessionId: seat.h.id, state: seat.h.state } : null,
-      });
+      };
+      if (admin.role === 'owner') {   // owner only: mods get no ip fields at all
+        const h = tracker.history(id);
+        out.ips = { first: h ? h.first : null, last: h ? h.last : null, list: tracker.list(id) };
+        out.sharedIp = sharedFor(id);
+        auditIpView(admin, id);
+      }
+      return json(res, 200, out);
     }
 
     if (sub === 'reports') {
@@ -796,13 +903,29 @@ function createModeration(opts = {}) {
       const at = Date.parse(rp.at);
       const candidates = rp.sessionId ? matches().filter((mt) => mt.sessionId === rp.sessionId && Date.parse(mt.endedAt) >= at - 60000 && Date.parse(mt.endedAt) <= at + 4 * HOUR).slice(0, 5) : [];
       const lobby = rp.sessionId ? findLobby(rp.sessionId) : null;
-      return json(res, 200, {
-        report: rp, match: rp.matchId ? (matches().find((x) => x.id === rp.matchId) || null) : null, candidates,
+      const owner = admin.role === 'owner';
+      const detail = {
+        report: owner ? rp : (({ ips, ...rest }) => rest)(rp), match: rp.matchId ? (matches().find((x) => x.id === rp.matchId) || null) : null, candidates,
         target: summaryOf(rp.target.id), reporter: summaryOf(rp.reporter.id),
         priorReportsAgainstTarget: m.reports.filter((x) => x.target.id === rp.target.id && x.id !== rp.id).length,
         ban: activeBanFor(rp.target.id),
         links: { match: rp.matchId || null, target: rp.target.id, reporter: rp.reporter.id, spectate: { sessionId: rp.sessionId || null, live: !!lobby && lobby.h.state === 'started' } },
-      });
+      };
+      if (owner) { detail.sharedIp = sharedFor(rp.target.id); auditIpView(admin, rp.id); }
+      return json(res, 200, detail);
+    }
+    if ((r = sub.match(/^ip\/(.+)$/))) {   // owner only: who was seen on this address, and is it banned
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const ip = iptrack.normalize(decodeURIComponent(r[1]));
+      if (!ip) return json(res, 400, { error: 'bad-ip' });
+      const ban = ipBanned(ip);
+      auditIpView(admin, 'ip', ip);
+      return json(res, 200, { ip, accounts: tracker.accountsOn(ip).map((a) => ({ id: a.id, name: nameOf(a.id), first: a.first, last: a.last, count: a.count })), banned: !!ban, ban: ban || null });
+    }
+    if (sub === 'ip-bans') {
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const all = url.searchParams.get('all') === '1';
+      return json(res, 200, { bans: m.ipBans.filter((b) => all || ipBanActive(b)).slice().reverse() });
     }
 
     if (sub === 'matches') {
@@ -837,10 +960,10 @@ function createModeration(opts = {}) {
         hostBlocks: m.hostBlocks.filter((h) => all || !h.lifted),
       });
     }
-    if (sub === 'audit') return json(res, 200, auditFiltered(url, 500, 5000));
+    if (sub === 'audit') return json(res, 200, auditFiltered(url, 500, 5000).map((e) => auditFor(admin, e)));
     if (sub === 'audit.csv') {
       const d = new Date(now()).toISOString().slice(0, 10).replace(/-/g, '');
-      return respond(res, 200, toCsv(auditFiltered(url, 20000, 20000)), 'text/csv; charset=utf-8', { 'Content-Disposition': `attachment; filename="ogsos-audit-${d}.csv"` });
+      return respond(res, 200, toCsv(auditFiltered(url, 20000, 20000), admin.role === 'owner'), 'text/csv; charset=utf-8', { 'Content-Disposition': `attachment; filename="ogsos-audit-${d}.csv"` });
     }
 
     if (sub === 'kv') {
@@ -908,7 +1031,7 @@ function createModeration(opts = {}) {
     }
     if (matchId) rp.matchId = matchId;
     save();
-    return json(res, 200, { ok: true, report: rp });
+    return json(res, 200, { ok: true, report: admin.role === 'owner' ? rp : (({ ips, ...rest }) => rest)(rp) });
   }
 
   // Player adjust / reset-stats. The game host holds a player's blob during a match and writes it back at the end, so
@@ -1110,6 +1233,32 @@ function createModeration(opts = {}) {
       save();
       return json(res, 200, { ok: true, ban });
     }
+    if (sub === 'ip-bans') {   // owner only
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const t = iptrack.parseBanTarget(typeof b.ip === 'string' ? b.ip : '', isTrustedProxy, trustedProxies);
+      if (t.error) return json(res, 400, { error: t.error });
+      if (m.ipBans.some((x) => ipBanActive(x) && x.kind === t.kind && x.value === t.value)) return json(res, 409, { error: 'already-banned' });
+      const hours = b.hours === null || b.hours === undefined || b.hours === '' ? 0 : Number(b.hours);
+      if (!Number.isFinite(hours) || hours < 0 || hours > 87600) return json(res, 400, { error: 'bad-hours' });
+      m.seq += 1;
+      const ban = {
+        id: `i${m.seq}`, kind: t.kind, value: t.value, reason: clip(b.reason, 200), code: BAN_CODES.includes(b.code) ? b.code : 'other',
+        by: admin.steamId, at: nowIso(), expiresAt: hours > 0 ? new Date(now() + hours * HOUR).toISOString() : null, lifted: false,
+      };
+      m.ipBans.push(ban);
+      audit(admin.steamId, admin.name, 'ip-ban', ban.id, `${hours > 0 ? `${hours}h` : 'permanent'}: ${ban.reason}`, ban.value);
+      save();
+      return json(res, 200, { ok: true, ipBan: ban });
+    }
+    if ((r = sub.match(/^ip-bans\/([^/]+)\/lift$/))) {
+      if (admin.role !== 'owner') return forbidOwnerOnly(res);
+      const ban = m.ipBans.find((x) => x.id === decodeURIComponent(r[1]) && ipBanActive(x));
+      if (!ban) return json(res, 404, { error: 'no-active-ban' });
+      ban.lifted = { by: admin.steamId, at: nowIso() };
+      audit(admin.steamId, admin.name, 'ip-unban', ban.id, '', ban.value);
+      save();
+      return json(res, 200, { ok: true, ipBan: ban });
+    }
     if (sub === 'host-blocks') {
       const value = clip(b.value, 64);
       const kind = blockKind(value);
@@ -1212,7 +1361,9 @@ function createModeration(opts = {}) {
       else if (p === '/admin/auth' && req.method === 'GET') {
         handleAuth(req, url, res).catch(() => { if (!res.headersSent) page(res, 500, 'Error', 'Sign-in failed.'); });
       } else if (p === '/admin/dev-login' && req.method === 'GET') handleDevLogin(req, url, res);
-      else if (p === '/admin/logout' && (req.method === 'GET' || req.method === 'POST')) {
+      else if (p === '/admin/logout' && req.method !== 'POST') json(res, 405, { error: 'method-not-allowed' }, { Allow: 'POST' });   // a link or image tag must not sign anyone out
+      else if (p === '/admin/logout' && req.headers['x-ogsos-admin'] !== '1') json(res, 403, { error: 'csrf' });
+      else if (p === '/admin/logout') {
         const a = adminFrom(req);
         if (a) { audit(a.steamId, a.name, 'logout', a.steamId, ''); save(); }
         redirect(res, '/admin/', { 'Set-Cookie': setCookieHeader(req, '', 0) });
@@ -1227,7 +1378,11 @@ function createModeration(opts = {}) {
     return true;
   }
 
-  return { isBanned, banBody, filterPlayerMap, handleReport, handleReportApi, handleEvidence, handleWatchApi, onMatchEnd, handleHttp, isHostBlocked, kickEverywhere, isAdmin, roleOf, kvServe, reapplyLobbyOptions };
+  pruneIps();   // once at startup, then daily
+  const pruneTimer = setInterval(pruneIps, 24 * 3600 * 1000);
+  if (pruneTimer.unref) pruneTimer.unref();
+
+  return { recordIp, ipBanned, pruneIps, isBanned, banBody, filterPlayerMap, handleReport, handleReportApi, handleEvidence, handleWatchApi, onMatchEnd, handleHttp, isHostBlocked, kickEverywhere, isAdmin, roleOf, kvServe, reapplyLobbyOptions };
 }
 
 module.exports = { createModeration };

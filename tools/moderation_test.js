@@ -301,7 +301,9 @@ test('auth: 401 without cookie, CSRF header, tampering, expiry, admin removal, d
   assert((await call(e3.mod, 'GET', `/admin/dev-login?steamid=${ADMIN}`)).status === 404, 'dev-login disabled');
   const e4 = makeEnv({ env: { OGSOS_ADMIN_ORIGIN: 'https://sos.example.com' } });
   assert(/; Secure/.test((await call(e4.mod, 'GET', `/admin/dev-login?steamid=${ADMIN}`)).headers['Set-Cookie']), 'Secure with https origin');
-  const lo = await call(e.mod, 'GET', '/admin/logout', { headers: { cookie: ck } });
+  assert((await call(e.mod, 'GET', '/admin/logout', { headers: { cookie: ck } })).status === 405, 'GET logout refused');
+  assert((await call(e.mod, 'POST', '/admin/logout', { headers: { cookie: ck } })).status === 403, 'POST logout needs the CSRF header');
+  const lo = await call(e.mod, 'POST', '/admin/logout', { headers: { cookie: ck, 'x-ogsos-admin': '1' } });
   assert(lo.status === 302 && /Max-Age=0/.test(lo.headers['Set-Cookie']), 'logout clears');
 });
 
@@ -981,7 +983,7 @@ test('audit: filters and CSV export with escaping and formula-injection protecti
   eq(r.headers['Content-Type'], 'text/csv; charset=utf-8');
   assert(/^attachment; filename="ogsos-audit-20260601\.csv"$/.test(r.headers['Content-Disposition']), r.headers['Content-Disposition']);
   const lines = r.text.split('\r\n');
-  eq(lines[0], 'at,by,byName,action,target,detail');
+  eq(lines[0], 'at,by,byName,action,target,detail,ip');   // owners get the ip column
   assert(r.text.includes(`,${P1},"'=HYPERLINK(""http://x"",""click""),a"`), 'quotes doubled, formula neutralised: ' + r.text);
   assert(r.text.includes(`,${P2},'+1 plus`), '+ prefixed');
   assert(r.text.includes(`"line1 line2 ""q"""`), 'newline flattened by the audit, quotes doubled: ' + r.text);

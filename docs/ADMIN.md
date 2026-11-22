@@ -297,13 +297,23 @@ additions:
   Because of this, the client mod's watch route is off by default (`OGSOS_ADMIN_GAME_WATCH`), and the `dev` role an
   admin gets at game login can be claimed by a spoofer too. That role only unlocks client-side UI (Director screen);
   joining as a spectator still needs a watch link from the panel or a seat in the lobby.
-- Bans are by Steam id only, no hardware or IP bans for players.
+- Bans are by Steam id, plus owner-set IP bans (an IPv4, IPv6 or IPv4 CIDR /16-/32; docs/SECURITY.md section 9). No hardware bans.
 - Kick removes the seat; the game host does the disconnect on its next poll (up to ~5 s).
 - Spectator invisibility and the in-game `open` command are untested (no second game client in these tests).
 - Warnings are an internal record only (section 3c).
 - Player adjust needs the player out of every lobby; a player who is only queued is not seated and can be edited.
 - Reports, bans, notes and the audit log live in the backend's `db.json` (`db.moderation`), capped at 5000 reports and
   20000 audit entries.
+
+### IP addresses, IP bans and logout
+
+- Owners only: player and report pages show the addresses seen, accounts sharing an address, and an IP ban button; the Bans
+  page has an IP bans table. API: `GET /admin/api/ip/<ip>`, `GET/POST /admin/api/ip-bans`, `POST /admin/api/ip-bans/<id>/lift`.
+  Moderators never receive any address (profile, report, audit, CSV). Views are audited (`ip-view`), bans as `ip-ban` and
+  `ip-unban`. Retention `OGSOS_IP_RETENTION_DAYS` (90). Details: docs/SECURITY.md section 9.
+- Sign out is `POST /admin/logout` with the `X-OGSOS-Admin: 1` header (the panel's Sign out button does this); GET is `405`.
+- A full report queue (`OGSOS_MAX_REPORTS`, default 5000) evicts the oldest resolved or dismissed report; if only open ones
+  remain, new reports get `429 report-queue-full`.
 
 ## 8. Tests
 

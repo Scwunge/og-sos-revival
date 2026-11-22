@@ -1,8 +1,8 @@
 # Backend security notes
 
 What the backend (`server/`) enforces on its own, how to tune it, and what the deployment has to provide.
-Tests: `node tools/hardening_test.js` (limits, refusals, persistence) and `node tools/crash_test.js` (hostile input must
-never stop the process).
+Tests: `node tools/hardening_test.js` (limits, refusals, persistence, host write scope, report queue, IP tracking and IP
+bans, retention, log redaction) and `node tools/crash_test.js` (hostile input must never stop the process).
 
 ## 1. Request limits
 
@@ -67,6 +67,9 @@ register on the direct port, not through the proxy.
 - JSON bodies, responses and WebSocket texts have the keys `session-auth-token`, `sessionToken`, `token`, `access-token`,
   `key`, `password`, `secret`, `ticket` masked (case-insensitive); `?token=`-style query values and JWT-shaped strings are
   masked in any text;
+- IP addresses never reach the log files: IPv4 and IPv6 literals in any logged string, the `ip` field, the `Host` header
+  and matchmaker text become `ip-redacted`, and proxy headers that only carry an address (`x-forwarded-for`, `x-real-ip`,
+  `forwarded`, `cf-connecting-ip`, ...) are replaced whole. Player addresses live only in `db.json` (section 9);
 - every logged string is cut to 2048 characters;
 - a file larger than 50 MB (`OGSOS_LOG_MAX_BYTES`) is renamed to `<file>.1` (replacing the old one) and a new file starts
   (size checked about every 1000 writes or 10 s);
@@ -119,3 +122,124 @@ the community keys if those logs ever left the machine.
   (`https://<backend-host>/admin/`), not over the plain port.
 - Set `OGSOS_ADMIN_ORIGIN` in production, keep `OGSOS_ADMIN_DEV_LOGIN` and `OGSOS_ADMIN_GAME_WATCH` off, and keep
   `OGSOS_LEADERBOARD_OPEN` unset.
+
+## 8. Hardening status
+
+Fixed in the first pass: request/body caps and timeouts, per-route rate limits, WebSocket limits, `clientIp` with trusted
+proxies, log redaction, SteamID64 shape check, HS256 pinning and constant-time compare, atomic `db.json` with a backup,
+prototype-free id maps, owner-only blob writes for non-Classic apps, stream/session ownership rules, OpenID assertion
+checks, community host name rules.
+
+Fixed in the second pass:
+
+- **Host write scope.** A host session token can write a Classic blob or leaderboard row only for a player who is seated in
+  that host's session now, or was seated in it within the last 30 minutes (so end-of-match saves still land), or is one of
+  the host's own ids. Anything else is `403 {"error":"not-seated"}`; a leaderboard post naming any non-seated member is
+  refused whole. Code: `wasSeated` in `server/matchmaking.js`, `inScope` in `server/progression.js`.
+  `OGSOS_HOST_WRITE_ANY=1` turns the check off (tests only; never set it in production).
+- **Report queue.** Reports are capped at `OGSOS_MAX_REPORTS` (default 5000). When full, the oldest resolved or dismissed
+  report is evicted; open and investigating reports are never dropped, and if none can be evicted the new one gets
+  `429 {"error":"report-queue-full"}` (audited at most once an hour). Per reporter: 20 open reports per account and 30 per
+  client address (`429 too-many-open-reports`). The per-address rate maps are bounded.
+- **Admin logout** is `POST /admin/logout` with the `X-OGSOS-Admin: 1` header only (GET is `405`, no header is `403`), so a
+  link or image cannot sign an admin out.
+- **Community hosts.** The UDP probe needs a 32-byte reply from the registered ip:port (a bare datagram from anyone no longer
+  lists a host); at most 3 registered hosts per source /24 (`too-many-for-network`); at most 20 hosts that were never listed
+  (`503 too-many-pending`); a host that never gets listed is removed after 120 s (`pending-expired`), renewals do not extend that.
+- **Player IP tracking and IP bans**, owner only (section 9).
+
+Environment variables added in the second pass:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OGSOS_HOST_WRITE_ANY` | off | 1 disables the host write scope (tests only) |
+| `OGSOS_MAX_REPORTS` | 5000 | report queue size |
+| `OGSOS_IP_RETENTION_DAYS` | 90 | player IP retention (section 9) |
+| `OGSOS_COMMUNITY_MAX_PER_NET` | 3 | registered community hosts per source /24 |
+| `OGSOS_COMMUNITY_MAX_PENDING` | 20 | registered hosts waiting to be listed |
+| `OGSOS_COMMUNITY_PENDING_SECONDS` | 120 | how long an unlisted host may stay registered |
+| `OGSOS_COMMUNITY_PROBE_REPLY_BYTES` | 32 | exact size of the probe reply (0 = any datagram) |
+
+Still open (by decision or not done):
+
+- **Login does not verify the Steam session ticket.** Anyone who knows a Steam id can get a token for it. This is a known
+  design item, left as it is on purpose. Everything below that says "the account id from the JWT" is only as strong as that.
+  Account bans and IP bans are the mitigation.
+- Moderators still see community host addresses on the community page (existing behaviour, host addresses are public in the
+  server list anyway); player addresses are owner only.
+- No hardware or device bans.
+
+## 9. Player IP tracking and IP bans (owner only)
+
+- **What is stored.** Per account in `db.json` (`ipHistory`): the first and last address, and up to 50 addresses with first
+  seen, last seen and a count. Recorded on login, on `/ws` and `/ws/stream` sockets that carry an account, on join-hint,
+  vote-start and when a report is filed. The address is `clientIp(req)` (section 3). Loopback, private, Docker, CGNAT and
+  the trusted proxies' own addresses are never recorded. Code: `server/iptrack.js`.
+- **Who sees it.** Only owners (`OGSOS_ADMINS`). For moderators the admin API leaves out every IP field: player profile
+  (`ips`, `sharedIp`), report detail and report edit (`ips`), the audit `ip` field and the audit CSV `ip` column. Owner views of a
+  player's or report's addresses and the address lookup write an `ip-view` audit entry (once per admin and target per
+  10 minutes).
+- **Reports** store a snapshot at filing time: the target's last address and up to 10 from the last 30 days, and the
+  reporter's address.
+- **Shared addresses.** Owner profile and report pages list other accounts seen on the same address in the last 90 days;
+  `GET /admin/api/ip/<ip>` lists the accounts seen on one address.
+- **Retention.** `OGSOS_IP_RETENTION_DAYS` (default 90): at startup and then daily, an address last seen longer ago is
+  deleted, and an account left with none loses its entry. Addresses in stored report snapshots and in IP ban records are
+  kept.
+- **IP bans.** Owner only: `GET/POST /admin/api/ip-bans`, `POST /admin/api/ip-bans/<id>/lift` (panel: Bans page). A target is
+  an IPv4, an IPv6 or an IPv4 CIDR from /16 to /32, with an optional duration. Banning loopback, private or CGNAT ranges, the
+  trusted proxies, a range that covers one, or a malformed target is refused (`400`), so an owner cannot lock out the proxy or
+  the whole network by mistake. An IP ban refuses login (the same `403` body as an account ban), `/ws` and `/ws/stream`
+  upgrades (`403`), join-hint and report filing from that address. Plain reads and the host routes are not affected. It can
+  catch other players behind the same router, which is why bans take an expiry.
+- **Logs** never contain addresses (section 4). The audit log (`db.moderation`) keeps the address of an ip-ban or ip-view
+  in a separate `ip` field that is owner only and is not written to `logs/admin.jsonl`.
+
+## 10. Building your own auth
+
+This backend's login is a stand-in: it trusts the Steam id the client sends (section 5). If you replace it with real
+verification (Steam, your own accounts), these are the places that matter. Nothing here is secret; line numbers drift, search
+for the function names.
+
+**Where login happens.** `server/server.js`, the handler for `POST /api/access-token` and `/api/access-token/steam` (search
+`'/api/access-token'`; it is the route that calls `makeJwt`). In order: parse the JSON body, check `steam-id` against
+`STEAM_ID_RE` (`server/safe.js`), refuse banned accounts and banned addresses (`moderation.isBanned`, `moderation.ipBanned`),
+`moderation.recordIp`, create or touch `db.accounts[id]`, decide roles (`classicRoles` for Classic), `makeJwt`, reply. The
+Steam ticket (`session-auth-token`) is read by nobody; **this is where to verify it** (for example with Steam's
+`ISteamUserAuth/AuthenticateUserTicket`), before the ban check or right after it, and answer `401` on failure.
+
+**What the Classic client sends and expects.** Request: `POST /api/access-token/steam` with a JSON body
+`{"steam-app-id":"802240","steam-id":"<SteamID64>","session-auth-token":"<hex ticket>","roles":[...],"app-id":"sostest"}`;
+every later HTTP request carries `Authorization: Token <jwt>` and an `app-id` header. Reply (200): the account view
+(`id`, `account-id`, `alias`, `display-name`) plus `user-id`, `access-token`, `token` (the JWT, the client refuses anything
+that is not `xxx.yyy.zzz`) and, for Classic, `roles`; the same object is repeated under `data` with `version: 1`. A banned
+account gets `403 {"error":"forbidden","metadata":{"cause":"app-banned",...}}` (`moderation.banBody`), the shape the client's
+login error handler parses. A wrong or missing token elsewhere is `401`. The client reads these JWT claims: `id`,
+`account-id`, `user-id`, `sub` (all the account id), `steam-id`, `roles`, `app-id`, `iat`, `exp`. See docs/CLASSIC.md.
+
+**Where JWTs are verified.** One function: `readJwt` in `server/server.js` (HS256 with `secret.key`, header `alg` pinned,
+constant-time signature compare, numeric `exp` required). Everything goes through it:
+`jwtAccount(tok)` for HTTP routes (`progression`, `moderation` get it as an option), `accountFromAuth(req)` for `/api/account`,
+and `wsAccount(req, token)` for WebSockets (`/ws` header token, `/ws/stream` header or `?token=`). Tokens are minted only by
+`makeJwt`. If your auth issues tokens, keep `readJwt` as the single verifier and keep `exp` mandatory.
+
+**Host session JWT (a second, separate token).** Game hosts authenticate with `Authorization: Token <SESSION_TOKEN>`, a
+per-lobby secret from `OGSOS_CLASSIC_HOSTS`/`OGSOS_HOSTS` or issued to a community host at registration; `isHostToken` in
+`server/server.js` compares it in constant time. Players get a per-session access token for the host: it is minted by
+`makeSessionJwt` in `server/matchmaking.js` (HS512, keyed with the lobby's `sessionToken`, `sub` = session id,
+`roles: ["user+session"]`, 24 h) and verified by `readSessionJwt` (same file; used by `vote-start`). The game host verifies it
+itself with the same key. A player JWT is never valid as a host token or the other way round.
+
+**Where bans hook in.** Account bans: `moderation.isBanned(id)` (`server/admin.js`), checked at login, at the `/ws` and
+`/ws/stream` upgrade (`handleUpgrade`), in `filterPlayerMap` (banned ids are dropped from a host's player map) and when
+reports and matchmaking act. IP bans: `moderation.ipBanned(ipOrReq)` at login, the WebSocket upgrade, join-hint and
+`addReport`. If you add a new way in (another login route, another socket), call both.
+
+**Routes that trust the account id from the JWT** (so they are only as good as login):
+`GET/POST /api/account/<id>/app/<app>` for non-Classic apps (writer must equal `<id>`) and Classic blobs for the owner
+(`progression.js`, `allowOwnerWrite`), `GET /api/account` (no id: the caller), `/api/search/account`, reports
+(`/api/reports`, `/api/account/<id>/report`, `.../app-meta/<app>/report`, `/api/reports/<id>/evidence`: the reporter),
+`POST /api/servers/<id>/join-hint`, `POST /api/session/<id>/vote-start` (the seat owner), the WebSocket identity for
+matchmaking, `session`, `feedback` and votes (`/ws`, `/ws/stream`), and `handleWatchApi` (admin watch link, off by default
+for this reason). The admin panel does not use these tokens: it has its own Steam OpenID login and signed cookie
+(`/admin/login`, `/admin/auth`, `server/admin.js`).

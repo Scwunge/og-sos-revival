@@ -33,7 +33,7 @@ Success (200): `{ result, sessionId, sessionToken, verified, listed:false, heart
 
 Errors: `503 disabled`, `429 rate-limited`, `400 bad-body | address-not-public | host-mismatch | bad-port | bad-name | bad-max-players | bad-host-ids`,
 `403 banned | key-required | ip-mismatch`, `401 unauthorized` (wrong token on a known id), `409 already-registered | id-in-use`,
-`429 too-many-for-ip`, `503 registry-full`.
+`429 too-many-for-ip | too-many-for-network`, `503 registry-full | too-many-pending`.
 
 Renewal: register again with the stored `sessionId` and `sessionToken` (every 5 minutes or so, and on every start; send the
 `key` again each time). The same id and token come back. A renewal from a different IP is `403 ip-mismatch`. Registering
@@ -63,10 +63,12 @@ other community hosts. A community host is listed only after the game polled `GE
 
 ### Probe and expiry
 
-Before listing, the backend sends a UDP packet to `host:port` (up to three tries) and expects any datagram back. A failed
+Before listing, the backend sends a UDP packet to `host:port` (up to three tries) and expects a 32-byte datagram back
+from that same address and port (`OGSOS_COMMUNITY_PROBE_REPLY_BYTES`). A failed
 probe keeps the host unlisted and is retried at most once a minute; a listed host is re-probed every 10 minutes. A host is
 removed if the game never polled within `FIRST_POLL_SECONDS` of (re)registration, or once both its last poll and its last
-registration are older than `EXPIRE_SECONDS`. A sweep runs every 15 seconds.
+registration are older than `EXPIRE_SECONDS`. A host that is registered but still not listed after
+`OGSOS_COMMUNITY_PENDING_SECONDS` (120) is removed too, however often it renews. A sweep runs every 15 seconds.
 
 ## Settings (environment)
 
@@ -77,6 +79,10 @@ registration are older than `EXPIRE_SECONDS`. A sweep runs every 15 seconds.
 | `OGSOS_COMMUNITY_REQUIRE_KEY` | 0 | 1 refuses registration without a valid key |
 | `OGSOS_COMMUNITY_BANS` | none | comma-separated IPv4 addresses, IPv4 CIDRs and/or session ids; registered hosts are removed on the next sweep |
 | `OGSOS_COMMUNITY_MAX_PER_IP` | 3 | registered hosts per source IP |
+| `OGSOS_COMMUNITY_MAX_PER_NET` | 3 | registered hosts per source /24 (`429 too-many-for-network`) |
+| `OGSOS_COMMUNITY_MAX_PENDING` | 20 | registered hosts not listed yet (`503 too-many-pending`) |
+| `OGSOS_COMMUNITY_PENDING_SECONDS` | 120 | how long a host may stay registered without being listed |
+| `OGSOS_COMMUNITY_PROBE_REPLY_BYTES` | 32 | exact size of the probe reply, 0 accepts any datagram |
 | `OGSOS_COMMUNITY_MAX_TOTAL` | 50 | registered hosts in total |
 | `OGSOS_COMMUNITY_RATE_PER_IP` | 10 | register calls per IP per 10 minutes (renewals count) |
 | `OGSOS_COMMUNITY_FIRST_POLL_SECONDS` | 600 | remove a host the game never polled within this long |

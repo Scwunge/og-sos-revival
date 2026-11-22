@@ -30,6 +30,12 @@ function createProgression(opts = {}) {
   const canReadToken = opts.canReadToken || (() => false);   // extra tokens allowed to READ blobs (unverified community hosts)
   const leaderboardOpen = opts.leaderboardOpen ?? process.env.OGSOS_LEADERBOARD_OPEN === '1';
   const allowOwnerWrite = !!opts.allowOwnerWrite;
+  // Host write scope: wasSeated(sessionId, playerId, withinMs) says whether that player is, or within 30 minutes was,
+  // seated in the session of the host token. Not set (unit tests): no scope check. OGSOS_HOST_WRITE_ANY=1 is a TEST-ONLY
+  // escape hatch that turns the check off (never set it in production).
+  const wasSeated = typeof opts.wasSeated === 'function' && process.env.OGSOS_HOST_WRITE_ANY !== '1' ? opts.wasSeated : null;
+  const HOST_WRITE_WINDOW_MS = 30 * 60 * 1000;
+  const inScope = (sessionId, playerId) => !wasSeated || !sessionId || wasSeated(sessionId, String(playerId), HOST_WRITE_WINDOW_MS) === true;
   const rankBase = opts.rankBase ?? 1;
   const now = opts.now || Date.now;
 
@@ -64,6 +70,7 @@ function createProgression(opts = {}) {
     }
     if (method !== 'POST') return reply(405, { error: 'method not allowed' });
     if (!isHost && !(allowOwnerWrite && acct && acct === accountId)) return unauthorized;
+    if (isHost && !inScope(hostSession, accountId)) return reply(403, { error: 'not-seated' });
 
     const text = bodyText == null ? '' : String(bodyText);
     if (Buffer.byteLength(text) > MAX_BLOB_BYTES) return reply(413, { error: 'too large' });
@@ -109,7 +116,9 @@ function createProgression(opts = {}) {
 
     if (method === 'POST') {
       if (member != null) return reply(405, { error: 'method not allowed' });
-      if (!isHostToken(token) && !leaderboardOpen) return reply(401, { error: 'unauthorized' });
+      const hostRes = isHostToken(token);
+      if (!hostRes && !leaderboardOpen) return reply(401, { error: 'unauthorized' });
+      const lbSession = hostRes && typeof hostRes === 'string' ? hostRes : null;
       let arr;
       try { arr = JSON.parse(bodyText == null ? '' : String(bodyText)); } catch { return reply(400, { error: 'bad json' }); }
       if (!Array.isArray(arr) || arr.length > MAX_POST_ENTRIES) return reply(400, { error: 'bad body' });
@@ -122,6 +131,7 @@ function createProgression(opts = {}) {
       }
       const members = Object.keys(valid);
       if (!members.length) return reply(400, { error: 'no valid entries' });
+      if (hostRes && !members.every((mm) => inScope(lbSession, mm))) return reply(403, { error: 'not-seated' });
       const b = db.leaderboards[key] || (db.leaderboards[key] = { updated: '', scores: Object.create(null) });
       Object.assign(b.scores, valid);
       b.updated = new Date(now()).toISOString();

@@ -149,6 +149,33 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
   let batchTimer = null;
   const hostEntries = Array.isArray(config.HOSTS) ? config.HOSTS : [];
   const hostedById = new Map(); // sessionId -> { s, entry }; one persistent live session per host
+  // Host write scope (docs/SECURITY.md): per hosted session, playerId -> when that player was last seated there (ms).
+  // A host token may only write the blob / leaderboard rows of a player seated now or within SEATED_KEEP_MS (end-of-match
+  // saves arrive after the seats were cleared). Null-proto maps, pruned when older than SEATED_KEEP_MS.
+  const SEATED_KEEP_MS = 30 * 60 * 1000;
+  const seatedAt = new Map();   // sessionId -> { [playerId]: ms }
+  const touchSeat = (sessionId, pid) => {
+    let m = seatedAt.get(sessionId);
+    if (!m) seatedAt.set(sessionId, (m = Object.create(null)));
+    m[String(pid)] = Date.now();
+  };
+  const touchAllSeated = (s) => {
+    const t = Date.now();
+    let m = seatedAt.get(s.id);
+    if (!m) seatedAt.set(s.id, (m = Object.create(null)));
+    for (const pid of s.players.keys()) m[String(pid)] = t;
+    for (const k of Object.keys(m)) if (t - m[k] > SEATED_KEEP_MS) delete m[k];
+  };
+  function wasSeated(sessionId, playerId, withinMs = SEATED_KEEP_MS) {
+    const h = hostedById.get(String(sessionId));
+    const pid = String(playerId);
+    if (!h || !pid) return false;
+    if (h.s.players.has(pid)) return true;
+    if (Array.isArray(h.entry.hostIds) && h.entry.hostIds.includes(pid) && pid !== '0') return true;   // the host's own ids are always in its player-map
+    const m = seatedAt.get(String(sessionId));
+    const at = m ? m[pid] : undefined;
+    return at !== undefined && Date.now() - at <= Math.min(withinMs, SEATED_KEEP_MS);
+  }
 
   const numCfg = (k) => (Number.isFinite(Number(config[k])) ? Number(config[k]) : DEFAULTS[k]);
   const startMin = Math.min(Math.max(1, Math.floor(numCfg('START_MIN_PLAYERS'))), Math.max(1, config.MAX_PLAYERS));
@@ -344,6 +371,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     if (!m) return false;
     const wasOnline = hostOnline(id);
     m.lastPoll = m.lastPollAny = Date.now();
+    touchAllSeated(hostedById.get(String(id)).s);   // the poll returns the player-map: everyone seated is still seated
     if (!wasOnline) {
       // Offline -> online: finish a countdown that was held while the host was away, then seat waiting players.
       const s = hostedById.get(String(id)).s;
@@ -435,7 +463,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     s.players.clear(); s.groups = {}; s.votes.clear();
     s.started = false; s.state = 'ended'; s.endedAt = Date.now();
     for (const [pid, hint] of joinHints) if (hint.id === s.id) joinHints.delete(pid);
-    hostedById.delete(s.id); hostedMeta.delete(s.id); sessions.delete(s.id);
+    hostedById.delete(s.id); hostedMeta.delete(s.id); sessions.delete(s.id); seatedAt.delete(s.id);
     const msg = `mm community host ${s.id} removed (${why}, ${ids.length} player(s) released)`;
     console.log(msg); log(msg);
     return ids.length;
@@ -448,6 +476,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
       if (o && o !== c) o.sendMsg('player-join', { id: s.id, 'player-id': c.id, uname: uname(c.id) });
     }
     s.players.set(c.id, { uname: uname(c.id), graceTimer: null });
+    if (s.hosted) touchSeat(s.id, c.id);
     c.sessionId = s.id;
     if (groupId) (s.groups[groupId] ??= []).push(c.id);
   }
@@ -457,6 +486,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     const p = s.players.get(pid);
     if (!p) return false;
     if (p.graceTimer) clearTimeout(p.graceTimer);
+    if (s.hosted) touchSeat(s.id, pid);
     s.players.delete(pid);
     for (const [gid, list] of Object.entries(s.groups)) {
       s.groups[gid] = list.filter((x) => x !== pid);
@@ -531,6 +561,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
 
   function startSession(s, why) {
     if (s.state === 'ended') return 0;
+    touchAllSeated(s);
     cancelCountdown(s);
     if (s.started) return s.players.size;
     s.started = true; s.state = 'started'; s.startedAt = Date.now(); s.votes.clear();
@@ -626,6 +657,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     const h = hostedById.get(String(id));
     if (!h) return null;
     const s = h.s;
+    touchAllSeated(s);
     cancelCountdown(s);
     if (s.emptyTimer) { clearTimeout(s.emptyTimer); s.emptyTimer = null; }
     const ids = [...s.players.keys()];
@@ -1096,7 +1128,7 @@ function createMatchmaker({ config, getUname = (id) => id, log = () => {} }) {
     for (const { s } of hostedById.values()) { cancelCountdown(s); clearTimeout(s.emptyTimer); for (const p of s.players.values()) clearTimeout(p.graceTimer); }
   }
 
-  return { onConnect, onMessage, onClose, shutdown, getHostedSession, addWatcher, removeWatcher, listWatchers, watcherExpiry, watchToken, kickHosted, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, countdownHosted, setLobbyOptions, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
+  return { onConnect, onMessage, onClose, shutdown, getHostedSession, addWatcher, removeWatcher, listWatchers, watcherExpiry, watchToken, kickHosted, wasSeated, hostOnline, addCommunityHost, updateCommunityHost, removeCommunityHost, isCommunityHost, lastPollOf, markHostPolled, announceHosted, listHosted, resetHosted, endHosted, voteStartHosted, setJoinHint, forceStartHosted, countdownHosted, setLobbyOptions, forceStartAll, publicHost, _state: { clients, groups, sessions, get queue() { return queue; } } };
 }
 
 module.exports = { cleanLabel, parseHosts, pickPublicHost, makeSessionJwt, readSessionJwt, loadConfig, createMatchmaker, DEFAULTS };

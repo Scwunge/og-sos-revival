@@ -6,6 +6,8 @@
 // The match-end POST ends that lobby (like a real match end), so run it on a test backend, not on prod.
 'use strict';
 const http = require('http');
+const net = require('net');
+const crypto = require('crypto');
 
 const HOST = process.argv[2] || '127.0.0.1';
 const PORT = Number(process.argv[3] || 7784);
@@ -29,6 +31,38 @@ function req(method, path, body, token) {
 const login = async (steamId) => (await req('POST', '/api/access-token/steam',
   { 'steam-app-id': '802240', 'steam-id': steamId, 'session-auth-token': 'x', 'app-id': 'sostest' })).body['access-token'];
 
+// A real player's matchmaking socket: connect with the account JWT and ask for a game. The host may only write the
+// blob / leaderboard rows of players seated in its session (server/progression.js), so the players are seated first.
+function wsOpen(token) {
+  return new Promise((resolve) => {
+    const s = net.connect(PORT, HOST);
+    const msgs = []; let buf = Buffer.alloc(0); let up = false;
+    const api = {
+      msgs, close() { s.destroy(); },
+      send(o) {
+        const p = Buffer.from(JSON.stringify(o)); const mask = crypto.randomBytes(4);
+        const head = p.length < 126 ? Buffer.from([0x81, 0x80 | p.length]) : Buffer.from([0x81, 0x80 | 126, p.length >> 8, p.length & 255]);
+        s.write(Buffer.concat([head, mask, Buffer.from(p.map((b, i) => b ^ mask[i % 4]))]));
+      },
+    };
+    s.on('error', () => {});
+    s.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (!up) { const i = buf.indexOf('\r\n\r\n'); if (i < 0) return; up = true; buf = buf.subarray(i + 4); resolve(api); }
+      while (buf.length >= 2) {
+        let len = buf[1] & 0x7f, off = 2;
+        if (len === 126) { len = buf.readUInt16BE(2); off = 4; }
+        if (buf.length < off + len) return;
+        try { msgs.push(JSON.parse(buf.subarray(off, off + len).toString())); } catch { /* not json */ }
+        buf = buf.subarray(off + len);
+      }
+    });
+    s.on('connect', () => s.write(`GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: wss,ws\r\nAuthorization: Token ${token}\r\n\r\n`));
+    setTimeout(() => { if (!up) resolve(api); }, 3000);
+  });
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 let failed = 0;
 const check = async (name, fn) => {
   try { await fn(); console.log('PASS ', name); } catch (e) { failed++; console.log('FAIL ', name, '-', e.message); }
@@ -37,7 +71,14 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
 
 (async () => {
   const A = '76561190000000501', B = '76561190000000502';
-  const jwtA = await login(A); await login(B);
+  const jwtA = await login(A); const jwtB = await login(B);
+  // Seat A and B in the lobby like real clients: reset it (a fresh lobby), let the host poll (online), then find-session.
+  await req('POST', `/api/session/${SID}/reset`, '{}', HTOK);
+  await req('GET', `/api/session/${SID}`, undefined, HTOK);
+  const sockets = [await wsOpen(jwtA), await wsOpen(jwtB)];
+  await sleep(200);
+  for (const w of sockets) w.send({ type: 'find-session', data: { opts: { 'game-mode': '', map: '' } } });
+  for (let i = 0; i < 40 && !sockets.every((w) => w.msgs.some((m) => m.type === 'session')); i++) await sleep(100);
   const blob = `/api/account/${A}/app/sostest`;
   let v;
 
@@ -54,6 +95,13 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
   await check('host writes with its session token; version bumps', async () => {
     const r = await req('POST', blob, { version: v, data: { version: 8, progression: { level: 2, levelProgress: 0.4167 } } }, HTOK);
     assert(r.status === 200 && r.body.version === v + 1, r.status + r.text);
+  });
+  await check('host cannot write a player who was never seated in its session: 403 not-seated', async () => {
+    const C = '76561190000000503';
+    const r = await req('POST', `/api/account/${C}/app/sostest`, { data: { progression: { level: 50 } } }, HTOK);
+    assert(r.status === 403 && r.body && r.body.error === 'not-seated', r.status + r.text);
+    const lb = await req('POST', '/api/leaderboard/sostest/survival_solo', [{ member: C, score: 9 }], HTOK);
+    assert(lb.status === 403 && lb.body && lb.body.error === 'not-seated', lb.status + lb.text);
   });
   await check('stale version: 409 with the stored blob (host merges and retries)', async () => {
     const r = await req('POST', blob, { version: v, data: { progression: { level: 1 } } }, HTOK);
@@ -114,6 +162,7 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
     assert(Array.isArray(recent) && recent[0].id === matchId, 'recent ' + JSON.stringify(recent[0]));
   });
 
+  for (const w of sockets) w.close();
   console.log(failed ? `${failed} FAILED` : 'ALL OK');
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.error('crashed:', e); process.exit(1); });

@@ -134,7 +134,8 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
   });
 
   await check('logout clears the cookie', async () => {
-    const r = await req('GET', '/admin/logout', { headers: { Cookie: cookie } });
+    assert((await req('GET', '/admin/logout', { headers: { Cookie: cookie } })).status === 405, 'GET logout is refused (405)');
+    const r = await req('POST', '/admin/logout', { headers: { Cookie: cookie, 'X-OGSOS-Admin': '1' } });
     assert(r.status === 302 && /Max-Age=0/.test(r.headers['set-cookie'][0]), 'cleared');
   });
 

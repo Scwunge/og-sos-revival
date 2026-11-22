@@ -129,7 +129,7 @@ test('per-IP cap (renewals do not count) and 409 on same port', async () => {
   env.done();
 });
 test('rate limit per ip per 10 minutes', async () => {
-  const env = mkEnv({ cfgOver: { ratePerIp: 3, maxPerIp: 100 } });
+  const env = mkEnv({ cfgOver: { ratePerIp: 3, maxPerIp: 100, maxPerNet: 100 } });
   for (let i = 0; i < 3; i++) assert.strictEqual(env.reg.register(PUB, body({ port: 7000 + i })).status, 200);
   const r = env.reg.register(PUB, body({ port: 7100 }));
   assert.deepStrictEqual([r.status, r.body.error], [429, 'rate-limited']);
@@ -591,8 +591,10 @@ async function runHttp() {
     assert.strictEqual((await req('GET', `/api/account/${acct}/app/sostest`, undefined, { Authorization: `Token ${tok}` })).status, 200, 'blob read allowed');
     assert.strictEqual((await req('GET', `/api/account/${acct}/app/sostest`, undefined, {})).status, 401, 'no token still 401');
     assert.strictEqual((await req('POST', '/api/leaderboard/sostest/xp', [{ member: acct, score: 5 }], { Authorization: `Token ${tok}` })).status, 401, 'leaderboard post');
-    // the official host token still writes
-    assert.strictEqual((await req('POST', `/api/account/${acct}/app/sostest`, { data: { xp: 1 } }, { Authorization: `Token ${OFFICIAL.sessionToken}` })).status, 200, 'official host write');
+    // the official host token is accepted, but writes only for players seated in ITS session (acct sits in the community lobby): 403 not-seated
+    const ow = await req('POST', `/api/account/${acct}/app/sostest`, { data: { xp: 1 } }, { Authorization: `Token ${OFFICIAL.sessionToken}` });
+    assert.strictEqual(ow.status, 403, 'official host write for a player it never seated: ' + ow.text);
+    assert.strictEqual(ow.json.error, 'not-seated');
     // unverified match-end still ends the session but records nothing
     const ev = await req('POST', `/api/session/${id}/events`, { type: 'match-end', matchId: 'm1', players: [{ playerId: acct, kills: 3 }] }, { Authorization: `Token ${tok}` });
     assert.strictEqual(ev.status, 200);

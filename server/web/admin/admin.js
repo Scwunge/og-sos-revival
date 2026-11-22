@@ -392,6 +392,12 @@
       h('p', { class: 'muted' }, 'Sign in with the Steam account listed as an admin for this server.'),
       h('a', { class: 'btn', href: '/admin/login' }, 'Sign in through Steam')));
   }
+  // Logout is POST-only with the CSRF header (a link or image tag must not sign anyone out); then back to the sign-in page.
+  async function signOut() {
+    try { await fetch('/admin/logout', { method: 'POST', credentials: 'same-origin', headers: { 'X-OGSOS-Admin': '1' } }); } catch (_) { /* cookie may still be cleared */ }
+    OGA.me = null;
+    location.href = '/admin/';
+  }
   async function loadMe() {
     try {
       const me = await api('me');
@@ -400,7 +406,7 @@
       const who = $('who'); clear(who);
       add(who, [h('span', { class: 'badge role-' + (me.role || 'none'), text: me.role || 'no role' }),
         h('span', {}, h('b', { text: me.name || '(unnamed)' }), ' ', h('span', { class: 'mono', text: me.steamId })),
-        h('a', { href: '/admin/logout' }, 'Sign out')]);
+        h('button', { class: 'sm', onclick: signOut }, 'Sign out')]);
       return true;
     } catch (e) {
       if (e.status !== 401) toast(e.message);
