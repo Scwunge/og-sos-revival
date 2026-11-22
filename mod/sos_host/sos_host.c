@@ -85,13 +85,14 @@ static struct {
     wchar_t token[512];       /* optional "Authorization: Token <this>" for backend calls */
     int mirror_streaming;     /* 1: send the host's streaming-level states to joiners (kept joiners on the loading screen) */
     int correct_moves;        /* 1: correct a joiner the host has far from its own position */
-    int correct_dist;         /* cm the joiner may be off before it is corrected */
+    int correct_dist;         /* cm the joiner may be off before it is corrected (unused by the safe build) */
+    int safe_dist;            /* cm; safe build: AdjustPosition only past this gap, in any movement mode */
     int test_match_end;       /* test switch: >0 = fire the match end this many s after the first joiner pawn */
     wchar_t stat_props[512];  /* PlayerState properties added to each player's match-end entry */
 } cfg = {
     .enable_listen = 1, .unfilter_cmdline = 1, .game_log = 1, .fix_join_state = 1,
     .replicate_actors = 1, .startup_radius = 15000, .ack_moves = 1,
-    .correct_moves = 1, .correct_dist = 300,
+    .correct_moves = 1, .correct_dist = 300, .safe_dist = 500000,
     .tick_char_radius = 15000, .conn_net_speed = 400000, .set_pawn_owner = 1,
 };
 
@@ -186,6 +187,7 @@ static void load_config(HMODULE self)
     if (!cfg.token[0])   cmdline_value(L"-SESSION_TOKEN=", cfg.token, 512);
     cfg.correct_moves    = GetPrivateProfileIntW(L"Host", L"CorrectMoves", cfg.correct_moves, ini);
     cfg.correct_dist     = GetPrivateProfileIntW(L"Host", L"CorrectDistance", cfg.correct_dist, ini);
+    cfg.safe_dist        = GetPrivateProfileIntW(L"Host", L"SafeCorrectDistance", cfg.safe_dist, ini);
     GetPrivateProfileStringW(L"Host", L"StatProps", L"", cfg.stat_props, 512, ini);
     cfg.test_match_end   = GetPrivateProfileIntW(L"Host", L"TestMatchEndSec", 0, ini);
     cfg.set_pawn_owner   = GetPrivateProfileIntW(L"Host", L"SetPawnOwner", cfg.set_pawn_owner, ini);
@@ -1918,8 +1920,11 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
            base transform is unreliable and relative coordinates can't be compared
            with the host's world position. Let the landing reconcile. A base whose
            transform fails the sanity check is never trusted either. */
-        int skip = (base && (!base_ok || falling));
-        if (falling && !base) lim = FALL_DIST * 10.0f;       /* 100 m: only a real teleport */
+        /* Safe build: the ONLY correction is a gap beyond SafeCorrectDistance (default 500000 cm = 5 km),
+           in any movement mode, so play never teleports a joiner. Only a base whose transform
+           fails the sanity check is still skipped (its relative report can't be compared). */
+        lim = (float)cfg.safe_dist;
+        int skip = (base && !base_ok);
         if (skip && d2 > lim * lim) {
             static DWORD last_skip;
             DWORD tk = GetTickCount();
