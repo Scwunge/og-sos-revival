@@ -1777,6 +1777,9 @@ static int peek_param(uint8_t *stack, int n, void *out, size_t size)
 #define ADJUST_INTERVAL   0.25f   /* s between corrections of one joiner */
 #define FALL_DIST         1000.0f /* cm; while falling only a gap this big is corrected */
 #define BASE_DIST         2000.0f /* cm; same while the joiner stands on a base */
+#define LAG_FLOOR        15000.0f /* cm; a host pawn that lags behind its joiner (the host simulates the
+                                     moves slower than the client) must not drag the joiner back: only a
+                                     teleport-sized gap (match start, 100s of m) is corrected */
 #define MOVE_FALLING      3
 
 /* World position of a point given relative to a movement base component. */
@@ -1820,20 +1823,45 @@ static uint8_t packed_move_mode(uint8_t *cmc)
 /* After a ServerMove ran: ack it, or, when the host's position for this pawn is
    far from where the joiner says it is (a teleport such as the start of the
    match, a blocked move), send the host's position with ClientAdjustPosition. */
-/* A movement base whose transform can be trusted: scale not zero, rotation a
-   unit quaternion, location not exactly the origin of a never-initialised one. */
+/* A movement base whose rotation is a unit quaternion. Scale and location are
+   not checked: terrain and static meshes legitimately have scale 100 or sit at
+   the origin. */
 static int base_sane(const uint8_t *base)
 {
     const float *q = (const float *)(base + COMP_ROTATION);
-    const float *t = (const float *)(base + COMP_LOCATION);
-    const float *s = (const float *)(base + COMP_SCALE);
     float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-    if (!(n > 0.9f && n < 1.1f)) return 0;
-    for (int i = 0; i < 3; i++) {
-        if (!(fabsf(s[i]) > 0.01f && fabsf(s[i]) < 100.0f)) return 0;
-        if (!(fabsf(t[i]) < 1.0e7f)) return 0;
-    }
-    return !(t[0] == 0 && t[1] == 0 && t[2] == 0);
+    return n > 0.9f && n < 1.1f;
+}
+
+/* Name of a UObject (its FName) as ASCII, "?" if unreadable. */
+static void uobj_name(const uint8_t *o, char *out, size_t cap)
+{
+    snprintf(out, cap, "?");
+    if (!o || !g_build->fname_tostring) return;
+    FString fs = { 0 };
+    ((FNameToStringFn)AT(g_build->fname_tostring))((const FName *)(o + OBJ_NAME), &fs);
+    if (!fs.data) return;
+    size_t i = 0;
+    for (; i + 1 < cap && fs.data[i]; i++) out[i] = fs.data[i] < 0x7f ? (char)fs.data[i] : '?';
+    out[i] = 0;
+    ((FreeFn)AT(g_build->mem_free))(fs.data);
+}
+
+/* Once per new movement base pointer (first 24): what it is, for the log. */
+static void log_new_base(const uint8_t *base, const float *client_loc)
+{
+    static const uint8_t *seen[24];
+    static int n;
+    for (int i = 0; i < n; i++) if (seen[i] == base) return;
+    if (n >= 24) return;
+    seen[n++] = base;
+    char nm[96] = "?", cn[96] = "?", on[96] = "?";
+    uobj_name(base, nm, sizeof nm);
+    uobj_name(*(uint8_t **)(base + OBJ_CLASS), cn, sizeof cn);
+    uobj_name(*(uint8_t **)(base + OBJ_OUTER), on, sizeof on);
+    const float *t = (const float *)(base + COMP_LOCATION), *sc = (const float *)(base + COMP_SCALE);
+    hlog("Base %p: %s (%s) in %s, loc (%.0f %.0f %.0f) scale (%.2f %.2f %.2f); joiner reports (%.0f %.0f %.0f)",
+         (const void *)base, nm, cn, on, t[0], t[1], t[2], sc[0], sc[1], sc[2], client_loc[0], client_loc[1], client_loc[2]);
 }
 
 static int client_mode_falling(int packed)
@@ -1863,6 +1891,20 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
             }
         }
         int falling = cmc[CMC_MOVEMODE] == MOVE_FALLING || client_mode_falling(client_mode);
+        if (base) log_new_base(base, client_loc);
+        {   /* every 10 s: how far apart the joiner and its host pawn are, and how fast each moves */
+            static struct { void *cmc; DWORD tick; float cl[3], hl[3]; } samp[8];
+            int si = (int)(((uintptr_t)cmc >> 4) & 7);
+            DWORD tk = GetTickCount();
+            if (samp[si].cmc != cmc) { samp[si].cmc = cmc; samp[si].tick = tk; memcpy(samp[si].cl, client_loc, 12); memcpy(samp[si].hl, loc, 12); }
+            else if (tk - samp[si].tick >= 10000) {
+                float secs = (tk - samp[si].tick) / 1000.0f;
+                hlog("MoveDiag: joiner (%.0f %.0f %.0f)%s host (%.0f %.0f %.0f) gap %.0f cm; client moved %.0f cm/s, host pawn %.0f cm/s, host mode %u",
+                     client_loc[0], client_loc[1], client_loc[2], base ? " rel" : "", loc[0], loc[1], loc[2], sqrtf(d2),
+                     sqrtf(dist2(client_loc, samp[si].cl)) / secs, sqrtf(dist2(loc, samp[si].hl)) / secs, cmc[CMC_MOVEMODE]);
+                samp[si].tick = tk; memcpy(samp[si].cl, client_loc, 12); memcpy(samp[si].hl, loc, 12);
+            }
+        }
         /* While falling the host's simulation runs ahead of the joiner's, and a
            correction (sent with zero velocity) costs the joiner its momentum. */
         float lim = falling ? FALL_DIST : (float)cfg.correct_dist;
@@ -1870,6 +1912,7 @@ static void answer_move(uint8_t *cmc, int ok, float ts, int have_loc, const floa
            often somewhere else on the host than on the joiner, since the intro
            sequence moves it client-side. Only a teleport-sized gap is corrected. */
         if (base && lim < BASE_DIST) lim = BASE_DIST;
+        if (lim < LAG_FLOOR && !falling) lim = LAG_FLOOR;
         /* Falling or dropping from a vehicle while the client still reports a base:
            the base (a helicopter, the drop ship) moves client-side, so the host's
            base transform is unreliable and relative coordinates can't be compared
