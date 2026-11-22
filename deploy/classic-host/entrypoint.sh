@@ -138,7 +138,7 @@ while :; do
   log "starting game (backend $OGSOS_BACKEND = $BHOST:$BPORT, session $SESSION_ID)"
   ( cd "$WIN64" && exec wine "$EXE" "${GAME_MAP:-LaCuna}?game=SUR?listen?AuthToken=$JWT" "-SESSION_ID=$SESSION_ID" "-SESSION_TOKEN=$SESSION_TOKEN" \
       -nullrhi -nosound -unattended -log ${EXTRA_ARGS:-} ) >/dev/null 2>&1 &
-  GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=; GAME_BHOST=$BHOST
+  GAME_PID=$!; START=$(date +%s); LISTENING=0; REASON=exited; ENDED_AT=; BAD_SINCE=; GAME_BHOST=$BHOST
 
   while kill -0 "$GAME_PID" 2>/dev/null; do
     sleep 15
@@ -168,13 +168,18 @@ while :; do
       LAST=$(grep 'Players alive=' "$WIN64/sos_host.log" 2>/dev/null | tail -1)
       if [ $G -ge "${POSTGAME_MAX:-300}" ] || { [ $G -ge 20 ] && echo "$LAST" | grep -q 'connected=0'; }; then REASON="match ended (${G}s after the end)"; break; fi
     fi
-    if [ $UP -gt 600 ]; then
+    # Backend not seeing this host: the lobby is gone from /servers, or its poll is unknown (null lastSeenSec after a backend
+    # redeploy dropped the state) or stale. Once listening, recycle after BAD_GRACE seconds of that (default 120, so a backend
+    # restart does not kill the game), unless players are connected (let them finish). An ended match drains above.
+    if [ "$LISTENING" = 1 ] && [ "$(lobby_state)" != ended ]; then
       SEEN=$(last_seen)
       if [ -z "$SEEN" ] || [ "$SEEN" -gt "$POLL_STALE" ]; then
-        # Unknown or stale: check once more after a minute, so a backend restart doesn't kill the game.
-        sleep 60; SEEN=$(last_seen)
-        if [ -n "$SEEN" ] && [ "$SEEN" -gt "$POLL_STALE" ]; then REASON="no backend poll for ${SEEN}s (hang)"; break; fi
-      fi
+        [ -z "$BAD_SINCE" ] && BAD_SINCE=$(date +%s)
+        LAST=$(grep 'Players alive=' "$WIN64/sos_host.log" 2>/dev/null | tail -1)
+        if [ $(( $(date +%s) - BAD_SINCE )) -ge "${BAD_GRACE:-120}" ] && ! echo "$LAST" | grep -qE 'connected=[1-9]'; then
+          REASON="backend does not see this host (poll ${SEEN:-unknown}, lobby $([ -z "$(lobby_json)" ] && echo gone || echo listed)) for $(( $(date +%s) - BAD_SINCE ))s"; break
+        fi
+      else BAD_SINCE=; fi
     fi
     # Daily restart (fresh 24 h JWT), only while the lobby is empty and waiting; the JWT has slack until the
     # 24 h mark, after which an empty lobby is restarted at any hour.

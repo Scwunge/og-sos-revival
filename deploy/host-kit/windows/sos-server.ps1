@@ -265,7 +265,7 @@ try {
   $lastBeat = Get-Date; $lastLine = ''; $probeFailSince = $null; $hinted = $false
   while ($true) {
     $Proc = Start-Game
-    $start = Get-Date; $listening = $false; $reason = 'exited'; $endedAt = $null
+    $start = Get-Date; $listening = $false; $reason = 'exited'; $endedAt = $null; $badSince = $null
     while (-not $Proc.HasExited) {
       Start-Sleep -Seconds 15
       if ($Proc.HasExited) { break }
@@ -305,13 +305,16 @@ try {
         $last = Get-Content -LiteralPath (Join-Path $Win64 'sos_host.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match 'Players alive=' } | Select-Object -Last 1
         if ($g -ge 300 -or ($g -ge 20 -and $last -match 'connected=0')) { $reason = 'match ended'; break }
       }
-      if ($up -gt 600) {
+      # Backend not seeing this host (lobby gone, poll unknown after a backend redeploy, or stale): recycle after 120 s of that,
+      # unless players are connected. An ended match drains above.
+      if ($st -and "$($st.state)" -eq 'ended') { $badSince = $null }
+      else {
         $seen = if ($st) { $st.lastSeenSec } else { $null }
         if ($null -eq $seen -or $seen -gt 300) {
-          Start-Sleep -Seconds 60              # a backend restart must not kill the game: check twice
-          $st = Get-Status; $seen = if ($st) { $st.lastSeenSec } else { $null }
-          if ($null -ne $seen -and $seen -gt 300) { $reason = "no backend poll for ${seen}s (hang)"; break }
-        }
+          if (-not $badSince) { $badSince = Get-Date }
+          $lastP = Get-Content -LiteralPath (Join-Path $Win64 'sos_host.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match 'Players alive=' } | Select-Object -Last 1
+          if (((Get-Date) - $badSince).TotalSeconds -ge 120 -and $lastP -notmatch 'connected=[1-9]') { $reason = 'backend does not see this host'; break }
+        } else { $badSince = $null }
       }
       if ($up -gt 79200 -and $st -and "$($st.state)" -eq 'waiting' -and [int]$st.players -eq 0) { $reason = 'daily restart (fresh host token)'; break }
     }
