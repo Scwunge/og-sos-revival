@@ -202,6 +202,12 @@ while :; do
   done
   log "game stopped: $REASON"
   mkdir -p "$HOME/logs" && cp -f "$WIN64/sos_host.log" "$HOME/logs/sos_host.last.log" 2>/dev/null; cp -f "$WIN64"/sos_game_*.log "$HOME/logs/" 2>/dev/null
+  # Per-match archive (lag/desync forensics): logs/matches/<start UTC>_<map>_<reason>/, gzipped, kept LOG_KEEP_DAYS (14).
+  ARCH="$HOME/logs/matches/$(date -u -d "@$START" +%Y%m%dT%H%M%SZ)_$(basename "${GAME_MAP:-LaCuna}")_$(echo "$REASON" | tr -c 'a-z0-9\n' '-' | cut -c1-24)"
+  if mkdir -p "$ARCH" 2>/dev/null; then
+    for f in "$WIN64/sos_host.log" "$WIN64"/sos_game_*.log; do [ -f "$f" ] && gzip -c "$f" > "$ARCH/$(basename "$f").gz"; done
+    find "$HOME/logs/matches" -mindepth 1 -maxdepth 1 -type d -mtime +"${LOG_KEEP_DAYS:-14}" -exec rm -rf {} + 2>/dev/null
+  fi
   stop_game
   # Crash loop guard: a game that dies within 90 s of starting backs off (up to 5 min). While it is down the backend
   # sees no polls and lists the lobby as offline, so players are not sent to a dead host.
